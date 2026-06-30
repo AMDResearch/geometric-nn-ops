@@ -9,9 +9,11 @@ can switch backends with a single import change.
 """
 
 from ._kernels.triangle_attention import TritonEvoformer
+from ._trimul import triangle_multiplicative_update
 from ._triattn import triangle_attention
 
 __all__ = [
     "triangle_attention",
+    "triangle_multiplicative_update",
     "TritonEvoformer",
 ]
