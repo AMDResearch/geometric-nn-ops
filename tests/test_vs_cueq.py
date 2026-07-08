@@ -12,8 +12,6 @@ Run with:
     pytest tests/test_vs_cueq.py -v
 """
 
-import math
-
 import pytest
 import torch
 
@@ -45,6 +43,25 @@ def _make_inputs(B, N_seq, N_res, H, D, dtype, seed=0):
     return q, k, v, bias, mask
 
 
+def _cueq(q, k, v, bias, mask, scale):
+    """Call cueq's triangle_attention for comparison with our direct API.
+
+    geometric_nn_ops uses q/k/v layout ``(B, N, S, H, D)``; cuequivariance uses
+    ``(B, N, H, S, D)``. Transpose the H/S axes on the way in and transpose the
+    output back so results are comparable in our layout. (bias/mask share the
+    same shape in both.)
+    """
+    o = cueq_triangle_attention(
+        q.transpose(-2, -3),
+        k.transpose(-2, -3),
+        v.transpose(-2, -3),
+        bias=bias,
+        mask=mask,
+        scale=scale,
+    )
+    return o.transpose(-2, -3)
+
+
 # Representative shapes chosen to cover:
 #  - small monomer-like (D=32, common pairformer attention call)
 #  - MSA-att-like (D=8, the most common kernel call in OF3)
@@ -68,7 +85,7 @@ def test_matches_cueq(shape, dtype):
     scale = D ** -0.5
 
     o_triton = hip_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
-    o_cueq = cueq_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
+    o_cueq = _cueq(q, k, v, bias=bias, mask=mask, scale=scale)
 
     # Both run in low precision; tolerances chosen to be loose enough to
     # accommodate different reduction orders inside the two kernels but tight
@@ -89,7 +106,7 @@ def test_matches_cueq_custom_scale(dtype):
     scale = (D ** -0.5) * 1.5  # arbitrary non-default
 
     o_triton = hip_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
-    o_cueq = cueq_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
+    o_cueq = _cueq(q, k, v, bias=bias, mask=mask, scale=scale)
 
     atol = 5e-2 if dtype == torch.bfloat16 else 1e-2
     assert torch.allclose(
@@ -109,7 +126,7 @@ def test_matches_cueq_backward():
     q_c, k_c, v_c, bias_c = (t.clone().detach().requires_grad_(True) for t in (q, k, v, bias))
 
     o_triton = hip_triangle_attention(q_a, k_a, v_a, bias=bias_a, mask=mask, scale=scale)
-    o_cueq = cueq_triangle_attention(q_c, k_c, v_c, bias=bias_c, mask=mask, scale=scale)
+    o_cueq = _cueq(q_c, k_c, v_c, bias=bias_c, mask=mask, scale=scale)
 
     # Random (but matched) upstream gradient
     torch.manual_seed(99)

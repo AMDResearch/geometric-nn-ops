@@ -1,11 +1,9 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Triangle attention adapter on top of the Triton evoformer kernel.
+"""Functional form of triangle attention on top of the Triton evoformer kernel.
 
-Exposes a `triangle_attention(q, k, v, bias, mask, scale)` function with the
-same calling convention as
-`cuequivariance_torch.primitives.triangle.triangle_attention`.
+Exposes the public `triangle_attention(q, k, v, bias, mask, scale)` API.
 
 Shape and dtype handling here mirror openfold-3's
 `openfold3/core/model/primitives/attention.py:_triton_evo_attn` (commit
@@ -29,8 +27,8 @@ def triangle_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    bias: torch.Tensor,
-    mask: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
     """Triangle attention with a cueq-compatible signature.
@@ -38,10 +36,12 @@ def triangle_attention(
     Args:
         q, k, v: shape ``[..., N_seq, N_res, H, D]``. 4D, 5D, or 6D inputs are
             accepted; leading dims are collapsed to a single batch.
-        bias: pair bias broadcastable to ``[B, 1, H, N_res, N_res]``.
+        bias: pair bias broadcastable to ``[B, 1, H, N_res, N_res]``, or ``None``
+            for no bias (skips all bias work in the kernel).
         mask: boolean tensor where ``True`` keeps and ``False`` masks; shape
             broadcastable to ``[B, N_seq, 1, 1, N_res]``. Additive masks
-            (0 = keep, large-negative = mask) are also accepted.
+            (0 = keep, large-negative = mask) are also accepted. ``None`` means
+            all-keep.
         scale: softmax scale. If ``None`` or equal to ``1/sqrt(D)``, the
             kernel's built-in scale runs unchanged. Otherwise ``q`` is
             pre-multiplied so the kernel's built-in scale yields the
@@ -72,26 +72,36 @@ def triangle_attention(
 
     Batch, N_seq, N_res, Head, Dim = q.shape
 
-    # bias -> [B, 1, H, N_res, N_res]
-    if bias.dim() == 4:
-        bias = bias.unsqueeze(-4)  # [B, H, N, N] -> [B, 1, H, N, N]
-    elif bias.dim() > 5:
-        bias = bias.reshape(-1, *bias.shape[-4:])
-    pair_bias = bias.expand(Batch, 1, Head, N_res, N_res).contiguous()
-
-    # mask: bool -> additive ([NEG_INF, 0]); reshape/broadcast to [B, N_seq, 1, 1, N_res]
-    if mask.dtype == torch.bool:
-        res_mask = torch.where(
-            mask, torch.tensor(0.0, device=mask.device), torch.tensor(NEG_INF, device=mask.device)
-        ).to(torch.float32)
+    # bias -> [B, 1, H, N_res, N_res]. When bias is None, expand a single scalar
+    # zero (stride-0) instead of allocating; has_pair_bias=False then skips all
+    # bias work in the kernel, so its values are never read.
+    has_pair_bias = bias is not None
+    if has_pair_bias:
+        if bias.dim() == 4:
+            bias = bias.unsqueeze(-4)  # [B, H, N, N] -> [B, 1, H, N, N]
+        elif bias.dim() > 5:
+            bias = bias.reshape(-1, *bias.shape[-4:])
+        pair_bias = bias.expand(Batch, 1, Head, N_res, N_res).contiguous()
     else:
-        res_mask = mask.to(torch.float32)
-    # Collapse leading dims of mask to match Batch
-    while res_mask.dim() > 5:
-        res_mask = res_mask.reshape(-1, *res_mask.shape[-4:])
-    # Broadcast to [B, N_seq, 1, 1, N_res]
-    res_mask = res_mask.reshape(*res_mask.shape, *([1] * (5 - res_mask.dim())))
-    res_mask = res_mask.broadcast_to(Batch, N_seq, 1, 1, N_res).contiguous()
+        pair_bias = q.new_zeros(()).expand(Batch, 1, Head, N_res, N_res)
+
+    # mask -> additive [B, N_seq, 1, 1, N_res]. None means all-keep; expand a
+    # single scalar zero (stride-0) rather than materializing a full mask.
+    if mask is None:
+        res_mask = q.new_zeros(()).expand(Batch, N_seq, 1, 1, N_res)
+    else:
+        # bool -> additive ([NEG_INF, 0]); else assume already additive.
+        if mask.dtype == torch.bool:
+            # True = keep (0), False = mask (NEG_INF)
+            res_mask = (~mask).to(torch.float32) * NEG_INF
+        else:
+            res_mask = mask.to(torch.float32)
+        # Collapse leading dims of mask to match Batch
+        while res_mask.dim() > 5:
+            res_mask = res_mask.reshape(-1, *res_mask.shape[-4:])
+        # Broadcast to [B, N_seq, 1, 1, N_res]
+        res_mask = res_mask.reshape(*res_mask.shape, *([1] * (5 - res_mask.dim())))
+        res_mask = res_mask.broadcast_to(Batch, N_seq, 1, 1, N_res).contiguous()
 
     # If user passed a non-default scale, pre-multiply q so kernel's
     # built-in scale = 1/sqrt(D) yields the requested scale.
@@ -108,7 +118,7 @@ def triangle_attention(
         q_, k_, v_ = q, k, v
         rm_, pb_ = res_mask.to(orig_dtype), pair_bias.to(orig_dtype)
 
-    o = TritonEvoformer(q_, k_, v_, rm_, pb_)
+    o = TritonEvoformer(q_, k_, v_, rm_, pb_, has_pair_bias)
     o = o.to(orig_dtype)
 
     return o.reshape(orig_shape)
