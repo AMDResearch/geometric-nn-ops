@@ -12,6 +12,11 @@ import torch
 import triton
 import triton.language as tl
 
+# Note: The limit for the number of tiles along grid.x is `2^32` whereas for the
+# other dimensions it's `2^16`. Dimensions that grows with sequence length
+# squared (e.g. M = B*N*N) can exceed the smaller limit and need to go on
+# grid.x.
+
 
 def _cfg_fused_gemm(*, N):
     block_n = min(128, max(16, triton.next_power_of_2(N)))
@@ -199,8 +204,8 @@ def fused_gemm_sigmoid_multiply_channel_major(
     Key difference: Output is written in channel-major format [B*C, N, N]
     where each input row (b*N*N + i*N + j) writes to output (b*C + c, i, j)
     """
-
-    pid_m = tl.program_id(1)
+    # Large M dimension tiling on grid.x. See note at top of file.
+    pid_m = tl.program_id(0)
     pid_n = tl.program_id(2)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -339,8 +344,8 @@ def fused_gemm_sigmoid_multiply(
     proj = (A_p if A_p_ptr else A) @ W_p.T + bias_p
     output = sigmoid(gate) * proj * mask
     """
-
-    pid_m = tl.program_id(1)
+    # Large M dimension tiling on grid.x. See note at top of file.
+    pid_m = tl.program_id(0)
     pid_n = tl.program_id(2)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -658,8 +663,8 @@ def triton_triangular_mult_forward(
 
     def proj_grid(meta):
         return (
-            1,
             triton.cdiv(N_rows, meta["BLOCK_M"]),
+            1,
             triton.cdiv(c_hidden, meta["BLOCK_N"]),
         )
 
@@ -775,8 +780,8 @@ def triton_triangular_mult_forward(
 
     def out_grid(meta):
         return (
-            1,
             triton.cdiv(N_rows_out, meta["BLOCK_M"]),
+            1,
             triton.cdiv(D, meta["BLOCK_N"]),
         )
 
