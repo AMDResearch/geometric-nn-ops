@@ -126,13 +126,16 @@ def batched_gemm_multi_channel(
     # Process each channel in the group
     for channel in range(start_channel, end_channel):
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # Cast channel to int64 before multiplying by stride to avoid
+        # INT32 overflow at large N (stride is N^2).
+        channel_i64 = channel.to(tl.int64)
 
         for k_start in range(0, K, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
 
             A = tl.load(
                 A_ptr
-                + channel * stride_Ab
+                + channel_i64 * stride_Ab
                 + offs_m[:, None] * stride_Ai
                 + offs_k[None, :] * stride_Ak,
                 mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
@@ -141,7 +144,7 @@ def batched_gemm_multi_channel(
 
             B = tl.load(
                 B_ptr
-                + channel * stride_Bb
+                + channel_i64 * stride_Bb
                 + offs_k[:, None] * stride_Bk
                 + offs_n[None, :] * stride_Bj,
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
@@ -152,7 +155,7 @@ def batched_gemm_multi_channel(
 
         tl.store(
             C_ptr
-            + channel * stride_Cb
+            + channel_i64 * stride_Cb
             + offs_m[:, None] * stride_Ci
             + offs_n[None, :] * stride_Cj,
             acc,
@@ -210,6 +213,9 @@ def fused_gemm_sigmoid_multiply_channel_major(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Cast to int64 before multiplying by strides to avoid INT32 overflow
+    # at large M (= batch * N_spatial^2).
+    offs_m_i64 = offs_m.to(tl.int64)
 
     # Initialize accumulators for both gate and proj
     acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -221,7 +227,7 @@ def fused_gemm_sigmoid_multiply_channel_major(
 
         # Load A tile for gate computation
         A = tl.load(
-            A_ptr + offs_m[:, None] * stride_Ai + offs_k[None, :] * stride_Ak,
+            A_ptr + offs_m_i64[:, None] * stride_Ai + offs_k[None, :] * stride_Ak,
             mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
             other=0.0,
         )
@@ -229,7 +235,9 @@ def fused_gemm_sigmoid_multiply_channel_major(
         # Load A_p tile for proj computation if provided, else use A
         if A_p_ptr is not None:
             A_p = tl.load(
-                A_p_ptr + offs_m[:, None] * stride_Api + offs_k[None, :] * stride_Apk,
+                A_p_ptr
+                + offs_m_i64[:, None] * stride_Api
+                + offs_k[None, :] * stride_Apk,
                 mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
                 other=0.0,
             )
@@ -293,10 +301,11 @@ def fused_gemm_sigmoid_multiply_channel_major(
     # Compute output offsets for all (m, n) pairs
     # out_idx[m, n] = (batch_idx[m] * N + n) * stride_Cb
     #                 + spatial_i[m] * stride_Ci + spatial_j[m] * stride_Cj
+    # Cast to int64 to avoid overflow at large N.
     out_offsets = (
-        (batch_idx[:, None] * N + offs_n[None, :]) * stride_Cb
-        + spatial_i[:, None] * stride_Ci
-        + spatial_j[:, None] * stride_Cj
+        (batch_idx[:, None].to(tl.int64) * N + offs_n[None, :]) * stride_Cb
+        + spatial_i[:, None].to(tl.int64) * stride_Ci
+        + spatial_j[:, None].to(tl.int64) * stride_Cj
     )
 
     # Single vectorized store
@@ -350,6 +359,9 @@ def fused_gemm_sigmoid_multiply(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Cast to int64 before multiplying by strides to avoid INT32 overflow
+    # at large M (= batch * N_spatial^2).
+    offs_m_i64 = offs_m.to(tl.int64)
 
     # Initialize accumulators for both gate and proj
     acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -361,7 +373,7 @@ def fused_gemm_sigmoid_multiply(
 
         # Load A tile for gate computation
         A = tl.load(
-            A_ptr + offs_m[:, None] * stride_Ai + offs_k[None, :] * stride_Ak,
+            A_ptr + offs_m_i64[:, None] * stride_Ai + offs_k[None, :] * stride_Ak,
             mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
             other=0.0,
         )
@@ -369,7 +381,9 @@ def fused_gemm_sigmoid_multiply(
         # Load A_p tile for proj computation if provided, else use A
         if A_p_ptr is not None:
             A_p = tl.load(
-                A_p_ptr + offs_m[:, None] * stride_Api + offs_k[None, :] * stride_Apk,
+                A_p_ptr
+                + offs_m_i64[:, None] * stride_Api
+                + offs_k[None, :] * stride_Apk,
                 mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
                 other=0.0,
             )
@@ -420,7 +434,7 @@ def fused_gemm_sigmoid_multiply(
 
     # Store result
     tl.store(
-        C_ptr + offs_m[:, None] * stride_Ci + offs_n[None, :] * stride_Cj,
+        C_ptr + offs_m_i64[:, None] * stride_Ci + offs_n[None, :] * stride_Cj,
         result,
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
@@ -531,8 +545,10 @@ def _layer_norm_2d_fwd_fused(
         row_valid = row < total_rows
 
         # Pointers for this row
-        X_row = X + row * stride
-        Y_row = Y + row * stride
+        # Cast to int64 to avoid overflow at large total_rows.
+        row_i64 = row.to(tl.int64)
+        X_row = X + row_i64 * stride
+        Y_row = Y + row_i64 * stride
 
         # Only process if row is valid
         if row_valid:
