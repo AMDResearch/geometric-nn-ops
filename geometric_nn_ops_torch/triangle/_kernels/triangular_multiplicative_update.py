@@ -13,18 +13,58 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        # Larger block sizes for better GPU utilization
-        # Original configs as fallback
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-            num_stages=3,
-            num_warps=4,
-        ),
-    ],
-    key=["M", "K", "N"],
-)
+def _cfg_fused_gemm(*, N):
+    block_n = min(128, max(16, triton.next_power_of_2(N)))
+    if block_n <= 64:
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": block_n,
+            "BLOCK_K": 32,
+            "num_warps": 8,
+            "num_stages": 1,
+        }
+    return {
+        "BLOCK_M": 128,
+        "BLOCK_N": block_n,
+        "BLOCK_K": 32,
+        "num_warps": 16,
+        "num_stages": 2,
+    }
+
+
+def _cfg_batched_gemm(*, N, total_channels):
+    if N <= 640:
+        return {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 32,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+    elif total_channels <= 64:
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 32,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 3,
+        }
+    return {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 32,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+
+
+def _cfg_layer_norm():
+    return {"BLOCK_ROWS": 16, "BLOCK_C": 64, "num_warps": 2, "num_stages": 3}
+
+
 @triton.jit
 def batched_gemm_multi_channel(
     A_ptr,
@@ -116,14 +156,6 @@ def batched_gemm_multi_channel(
 
 
 # Fused GEMM + sigmoid + multiply kernel with channel-major output
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-    ],
-    key=["M", "K", "N"],
-)
 @triton.jit
 def fused_gemm_sigmoid_multiply_channel_major(
     A_ptr,
@@ -269,14 +301,6 @@ def fused_gemm_sigmoid_multiply_channel_major(
 
 
 # Original fused GEMM + sigmoid + multiply kernel (for other uses)
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=2
-        ),
-    ],
-    key=["M", "K", "N"],
-)
 @triton.jit
 def fused_gemm_sigmoid_multiply(
     A_ptr,
@@ -429,6 +453,8 @@ def triton_combine_projection(a, b, outgoing=True, batch_dims=None, c_hidden=Non
     num_batches = (BC + MAX_CHANNELS_PER_BATCH - 1) // MAX_CHANNELS_PER_BATCH
     channels_per_batch = (BC + num_batches - 1) // num_batches
 
+    cfg = _cfg_batched_gemm(N=N, total_channels=BC)
+
     def grid(meta):
         num_m_tiles = triton.cdiv(N, meta["BLOCK_M"])
         num_n_tiles = triton.cdiv(N, meta["BLOCK_N"])
@@ -457,6 +483,7 @@ def triton_combine_projection(a, b, outgoing=True, batch_dims=None, c_hidden=Non
         N,  # M, K, N for square matrices
         BC,  # Total number of channels
         channels_per_batch,  # Channels to process per kernel
+        **cfg,
     )
 
     # Convert output to [..., N, N, C] format if batch_dims provided
@@ -474,12 +501,6 @@ def triton_combine_projection(a, b, outgoing=True, batch_dims=None, c_hidden=Non
     return ab_matmul
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_ROWS": 64, "BLOCK_C": 128}, num_warps=8),
-    ],
-    key=["total_rows", "C"],
-)
 @triton.jit
 def _layer_norm_2d_fwd_fused(
     X,  # pointer to the input
@@ -609,6 +630,8 @@ def triton_triangular_mult_forward(
     # Triton layer norm on flattened input
     z_normed_flat = torch.empty_like(z_flat)
 
+    ln_cfg = _cfg_layer_norm()
+
     def ln_grid(meta):
         return (triton.cdiv(N_rows, meta["BLOCK_ROWS"]),)
 
@@ -621,6 +644,7 @@ def triton_triangular_mult_forward(
         N_rows,
         D,
         1e-5,
+        **ln_cfg,
     )
 
     # Allocate channel-major output tensors [B*c_hidden, N, N]
@@ -629,6 +653,8 @@ def triton_triangular_mult_forward(
 
     # Flatten mask for the fused kernel
     mask_flat = mask.unsqueeze(-1).reshape(-1)
+
+    proj_cfg = _cfg_fused_gemm(N=c_hidden)
 
     def proj_grid(meta):
         return (
@@ -665,6 +691,7 @@ def triton_triangular_mult_forward(
         c_hidden,
         B,
         N,
+        **proj_cfg,
     )
 
     # Fused b projection
@@ -695,6 +722,7 @@ def triton_triangular_mult_forward(
         c_hidden,
         B,
         N,
+        **proj_cfg,
     )
 
     # Apply direction-specific transposes
@@ -720,6 +748,8 @@ def triton_triangular_mult_forward(
     # Layer norm on combined output
     x_normed_flat = torch.empty_like(x_flat)
 
+    ln_out_cfg = _cfg_layer_norm()
+
     def ln_grid_out(meta):
         return (triton.cdiv(N_rows_out, meta["BLOCK_ROWS"]),)
 
@@ -732,6 +762,7 @@ def triton_triangular_mult_forward(
         N_rows_out,
         c_hidden,
         1e-5,
+        **ln_out_cfg,
     )
 
     # Fused output: sigmoid(z_normed @ W_g_out) * (x_normed @ W_p_out)
@@ -739,6 +770,8 @@ def triton_triangular_mult_forward(
     W_p_out = p_out_weight.T.contiguous()
 
     output_flat = torch.empty(N_rows_out, D, device=x.device, dtype=x.dtype)
+
+    out_cfg = _cfg_fused_gemm(N=D)
 
     def out_grid(meta):
         return (
@@ -772,6 +805,7 @@ def triton_triangular_mult_forward(
         N_rows_out,
         D,
         D,
+        **out_cfg,
     )
 
     return output_flat.reshape(B, N, N, D)
