@@ -43,7 +43,7 @@ def _eager_triangle_attention(q, k, v, bias, mask, scale):
 
 
 @requires_gpu
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_triangle_attention_matches_eager(dtype):
     torch.manual_seed(0)
     device = "cuda"
@@ -63,8 +63,9 @@ def test_triangle_attention_matches_eager(dtype):
         bias.to(torch.float32), mask, scale,
     )
 
-    # bf16 tolerance is loose (~1e-2 abs is realistic for accumulated softmax)
-    atol = 5e-2 if dtype == torch.bfloat16 else 1e-2
+    # bf16 tolerance is loose (~1e-2 abs is realistic for accumulated softmax);
+    # fp32 runs natively through the kernel so it should match tightly.
+    atol = {torch.bfloat16: 5e-2, torch.float16: 1e-2, torch.float32: 1e-3}[dtype]
     assert torch.allclose(o_triton, o_ref, atol=atol, rtol=1e-2), (
         f"max abs diff: {(o_triton - o_ref).abs().max().item():.4f}"
     )
@@ -72,7 +73,7 @@ def test_triangle_attention_matches_eager(dtype):
 
 @requires_gpu
 def test_scale_override():
-    """Custom scale should be honoured via q pre-scaling."""
+    """Custom scale should be honoured via the kernel's softmax_scale arg."""
     torch.manual_seed(0)
     device = "cuda"
     B, N_seq, N_res, H, D = 1, 2, 16, 4, 32

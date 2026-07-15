@@ -6,15 +6,14 @@
 Exposes the public `triangle_attention(q, k, v, bias, mask, scale)` API.
 
 Shape and dtype handling here mirror openfold-3's
-`openfold3/core/model/primitives/attention.py:_triton_evo_attn` (commit
-90162862 on the `amd-rocm-inference` branch) — see that function for the
-canonical OF3-internal usage of the same kernel. Differences are the API
-shape (cueq's `(q, k, v, bias, mask, scale)` vs OF3's `(q, k, v, biases)`
-list convention) and a `scale` argument that pre-multiplies `q` so the
-kernel's built-in `1/sqrt(D)` yields the user-requested scale.
+`openfold3/core/model/primitives/attention.py:_triton_evo_attn` — see that
+function for the canonical OF3-internal usage of the same kernel. The kernel
+runs bf16/fp16/fp32 natively (fp32 accumulators), so q/k/v are passed through
+in their input dtype; only unsupported dtypes are cast down to fp32.
+Differences from OF3 are the API shape (cueq's `(q, k, v, bias, mask, scale)`
+vs OF3's `(q, k, v, biases)` list convention) and a `scale` argument passed
+through to the kernel's `softmax_scale` runtime parameter.
 """
-
-import math
 
 import torch
 
@@ -30,6 +29,7 @@ def triangle_attention(
     bias: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
     scale: float | None = None,
+    dynamic: bool = False,
 ) -> torch.Tensor:
     """Triangle attention with a cueq-compatible signature.
 
@@ -42,10 +42,12 @@ def triangle_attention(
             broadcastable to ``[B, N_seq, 1, 1, N_res]``. Additive masks
             (0 = keep, large-negative = mask) are also accepted. ``None`` means
             all-keep.
-        scale: softmax scale. If ``None`` or equal to ``1/sqrt(D)``, the
-            kernel's built-in scale runs unchanged. Otherwise ``q`` is
-            pre-multiplied so the kernel's built-in scale yields the
-            requested value.
+        scale: softmax scale, passed to the kernel as its ``softmax_scale``
+            runtime argument. ``None`` uses the kernel default ``1/sqrt(D)``.
+        dynamic: when ``True``, use the variable-shape kernel entry point (one
+            Triton compile across all sequence lengths). Trades a small per-call
+            cost for no per-size recompile; best for variable-size / cold-cache
+            workloads. Output is identical to the default specialized path.
 
     Returns:
         Tensor of the same shape and dtype as ``q``.
@@ -103,22 +105,17 @@ def triangle_attention(
         res_mask = res_mask.reshape(*res_mask.shape, *([1] * (5 - res_mask.dim())))
         res_mask = res_mask.broadcast_to(Batch, N_seq, 1, 1, N_res).contiguous()
 
-    # If user passed a non-default scale, pre-multiply q so kernel's
-    # built-in scale = 1/sqrt(D) yields the requested scale.
-    default_scale = Dim ** -0.5
-    if scale is not None and not math.isclose(scale, default_scale, rel_tol=1e-6):
-        q = q * (scale / default_scale)
-
-    # Kernel requires fp16 / bf16
-    if orig_dtype not in (torch.bfloat16, torch.float16):
-        target = torch.bfloat16
-        q_, k_, v_ = q.to(target), k.to(target), v.to(target)
-        rm_, pb_ = res_mask.to(target), pair_bias.to(target)
+    # Kernel runs bf16/fp16/fp32 natively (fp32 accumulators), so pass q/k/v
+    # through as-is for those dtypes; only cast unsupported dtypes (e.g. fp64)
+    # down to fp32. res_mask/pair_bias are cast to match the compute dtype.
+    if orig_dtype in (torch.bfloat16, torch.float16, torch.float32):
+        compute_dtype = orig_dtype
     else:
-        q_, k_, v_ = q, k, v
-        rm_, pb_ = res_mask.to(orig_dtype), pair_bias.to(orig_dtype)
+        compute_dtype = torch.float32
+    q_, k_, v_ = q.to(compute_dtype), k.to(compute_dtype), v.to(compute_dtype)
+    rm_, pb_ = res_mask.to(compute_dtype), pair_bias.to(compute_dtype)
 
-    o = TritonEvoformer(q_, k_, v_, rm_, pb_, has_pair_bias)
+    o = TritonEvoformer(q_, k_, v_, rm_, pb_, has_pair_bias, dynamic, scale)
     o = o.to(orig_dtype)
 
     return o.reshape(orig_shape)
