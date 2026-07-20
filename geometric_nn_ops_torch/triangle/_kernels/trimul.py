@@ -481,6 +481,99 @@ if TRITON_AVAILABLE:
         tl.store(Dag_ptr + out_off, d_ag, mask=store_mask)
 
     @triton.jit
+    def _proj_out_bwd_grads(
+        Zn_ptr,
+        Xn_ptr,
+        W_p_ptr,
+        W_g_ptr,
+        Dout_ptr,
+        Dproj_ptr,
+        Dgpre_ptr,
+        stride_Zi,
+        stride_Zk,
+        stride_Xi,
+        stride_Xk,
+        stride_Wpk,
+        stride_Wpj,
+        stride_Wgk,
+        stride_Wgj,
+        stride_Di,
+        stride_Dj,
+        M,
+        K,
+        N,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Fused output-projection backward pointwise grads.
+
+        The output projection is ``out = sigmoid(z_n @ W_g^T) * (x_n @ W_p^T)``
+        (gate from ``z_n``, proj from ``x_n``; no mask). This recomputes the gate
+        preact ``ag = z_n @ W_g^T`` and the proj ``xz = x_n @ W_p^T`` (over K=D),
+        then produces, all in fp32 internally::
+
+            sg          = sigmoid(ag)
+            d_proj      = Dout * sg
+            d_g_pre     = Dout * xz * sg * (1 - sg)
+
+        Writing ``d_proj`` and ``d_g_pre`` (compute dtype) directly. Fuses the two
+        recompute GEMMs with the sigmoid-derivative elementwise math so no large
+        fp32 [M, D] temporaries (sg, xz, d_proj, d_g_pre) hit HBM; the downstream
+        weight/input GEMMs then run in the compute dtype via ``torch.bmm``. Mirrors
+        ``_proj_in_bwd_grads`` but with distinct gate/proj inputs and no mask.
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m_i64 = offs_m.to(tl.int64)
+
+        acc_p = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            Z = tl.load(
+                Zn_ptr + offs_m_i64[:, None] * stride_Zi + offs_k[None, :] * stride_Zk,
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+                other=0.0,
+            )
+            X = tl.load(
+                Xn_ptr + offs_m_i64[:, None] * stride_Xi + offs_k[None, :] * stride_Xk,
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+                other=0.0,
+            )
+            W_p = tl.load(
+                W_p_ptr + offs_k[:, None] * stride_Wpk + offs_n[None, :] * stride_Wpj,
+                mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            W_g = tl.load(
+                W_g_ptr + offs_k[:, None] * stride_Wgk + offs_n[None, :] * stride_Wgj,
+                mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc_p = tl.dot(X.to(tl.float32), W_p.to(tl.float32), acc_p)
+            acc_g = tl.dot(Z.to(tl.float32), W_g.to(tl.float32), acc_g)
+
+        d_out = tl.load(
+            Dout_ptr + offs_m_i64[:, None] * stride_Di + offs_n[None, :] * stride_Dj,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+
+        sg = 1.0 / (1.0 + tl.exp(-acc_g))
+        d_proj = d_out * sg
+        d_g_pre = d_out * acc_p * sg * (1.0 - sg)
+
+        store_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        out_off = offs_m_i64[:, None] * N + offs_n[None, :]
+        tl.store(Dproj_ptr + out_off, d_proj, mask=store_mask)
+        tl.store(Dgpre_ptr + out_off, d_g_pre, mask=store_mask)
+
+    @triton.jit
     def _layer_norm_2d_fwd(
         X,
         Y,
@@ -842,6 +935,53 @@ def _proj_in_bwd_pointwise(z_n, Wp_t, Wg_t, d_out, mask_col_flat):
     return d_ap, d_ag
 
 
+def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
+    """Fused recompute + sigmoid-derivative for the output-projection backward.
+
+    z_n / x_n: [M, D] (compute dtype); gate input / proj input respectively.
+    Wp_t/Wg_t: [D, D] = W^T (K, N) contiguous. d_out: [M, D] (compute dtype).
+    Returns (d_proj, d_g_pre), each [M, D] in the compute dtype.
+    """
+    M, K = z_n.shape
+    N = Wp_t.shape[1]
+    cdtype = z_n.dtype
+    d_proj = torch.empty(M, N, device=z_n.device, dtype=cdtype)
+    d_g_pre = torch.empty(M, N, device=z_n.device, dtype=cdtype)
+    fg = _cfg_fused_gemm(N=N)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
+
+    _proj_out_bwd_grads[grid](
+        z_n,
+        x_n,
+        Wp_t,
+        Wg_t,
+        d_out,
+        d_proj,
+        d_g_pre,
+        z_n.stride(0),
+        z_n.stride(1),
+        x_n.stride(0),
+        x_n.stride(1),
+        Wp_t.stride(0),
+        Wp_t.stride(1),
+        Wg_t.stride(0),
+        Wg_t.stride(1),
+        d_out.stride(0),
+        d_out.stride(1),
+        M,
+        K,
+        N,
+        BLOCK_M=fg["BLOCK_M"],
+        BLOCK_N=fg["BLOCK_N"],
+        BLOCK_K=fg["BLOCK_K"],
+        num_warps=fg["num_warps"],
+        num_stages=fg["num_stages"],
+    )
+    return d_proj, d_g_pre
+
+
 class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
     """Differentiable TMU. Forward uses Triton fused kernels; backward is a
     hybrid (Triton batched-GEMM for the combine step, fused Triton LayerNorm
@@ -1074,14 +1214,16 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         Wg_out = g_out_weight.to(cdtype)
 
         # ---- Output projection backward ----
-        # out = sigmoid(z_n @ Wg^T) * (x_n @ Wz^T). Gate preact recomputed here
-        # (not saved) to avoid carrying a [M, D] buffer from forward.
-        sig_g = torch.sigmoid((z_n @ Wg_out.T).float()).to(cdtype)  # [M, D]
-        xz = x_n @ Wz.T  # proj [M, D], cdtype
-        d_g_pre = grad_out_flat * xz * sig_g * (1.0 - sig_g)  # wrt gate preact
-        del xz
-        d_proj = grad_out_flat * sig_g  # wrt proj
-        del sig_g
+        # out = sigmoid(z_n @ Wg^T) * (x_n @ Wz^T). A fused Triton kernel
+        # recomputes the gate preact (z_n @ Wg^T) and proj (x_n @ Wz^T) and does
+        # the sigmoid-derivative pointwise, emitting d_proj / d_g_pre directly
+        # (no large fp32 [M, D] temporaries hitting HBM). The 4 downstream weight/
+        # input GEMMs use ``torch.bmm``. Mirrors the input-projection backward.
+        Wz_t = Wz.T.contiguous()  # [K, N] = [D, D]
+        Wg_out_t = Wg_out.T.contiguous()
+        d_proj, d_g_pre = _proj_out_bwd_pointwise(
+            z_n, x_n, Wz_t, Wg_out_t, grad_out_flat.to(cdtype).contiguous()
+        )
 
         d_p_out_weight = d_proj.T @ x_n  # [D, D]
         d_x_n = d_proj @ Wz  # [M, D], cdtype
