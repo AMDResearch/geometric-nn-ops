@@ -10,9 +10,9 @@ training.
 
   * Forward uses a channel-major fused GEMM (LayerNorm -> gate/proj GEMM ->
     sigmoid -> multiply -> mask, written channel-major ``[B*C, N, N]``) and a
-    per-channel batched matmul that combines the two projections.
-  * Backward is a hybrid: the heavy per-channel combine matmul reuses the
-    batched-GEMM Triton kernel (transposed operands give the two combine
+    per-channel batched matmul (``torch.bmm``) that combines the two projections.
+  * Backward is a hybrid: the heavy per-channel combine matmul is the same
+    strided-batched ``torch.bmm`` (transposed operand views give the two combine
     gradients); the two LayerNorm backwards use a fused Triton kernel
     (``_layer_norm_2d_bwd``); the input-projection backward fuses its recompute
     + sigmoid-derivative pointwise into a Triton kernel
@@ -67,48 +67,6 @@ def _cfg_fused_gemm(*, N, spatial=None):
     }
 
 
-def _cfg_batched_gemm(*, N, total_channels):
-    """Per-channel combine GEMM (BC channels of [N,N] @ [N,N]).
-
-    Tuned on MI300X.
-    """
-    if N <= 256:
-        return {
-            "BLOCK_M": 64,
-            "BLOCK_N": 32,
-            "BLOCK_K": 64,
-            "GROUP_SIZE_M": 4,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
-    if N <= 512:
-        return {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 64,
-            "GROUP_SIZE_M": 4,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
-    if N <= 768:
-        return {
-            "BLOCK_M": 64,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "GROUP_SIZE_M": 4,
-            "num_warps": 8,
-            "num_stages": 2,
-        }
-    return {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 8,
-        "num_stages": 2,
-    }
-
-
 def _cfg_layer_norm():
     # MI300X: BLOCK_C=128 covers the full C=128 row in one pass (no inner loop);
     # BLOCK_ROWS=4 with a single warp is fastest for both bf16 and fp32.
@@ -127,90 +85,6 @@ def _cfg_layer_norm_bwd(*, C):
 # ---------------------------------------------------------------------------
 
 if TRITON_AVAILABLE:
-
-    @triton.jit
-    def _batched_gemm_multi_channel(
-        A_ptr,
-        B_ptr,
-        C_ptr,
-        stride_Ab,
-        stride_Ai,
-        stride_Ak,
-        stride_Bb,
-        stride_Bk,
-        stride_Bj,
-        stride_Cb,
-        stride_Ci,
-        stride_Cj,
-        M,
-        K,
-        N,
-        total_channels,
-        channels_per_batch,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-    ):
-        """Per-channel C[c] = A[c] @ B[c], with grouped tile swizzle.
-
-        Channels are processed in groups to amortize launch overhead. All channel
-        offsets are computed in int64 to avoid INT32 overflow when stride == N^2.
-        """
-        batch_group = tl.program_id(0)
-        pid = tl.program_id(1)
-
-        num_tiles_m = tl.cdiv(M, BLOCK_M)
-        num_tiles_n = tl.cdiv(N, BLOCK_N)
-
-        num_pid_in_group = GROUP_SIZE_M * num_tiles_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = tl.minimum(num_tiles_m - first_pid_m, GROUP_SIZE_M)
-        pid_in_group = pid % num_pid_in_group
-
-        pid_m = first_pid_m + (pid_in_group % group_size_m)
-        pid_n = pid_in_group // group_size_m
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-        start_channel = batch_group * channels_per_batch
-        end_channel = tl.minimum(start_channel + channels_per_batch, total_channels)
-
-        for channel in range(start_channel, end_channel):
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            channel_i64 = channel.to(tl.int64)
-
-            for k_start in range(0, K, BLOCK_K):
-                offs_k = k_start + tl.arange(0, BLOCK_K)
-
-                A = tl.load(
-                    A_ptr
-                    + channel_i64 * stride_Ab
-                    + offs_m[:, None] * stride_Ai
-                    + offs_k[None, :] * stride_Ak,
-                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
-                    other=0.0,
-                )
-                B = tl.load(
-                    B_ptr
-                    + channel_i64 * stride_Bb
-                    + offs_k[:, None] * stride_Bk
-                    + offs_n[None, :] * stride_Bj,
-                    mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
-                    other=0.0,
-                )
-                acc = tl.dot(A, B, acc)
-
-            tl.store(
-                C_ptr
-                + channel_i64 * stride_Cb
-                + offs_m[:, None] * stride_Ci
-                + offs_n[None, :] * stride_Cj,
-                acc,
-                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-            )
 
     @triton.jit
     def _fused_gemm_sigmoid_multiply_channel_major(
@@ -803,39 +677,13 @@ def _triton_layernorm_backward(dy, x, weight, mean, rstd, out_dtype=None):
 
 
 def _combine_projection(a, b, batch_dims, c_hidden):
-    """Per-channel a@b. a,b: [B*C, N, N] channel-major. Returns [..., N, N, C]."""
+    """Per-channel a@b. a,b: [B*C, N, N] channel-major. Returns [..., N, N, C].
+
+    Uses strided-batched GEMM (``torch.bmm``), which is generally faster than
+    any custom kernel.
+    """
     BC, N, _ = a.shape
-    out = torch.empty(BC, N, N, device=a.device, dtype=a.dtype)
-    MAX_CH = 16
-    num_batches = (BC + MAX_CH - 1) // MAX_CH
-    channels_per_batch = (BC + num_batches - 1) // num_batches
-    cfg = _cfg_batched_gemm(N=N, total_channels=BC)
-
-    def grid(meta):
-        nm = triton.cdiv(N, meta["BLOCK_M"])
-        nn = triton.cdiv(N, meta["BLOCK_N"])
-        return (num_batches, nm * nn)
-
-    _batched_gemm_multi_channel[grid](
-        a,
-        b,
-        out,
-        a.stride(0),
-        a.stride(1),
-        a.stride(2),
-        b.stride(0),
-        b.stride(1),
-        b.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        N,
-        N,
-        N,
-        BC,
-        channels_per_batch,
-        **cfg,
-    )
+    out = torch.bmm(a, b)
     Bflat = 1
     for d in batch_dims:
         Bflat *= d
@@ -843,44 +691,6 @@ def _combine_projection(a, b, batch_dims, c_hidden):
         out.reshape(Bflat, c_hidden, N, N)
         .permute(0, 2, 3, 1)
         .reshape(Bflat, N, N, c_hidden)
-    )
-    return out
-
-
-def _combine_projection_raw(a, b):
-    """Per-channel a@b. a,b: [BC, M, K]/[BC, K, N]. Returns [BC, M, N]. No reshape."""
-    BC, M, K = a.shape
-    N = b.shape[2]
-    out = torch.empty(BC, M, N, device=a.device, dtype=a.dtype)
-    MAX_CH = 16
-    num_batches = (BC + MAX_CH - 1) // MAX_CH
-    channels_per_batch = (BC + num_batches - 1) // num_batches
-    cfg = _cfg_batched_gemm(N=max(M, N), total_channels=BC)
-
-    def grid(meta):
-        nm = triton.cdiv(M, meta["BLOCK_M"])
-        nn = triton.cdiv(N, meta["BLOCK_N"])
-        return (num_batches, nm * nn)
-
-    _batched_gemm_multi_channel[grid](
-        a,
-        b,
-        out,
-        a.stride(0),
-        a.stride(1),
-        a.stride(2),
-        b.stride(0),
-        b.stride(1),
-        b.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        M,
-        K,
-        N,
-        BC,
-        channels_per_batch,
-        **cfg,
     )
     return out
 
@@ -984,8 +794,8 @@ def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
 
 class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
     """Differentiable TMU. Forward uses Triton fused kernels; backward is a
-    hybrid (Triton batched-GEMM for the combine step, fused Triton LayerNorm
-    backward, eager PyTorch for linear/sigmoid/elementwise).
+    hybrid (strided-batched ``torch.bmm`` for the combine step, fused Triton
+    LayerNorm backward, eager PyTorch for linear/sigmoid/elementwise).
 
     Weight convention (fused, bias-free): W_p_in / W_g_in are [2D, D] (rows 0:D
     -> a, D:2D -> b); W_z (= linear_z) and W_g_out (= linear_g) are [D, D]. All
@@ -1270,8 +1080,8 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             b_comb = b_cm
 
         # p = a_comb @ b_comb  -> da = dp @ b_comb^T ; db = a_comb^T @ dp
-        d_a_comb = _combine_projection_raw(d_x_cm, b_comb.transpose(-1, -2))
-        d_b_comb = _combine_projection_raw(a_comb.transpose(-1, -2), d_x_cm)
+        d_a_comb = torch.bmm(d_x_cm, b_comb.transpose(-1, -2))
+        d_b_comb = torch.bmm(a_comb.transpose(-1, -2), d_x_cm)
         del d_x_cm
 
         if outgoing:
