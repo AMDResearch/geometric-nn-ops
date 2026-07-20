@@ -76,8 +76,37 @@ def _cfg_layer_norm():
 def _cfg_layer_norm_bwd(*, C):
     # dx kernel: programs grid-stride over rows; whole channel dim in one block
     # (C == D is small, <= a few hundred). Reductions across C are in-register.
+    # Tuned on MI300X for the backward: a single warp is the consistent winner:
+    # the whole C=128 row fits one warp's registers and extra warps only add
+    # cross-warp reduction overhead here.
     block_c = max(16, triton.next_power_of_2(C))
-    return {"BLOCK_C": block_c, "num_warps": 4, "num_stages": 2}
+    return {"BLOCK_C": block_c, "num_warps": 1, "num_stages": 2}
+
+
+def _cfg_proj_bwd(*, dtype):
+    """Fused projection backward GEMM+pointwise config (proj-in / proj-in-dual /
+    proj-out). M = spatial^2 rows, K = D, N_out = D.
+
+    These kernels recompute the proj+gate GEMMs (K=D) and do the sigmoid-
+    derivative pointwise emitting d_ap/d_ag; a different access pattern than the
+    forward projection GEMM, so they get their own config rather than inheriting
+    ``_cfg_fused_gemm``. Tuned on MI300X.
+    """
+    if dtype == torch.float32:
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 32,
+            "num_warps": 16,
+            "num_stages": 2,
+        }
+    return {
+        "BLOCK_M": 64,
+        "BLOCK_N": 128,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -297,14 +326,28 @@ if TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        """Both input-projection backwards (a and b) in one launch.
+        """Two fused input-projection backwards (a and b) in one launch.
 
-        Identical math to :func:`_proj_in_bwd_grads`, but the grid carries a
-        third axis ``pid_b in {0, 1}`` selecting the a- or b-projection. The two
-        projections share ``z_n`` and ``mask`` but use distinct fused weights
-        (``Wp_ptr``/``Wg_ptr`` are ``[2, D, D]`` stacked a/b) and distinct upstream
-        grads (``Douta_ptr`` / ``Doutb_ptr``, each a possibly-strided ``[M, D]``
-        view). This halves the launch count of the two-projection input backward.
+        Recomputes proj ``ap = Zn @ W_p^T`` and gate preact ``ag = Zn @ W_g^T``
+        (over K=D), then produces, all in fp32 internally::
+
+            m           = mask[row]
+            sa          = sigmoid(ag)
+            d_after     = Dout * m
+            d_ap        = d_after * sa
+            d_ag        = d_after * ap * sa * (1 - sa)
+
+        Writing ``d_ap`` and ``d_ag`` (compute dtype) directly. This fuses the two
+        recompute GEMMs with the sigmoid-derivative elementwise math so no large
+        fp32 [M, D] temporaries (ap, sa, d_after, ...) hit HBM; the downstream
+        weight/input GEMMs then run in the compute dtype via ``torch.bmm``.
+
+        The grid carries a third axis ``pid_b in {0, 1}`` selecting the a- or
+        b-projection. The two projections share ``z_n`` and ``mask`` but use
+        distinct fused weights (``Wp_ptr``/``Wg_ptr`` are ``[2, D, D]`` stacked
+        a/b) and distinct upstream grads (``Douta_ptr`` / ``Doutb_ptr``, each a
+        possibly-strided ``[M, D]`` view). This halves the launch count vs
+        running as separate kernels.
 
         The 4 outputs (d_ap/d_ag for a and b) are written into one ``[M, 4, N]``
         buffer ``Dall`` interleaved along the feature (proj) axis: proj-index
@@ -748,7 +791,7 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
     N = Wp_t2.shape[2]
     cdtype = z_n.dtype
     d_all = torch.empty(M, 4, N, device=z_n.device, dtype=cdtype)
-    fg = _cfg_fused_gemm(N=N)
+    fg = _cfg_proj_bwd(dtype=cdtype)
 
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]), 2)
@@ -800,7 +843,7 @@ def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
     cdtype = z_n.dtype
     d_proj = torch.empty(M, N, device=z_n.device, dtype=cdtype)
     d_g_pre = torch.empty(M, N, device=z_n.device, dtype=cdtype)
-    fg = _cfg_fused_gemm(N=N)
+    fg = _cfg_proj_bwd(dtype=cdtype)
 
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
