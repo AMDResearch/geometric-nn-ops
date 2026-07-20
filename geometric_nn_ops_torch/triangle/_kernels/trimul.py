@@ -1292,26 +1292,29 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         )
         del d_x_flat
 
-        # The batched GEMM kernel reads operands via arbitrary strides, so
-        # transposed views can be passed directly (no .contiguous() copies).
-        if outgoing:
-            b_comb = b_cm.transpose(-1, -2)
-            a_comb = a_cm
-        else:
-            a_comb = a_cm.transpose(-1, -2)
-            b_comb = b_cm
+        # Combine grads emitted directly in the channel-major [BC, N, N]
+        # orientation the downstream [M, D] view wants, so both d_a_cm and
+        # d_b_cm come out contiguous with no post-transpose + .contiguous()
+        # copy. Computing and then transpose + contiguous costs ~as much as a
+        # combine GEMM itself.
+        # Using the transposed GEMM identity `(a^T @ dp)^T == dp^T @ a` lets
+        # ``torch.bmm`` produce the desired orientation as a native contiguous
+        # output instead (~2x faster bwd combine). Both bmm operands may be
+        # strided views; the batched GEMM reads arbitrary strides.
+        #
+        #   fwd (outgoing): p = a_cm @ b_cm^T ; (incoming): p = a_cm^T @ b_cm
+        #   grads, channel-major [BC,N,N] contiguous:
+        #     outgoing: d_a_cm = dp  @ b_cm      ; d_b_cm = dp^T @ a_cm
+        #     incoming: d_a_cm = b_cm @ dp^T     ; d_b_cm = a_cm @ dp
+        dxT = d_x_cm.transpose(-1, -2)
 
-        # p = a_comb @ b_comb  -> da = dp @ b_comb^T ; db = a_comb^T @ dp
-        d_a_comb = torch.bmm(d_x_cm, b_comb.transpose(-1, -2))
-        d_b_comb = torch.bmm(a_comb.transpose(-1, -2), d_x_cm)
+        if outgoing:
+            d_a_cm = torch.bmm(d_x_cm, b_cm)
+            d_b_cm = torch.bmm(dxT, a_cm)
+        else:
+            d_a_cm = torch.bmm(b_cm, dxT)
+            d_b_cm = torch.bmm(a_cm, d_x_cm)
         del d_x_cm
-
-        if outgoing:
-            d_a_cm = d_a_comb
-            d_b_cm = d_b_comb.transpose(-1, -2)
-        else:
-            d_a_cm = d_a_comb.transpose(-1, -2)
-            d_b_cm = d_b_comb
 
         # Row-major [M, D] view of the channel-major [Bflat, D, N, N] combine
         # grads. The proj-in backward kernel reads its d_out via arbitrary
@@ -1321,19 +1324,12 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # the channel-major->row-major map is not a single 2D stride, so fall
         # back to a materialized permute.
         if Bflat == 1:
-            # d_*_cm may be a transposed (non-contiguous) view; realize the
-            # [D, N, N] channel-major layout without a row-major copy so the
-            # [M, D] strided view is well-defined.
-            d_a_cm_c = (
-                d_a_cm.reshape(D, N, N).contiguous()
-                if not d_a_cm.is_contiguous()
-                else d_a_cm.reshape(D, N, N)
-            )
-            d_b_cm_c = (
-                d_b_cm.reshape(D, N, N).contiguous()
-                if not d_b_cm.is_contiguous()
-                else d_b_cm.reshape(D, N, N)
-            )
+            # d_a_cm / d_b_cm are emitted directly in [D, N, N] channel-major, so
+            # these reshapes are free views and .contiguous() is a no-op in the
+            # common case; it copies only if a non-contiguous view ever slips
+            # through, keeping the as_strided below well-defined.
+            d_a_cm_c = d_a_cm.reshape(D, N, N).contiguous()
+            d_b_cm_c = d_b_cm.reshape(D, N, N).contiguous()
             NN = N * N
             d_a = d_a_cm_c.reshape(D, NN).as_strided((NN, D), (1, NN))
             d_b = d_b_cm_c.reshape(D, NN).as_strided((NN, D), (1, NN))
@@ -1342,7 +1338,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             # back to row-major [M, D]
             d_a = d_a_cm.reshape(Bflat, D, N, N).permute(0, 2, 3, 1).reshape(M, D)
             d_b = d_b_cm.reshape(Bflat, D, N, N).permute(0, 2, 3, 1).reshape(M, D)
-        del d_a_comb, d_b_comb, d_a_cm, d_b_cm
+        del d_a_cm, d_b_cm
 
         # ---- Input projections backward ----
         # a = mask * sigmoid(z_n @ Wag^T) * (z_n @ Wap^T)
