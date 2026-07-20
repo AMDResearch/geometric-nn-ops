@@ -116,6 +116,70 @@ def _cfg_proj_bwd(*, dtype):
 if TRITON_AVAILABLE:
 
     @triton.jit
+    def _transpose_2d_batched(
+        In_ptr,
+        Out_ptr,
+        stride_ib,
+        stride_ir,
+        stride_ic,
+        stride_ob,
+        stride_oc,
+        stride_or,
+        R,
+        C,
+        BLOCK_R: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        """Batched 2D transpose ``Out[b, c, r] = In[b, r, c]`` via tiled copy.
+
+        For each batch ``b`` a row-major ``[R, C]`` matrix ``In`` is transposed
+        into a row-major ``[C, R]`` matrix ``Out``. A program loads a coalesced
+        ``[BLOCK_R, BLOCK_C]`` tile from ``In`` (fast axis C is contiguous, so
+        the read coalesces), transposes it in registers with ``tl.trans``, and
+        stores the ``[BLOCK_C, BLOCK_R]`` result into ``Out`` (fast axis R is
+        contiguous, so the write coalesces). Neither access is strided on its
+        fast axis, so the copy runs near HBM peak instead of torch's slow strided
+        ``.permute().contiguous()``.
+
+        Strides are passed explicitly so the same kernel serves both directions
+        of the channel-major <-> channel-last conversion; the caller just points
+        (R, C, strides) at the layout it has and wants.
+        """
+        pid_b = tl.program_id(0)
+        pid_r = tl.program_id(1)
+        pid_c = tl.program_id(2)
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+        b_i64 = pid_b.to(tl.int64)
+        in_base = In_ptr + b_i64 * stride_ib
+        out_base = Out_ptr + b_i64 * stride_ob
+
+        # Coalesced read of In[rr:rr+BR, cc:cc+BC] (C is the fast axis of In).
+        in_off = (
+            offs_r[:, None].to(tl.int64) * stride_ir
+            + offs_c[None, :].to(tl.int64) * stride_ic
+        )
+        tile = tl.load(
+            in_base + in_off,
+            mask=(offs_r[:, None] < R) & (offs_c[None, :] < C),
+            other=0.0,
+        )
+        # Register transpose -> [BLOCK_C, BLOCK_R], then coalesced store into
+        # Out[cc:cc+BC, rr:rr+BR] (R is the fast axis of Out).
+        tile_t = tl.trans(tile)
+        out_off = (
+            offs_c[:, None].to(tl.int64) * stride_oc
+            + offs_r[None, :].to(tl.int64) * stride_or
+        )
+        tl.store(
+            out_base + out_off,
+            tile_t,
+            mask=(offs_c[:, None] < C) & (offs_r[None, :] < R),
+        )
+
+    @triton.jit
     def _fused_gemm_sigmoid_multiply_channel_major(
         A_ptr,
         W_g_ptr,
@@ -761,15 +825,88 @@ def _combine_projection(a, b, batch_dims, c_hidden):
     any custom kernel.
     """
     BC, N, _ = a.shape
-    out = torch.bmm(a, b)
+    out = torch.bmm(a, b)  # [BC, N, N] channel-major = [Bflat, C, N*N]
     Bflat = 1
     for d in batch_dims:
         Bflat *= d
-    out = (
-        out.reshape(Bflat, c_hidden, N, N)
-        .permute(0, 2, 3, 1)
-        .reshape(Bflat, N, N, c_hidden)
+    # Channel-major -> channel-last via the tiled Triton transpose (near HBM
+    # peak), instead of torch's slow strided .permute().contiguous().
+    x_flat = _transpose_channel_major_to_last(out, Bflat, c_hidden, N * N)
+    return x_flat.reshape(Bflat, N, N, c_hidden)
+
+
+def _cfg_transpose():
+    # Tuned on MI300X.
+    return {"BLOCK_R": 64, "BLOCK_C": 128, "num_warps": 4, "num_stages": 2}
+
+
+# Below this per-batch spatial size R (= N*N), the channel-major<->channel-last
+# transpose is small enough that torch's strided copy beats the Triton tiled
+# transpose's fixed launch overhead (measured crossover ~N=512 on MI300X).
+_TRANSPOSE_MIN_R = 512 * 512
+
+
+def _launch_transpose(x_in, out, Bflat, kR, kC):
+    """Launch the tiled transpose for row-major per-batch ``[kR, kC] -> [kC, kR]``.
+
+    ``x_in`` is a row-major ``[Bflat, kR, kC]`` (kC the fast/contiguous axis) and
+    ``out`` a row-major ``[Bflat, kC, kR]`` (kR fast). The kernel reads In coalesced
+    along kC and writes Out coalesced along kR.
+    """
+    cfg = _cfg_transpose()
+
+    def grid(meta):
+        return (
+            Bflat,
+            triton.cdiv(kR, meta["BLOCK_R"]),
+            triton.cdiv(kC, meta["BLOCK_C"]),
+        )
+
+    _transpose_2d_batched[grid](
+        x_in,
+        out,
+        x_in.stride(0),
+        x_in.stride(1),
+        x_in.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        kR,
+        kC,
+        **cfg,
     )
+
+
+def _transpose_channel_major_to_last(x_cm, Bflat, C, R):
+    """Channel-major ``[Bflat*C, ...]`` (rows R contiguous) -> channel-last [R,C].
+
+    ``x_cm`` is viewed row-major as ``[Bflat, C, R]`` (per batch: C channels, each
+    R contiguous spatial elems). Returns a contiguous ``[Bflat, R, C]`` via the
+    tiled Triton transpose. Turns the combine's channel-major bmm output into the
+    channel-last layout LN_out / out-proj consume, near HBM peak.
+    """
+    if R < _TRANSPOSE_MIN_R:
+        return x_cm.reshape(Bflat, C, R).transpose(1, 2).contiguous()
+    x_in = x_cm.reshape(Bflat, C, R)
+    out = torch.empty(Bflat, R, C, device=x_cm.device, dtype=x_cm.dtype)
+    # Per batch In is [C, R] (R fast) and Out is [R, C] (C fast): kR=C, kC=R.
+    _launch_transpose(x_in, out, Bflat, C, R)
+    return out
+
+
+def _transpose_channel_last_to_major(x_cl, Bflat, C, R):
+    """Channel-last ``[Bflat, R, C]`` -> channel-major ``[Bflat*C, ...]`` (R fast).
+
+    Inverse of :func:`_transpose_channel_major_to_last`. Returns a contiguous
+    ``[Bflat, C, R]`` buffer (viewable as ``[Bflat*C, ...]``) for the combine
+    backward's channel-major bmm operands.
+    """
+    if R < _TRANSPOSE_MIN_R:
+        return x_cl.reshape(Bflat, R, C).transpose(1, 2).contiguous()
+    x_in = x_cl.reshape(Bflat, R, C)
+    out = torch.empty(Bflat, C, R, device=x_cl.device, dtype=x_cl.dtype)
+    # Per batch In is [R, C] (C fast) and Out is [C, R] (R fast): kR=R, kC=C.
+    _launch_transpose(x_in, out, Bflat, R, C)
     return out
 
 
@@ -1001,7 +1138,9 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             b_comb = b_cm
 
         x_out = _combine_projection(a_comb, b_comb, batch_dims, D)  # [Bflat,N,N,D]
-        x_flat = x_out.reshape(-1, D).contiguous()
+        # _combine_projection already returns a contiguous channel-last buffer
+        # (the tiled transpose wrote it), so this is a free view, not a copy.
+        x_flat = x_out.reshape(-1, D)
 
         x_n_flat, mean_out, rstd_out = _triton_layernorm(
             x_flat, norm_out_weight, norm_out_bias, eps, save_stats=True
@@ -1144,15 +1283,12 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         for d in batch_dims:
             Bflat *= d
         # d_x_flat is already cdtype (LN backward emits the compute dtype). The
-        # permute to channel-major needs a contiguous buffer: passing d_x as a
-        # strided view directly to the combine GEMMs was measured ~3x slower on
-        # MI300X (non-unit stride on the GEMM's inner dims destroys coalescing
-        # and the combine GEMM is compute/layout-bound).
-        d_x_cm = (
-            d_x_flat.reshape(Bflat, N, N, D)
-            .permute(0, 3, 1, 2)
-            .reshape(Bflat * D, N, N)
-            .contiguous()
+        # combine GEMMs want a contiguous channel-major buffer (a strided view
+        # was measured ~3x slower on MI300X); the channel-last -> channel-major
+        # conversion runs through the tiled Triton transpose (near HBM peak)
+        # instead of torch's slow strided .permute().contiguous().
+        d_x_cm = _transpose_channel_last_to_major(d_x_flat, Bflat, D, N * N).reshape(
+            Bflat * D, N, N
         )
         del d_x_flat
 
