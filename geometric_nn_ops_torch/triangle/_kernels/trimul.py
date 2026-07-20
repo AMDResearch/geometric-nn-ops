@@ -127,6 +127,7 @@ if TRITON_AVAILABLE:
         stride_or,
         R,
         C,
+        BIG_IS_R: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -145,9 +146,17 @@ if TRITON_AVAILABLE:
         of the channel-major <-> channel-last conversion; the caller just points
         (R, C, strides) at the layout it has and wants.
         """
-        pid_b = tl.program_id(0)
-        pid_r = tl.program_id(1)
-        pid_c = tl.program_id(2)
+        # Put the larger tile axis grid.x to avoid overflow. See note at top of
+        # file.
+        pid_big = tl.program_id(0)
+        pid_small = tl.program_id(1)
+        pid_b = tl.program_id(2)
+        if BIG_IS_R:
+            pid_r = pid_big
+            pid_c = pid_small
+        else:
+            pid_r = pid_small
+            pid_c = pid_big
 
         offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
         offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -850,12 +859,12 @@ def _launch_transpose(x_in, out, Bflat, kR, kC):
     """
     cfg = _cfg_transpose()
 
-    def grid(meta):
-        return (
-            Bflat,
-            triton.cdiv(kR, meta["BLOCK_R"]),
-            triton.cdiv(kC, meta["BLOCK_C"]),
-        )
+    # Keep the larger tile axis on grid dim x with a larger limit. See kernel
+    # function docstring.
+    n_r = triton.cdiv(kR, cfg["BLOCK_R"])
+    n_c = triton.cdiv(kC, cfg["BLOCK_C"])
+    big_is_r = n_r >= n_c
+    grid = (max(n_r, n_c), min(n_r, n_c), Bflat)
 
     _transpose_2d_batched[grid](
         x_in,
@@ -868,6 +877,7 @@ def _launch_transpose(x_in, out, Bflat, kR, kC):
         out.stride(2),
         kR,
         kC,
+        BIG_IS_R=big_is_r,
         **cfg,
     )
 
