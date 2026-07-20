@@ -1466,18 +1466,32 @@ def trimul_triton(
     else:
         mask_flat = mask.expand(x.shape[:-1]).reshape(-1, n, n).contiguous()
 
+    # Under autocast the caller can pass an fp32 pair representation alongside
+    # fp32 weights while the intended compute dtype is bf16. Every tl.dot
+    # operand has to share one dtype, so reconcile against the autocast dtype
+    # when it is on. Casting here is what autocast would do for a plain matmul.
+    device = x.device.type
+    compute_dtype = (
+        torch.get_autocast_dtype(device)
+        if torch.is_autocast_enabled(device)
+        else x.dtype
+    )
+
+    def cast(tensor):
+        return None if tensor is None else tensor.to(compute_dtype)
+
     out = _TriangleMultiplicativeUpdateFn.apply(
-        x_flat,
-        mask_flat,
+        cast(x_flat),
+        cast(mask_flat),
         is_outgoing(direction),
-        norm_in_weight,
-        norm_in_bias,
-        p_in_weight,
-        g_in_weight,
-        norm_out_weight,
-        norm_out_bias,
-        p_out_weight,
-        g_out_weight,
+        cast(norm_in_weight),
+        cast(norm_in_bias),
+        cast(p_in_weight),
+        cast(g_in_weight),
+        cast(norm_out_weight),
+        cast(norm_out_bias),
+        cast(p_out_weight),
+        cast(g_out_weight),
         eps,
     )
     return out.reshape(*batch_dims, n, n, d)

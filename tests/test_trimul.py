@@ -505,6 +505,23 @@ def test_unsupported_configs_use_the_reference(config):
     assert not spy.kernel.called
 
 
+@requires_gpu
+@pytest.mark.parametrize(
+    "autocast_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
+)
+def test_autocast_mixed_dtype(autocast_dtype):
+    """Under autocast the caller passes fp32 tensors while the compute dtype is
+    narrower. Every ``tl.dot`` operand has to end up in one dtype."""
+    x, mask, weights = build_config(dtype=torch.float32, input_requires_grad=True)
+
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        out = triangle_multiplicative_update(x, "outgoing", mask, **weights)
+    out.sum().backward()
+
+    assert out.dtype == autocast_dtype
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
 def test_cpu_is_differentiable():
     """The public op on CPU, where there is no kernel to route to. Gradients
     still have to flow to every parameter."""
