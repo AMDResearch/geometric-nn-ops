@@ -13,12 +13,18 @@ training.
     per-channel batched matmul that combines the two projections.
   * Backward is a hybrid: the heavy per-channel combine matmul reuses the
     batched-GEMM Triton kernel (transposed operands give the two combine
-    gradients); the remaining LayerNorm / linear / sigmoid / elementwise steps
-    are differentiated with eager PyTorch ops (cheap relative to the fused
-    projections).
+    gradients); the two LayerNorm backwards use a fused Triton kernel
+    (``_layer_norm_2d_bwd``); the input-projection backward fuses its recompute
+    + sigmoid-derivative pointwise into a Triton kernel
+    (``_proj_in_bwd_grads``); the remaining output-projection linear / sigmoid
+    / elementwise steps are differentiated with eager PyTorch ops (cheap
+    relative to the fused projections).
 
 The autograd.Function saves only minimal intermediates and recomputes the input
-projections in backward, trading compute for a large activation-memory saving.
+projections (and the output gate pre-activation) in backward, trading compute
+for a large activation-memory saving. Large [M, D] pointwise intermediates stay
+in the compute dtype (bf16). Together these keep the training peak at/below
+eager.
 
 Weight convention (fused layout, bias-free projections): ``p_in_weight`` /
 ``g_in_weight`` are ``[2D, D]`` (rows ``0:D`` -> ``a``, ``D:2D`` -> ``b``);
@@ -45,56 +51,75 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 
-def _cfg_fused_gemm(*, N):
+def _cfg_fused_gemm(*, N, spatial=None):
+    """Fused projection GEMM (M = spatial^2 rows, K = D, N_out = D).
+
+    Tuned on MI300X.
+    """
     block_n = min(128, max(16, triton.next_power_of_2(N)))
-    if block_n <= 64:
-        return {
-            "BLOCK_M": 128,
-            "BLOCK_N": block_n,
-            "BLOCK_K": 32,
-            "num_warps": 8,
-            "num_stages": 1,
-        }
+    num_warps = 8 if block_n <= 64 else 16
     return {
         "BLOCK_M": 128,
         "BLOCK_N": block_n,
         "BLOCK_K": 32,
-        "num_warps": 16,
+        "num_warps": num_warps,
         "num_stages": 2,
     }
 
 
 def _cfg_batched_gemm(*, N, total_channels):
-    if N <= 640:
+    """Per-channel combine GEMM (BC channels of [N,N] @ [N,N]).
+
+    Tuned on MI300X.
+    """
+    if N <= 256:
         return {
             "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 64,
             "GROUP_SIZE_M": 4,
             "num_warps": 4,
             "num_stages": 2,
         }
-    elif total_channels <= 64:
+    if N <= 512:
         return {
-            "BLOCK_M": 128,
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+    if N <= 768:
+        return {
+            "BLOCK_M": 64,
             "BLOCK_N": 128,
-            "BLOCK_K": 32,
+            "BLOCK_K": 64,
             "GROUP_SIZE_M": 4,
             "num_warps": 8,
-            "num_stages": 3,
+            "num_stages": 2,
         }
     return {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 32,
-        "GROUP_SIZE_M": 4,
-        "num_warps": 4,
-        "num_stages": 1,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 8,
+        "num_stages": 2,
     }
 
 
 def _cfg_layer_norm():
-    return {"BLOCK_ROWS": 16, "BLOCK_C": 64, "num_warps": 2, "num_stages": 3}
+    # MI300X: BLOCK_C=128 covers the full C=128 row in one pass (no inner loop);
+    # BLOCK_ROWS=4 with a single warp is fastest for both bf16 and fp32.
+    return {"BLOCK_ROWS": 4, "BLOCK_C": 128, "num_warps": 1, "num_stages": 2}
+
+
+def _cfg_layer_norm_bwd(*, C):
+    # dx kernel: programs grid-stride over rows; whole channel dim in one block
+    # (C == D is small, <= a few hundred). Reductions across C are in-register.
+    block_c = max(16, triton.next_power_of_2(C))
+    return {"BLOCK_C": block_c, "num_warps": 4, "num_stages": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +393,94 @@ if TRITON_AVAILABLE:
         )
 
     @triton.jit
+    def _proj_in_bwd_grads(
+        Zn_ptr,
+        W_p_ptr,
+        W_g_ptr,
+        Dout_ptr,
+        mask_ptr,
+        Dap_ptr,
+        Dag_ptr,
+        stride_Zi,
+        stride_Zk,
+        stride_Wpk,
+        stride_Wpj,
+        stride_Wgk,
+        stride_Wgj,
+        stride_Di,
+        stride_Dj,
+        M,
+        K,
+        N,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Fused input-projection backward pointwise grads.
+
+        Recomputes proj ``ap = Zn @ W_p^T`` and gate preact ``ag = Zn @ W_g^T``
+        (over K=D), then produces, all in fp32 internally::
+
+            m           = mask[row]
+            sa          = sigmoid(ag)
+            d_after     = Dout * m
+            d_ap        = d_after * sa
+            d_ag        = d_after * ap * sa * (1 - sa)
+
+        Writing ``d_ap`` and ``d_ag`` (compute dtype) directly. This fuses the two
+        recompute GEMMs with the sigmoid-derivative elementwise math so no large
+        fp32 [M, D] temporaries (ap, sa, d_after, ...) hit HBM; the downstream
+        weight/input GEMMs then run in the compute dtype via ``torch.bmm``.
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m_i64 = offs_m.to(tl.int64)
+
+        acc_p = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            Z = tl.load(
+                Zn_ptr + offs_m_i64[:, None] * stride_Zi + offs_k[None, :] * stride_Zk,
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+                other=0.0,
+            )
+            W_p = tl.load(
+                W_p_ptr + offs_k[:, None] * stride_Wpk + offs_n[None, :] * stride_Wpj,
+                mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            W_g = tl.load(
+                W_g_ptr + offs_k[:, None] * stride_Wgk + offs_n[None, :] * stride_Wgj,
+                mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            Zf = Z.to(tl.float32)
+            acc_p = tl.dot(Zf, W_p.to(tl.float32), acc_p)
+            acc_g = tl.dot(Zf, W_g.to(tl.float32), acc_g)
+
+        m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0)
+        d_out = tl.load(
+            Dout_ptr + offs_m_i64[:, None] * stride_Di + offs_n[None, :] * stride_Dj,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+
+        sa = 1.0 / (1.0 + tl.exp(-acc_g))
+        d_after = d_out * m[:, None]
+        d_ap = d_after * sa
+        d_ag = d_after * acc_p * sa * (1.0 - sa)
+
+        store_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        out_off = offs_m_i64[:, None] * N + offs_n[None, :]
+        tl.store(Dap_ptr + out_off, d_ap, mask=store_mask)
+        tl.store(Dag_ptr + out_off, d_ag, mask=store_mask)
+
+    @triton.jit
     def _layer_norm_2d_fwd(
         X,
         Y,
@@ -432,6 +545,72 @@ if TRITON_AVAILABLE:
                     y = x_hat * w + b
                     tl.store(Y_row + c_offsets, y, mask=cmask & row_valid)
 
+    @triton.jit
+    def _layer_norm_2d_bwd(
+        DY,
+        X,
+        W,
+        Mean,
+        Rstd,
+        DX,
+        DW_partial,
+        DB_partial,
+        stride_dy,
+        stride_x,
+        stride_dx,
+        total_rows,
+        C,
+        n_programs,
+        BLOCK_C: tl.constexpr,
+    ):
+        """Backward of row-wise LayerNorm over the last dim (C).
+
+        Each program grid-strides over rows (stride = n_programs), processing the
+        full channel dim in a single block (BLOCK_C >= C). It writes dx per row
+        and accumulates its partial dweight/dbias across the rows it visits into
+        DW_partial/DB_partial (shape [n_programs, C]); the caller sums those over
+        the program axis (a native torch reduction). All math is in fp32.
+        """
+        pid = tl.program_id(0)
+
+        c_offsets = tl.arange(0, BLOCK_C)
+        cmask = c_offsets < C
+        w = tl.load(W + c_offsets, mask=cmask, other=0.0).to(tl.float32)
+
+        dw_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        db_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+        C_f = C.to(tl.float32)
+
+        for row in range(pid, total_rows, n_programs):
+            row_i64 = row.to(tl.int64)
+            dy = tl.load(
+                DY + row_i64 * stride_dy + c_offsets, mask=cmask, other=0.0
+            ).to(tl.float32)
+            x = tl.load(X + row_i64 * stride_x + c_offsets, mask=cmask, other=0.0).to(
+                tl.float32
+            )
+            rstd = tl.load(Rstd + row_i64).to(tl.float32)
+            mean = tl.load(Mean + row_i64).to(tl.float32)
+            # Recompute x_hat from the saved pre-norm combine result. We tried
+            # reconstructing it from the affine output, which would avoid the
+            # need to store the pre-norm input, but this breaks at gamma=0 and
+            # the memory savings didn't seem worth special casing for.
+            x_hat = (x - mean) * rstd
+            dy_w = dy * w
+            # Reductions over the channel dim (masked-out lanes are 0).
+            mean_dy_w = tl.sum(dy_w) / C_f
+            mean_dy_w_xhat = tl.sum(dy_w * x_hat) / C_f
+            dx = rstd * (dy_w - mean_dy_w - x_hat * mean_dy_w_xhat)
+            tl.store(DX + row_i64 * stride_dx + c_offsets, dx, mask=cmask)
+
+            dw_acc += dy * x_hat
+            db_acc += dy
+
+        out_off = pid.to(tl.int64) * C + c_offsets
+        tl.store(DW_partial + out_off, dw_acc, mask=cmask)
+        tl.store(DB_partial + out_off, db_acc, mask=cmask)
+
 
 # ---------------------------------------------------------------------------
 # Python-side launch helpers
@@ -470,6 +649,64 @@ def _triton_layernorm(x_flat, weight, bias, eps, save_stats=False):
     if save_stats:
         return y, mean, rstd
     return y, None, None
+
+
+def _triton_layernorm_backward(dy, x, weight, mean, rstd, out_dtype=None):
+    """Fused Triton backward of LayerNorm over last dim of [M, C] tensors.
+
+    Args:
+        dy: [M, C]
+        x: raw pre-norm input
+        weight: [C]
+        mean: [M]
+        rstd: [M]
+        out_dtype: return type for dx (default dy.dtype)
+
+    dweight/dbias are always returned in fp32. All reductions run in fp32. Math (per
+    row m, channel c, with x_hat = (x - mean) * rstd and dy_w = dy * weight):
+
+        dx[m,c]  = rstd[m] * (dy_w[m,c] - mean_c(dy_w[m]) - x_hat[m,c] *
+                              mean_c(dy_w[m] * x_hat[m]))
+        dweight  = sum_m (dy[m] * x_hat[m])
+        dbias    = sum_m dy[m]
+    """
+    M, C = x.shape
+    if out_dtype is None:
+        out_dtype = dy.dtype
+    dy = dy.contiguous()
+    x = x.contiguous()
+    dx = torch.empty(M, C, device=x.device, dtype=out_dtype)
+    cfg = _cfg_layer_norm_bwd(C=C)
+
+    # Bound the number of programs so the partial buffer + its reduction stay
+    # small; each program grid-strides over its share of rows.
+    num_programs = min(M, 8192)
+
+    dw_partial = torch.empty(num_programs, C, device=x.device, dtype=torch.float32)
+    db_partial = torch.empty(num_programs, C, device=x.device, dtype=torch.float32)
+
+    _layer_norm_2d_bwd[(num_programs,)](
+        dy,
+        x,
+        weight,
+        mean,
+        rstd,
+        dx,
+        dw_partial,
+        db_partial,
+        dy.stride(0),
+        x.stride(0),
+        dx.stride(0),
+        M,
+        C,
+        num_programs,
+        **cfg,
+    )
+
+    # Sum partials over the program axis with a native torch reduction.
+    dweight = dw_partial.sum(dim=0)
+    dbias = db_partial.sum(dim=0)
+    return dx, dweight, dbias
 
 
 def _combine_projection(a, b, batch_dims, c_hidden):
@@ -556,38 +793,59 @@ def _combine_projection_raw(a, b):
 
 
 # ---------------------------------------------------------------------------
-# Backward helpers (eager PyTorch; correctness-first hybrid).
+# Backward helpers.
 # ---------------------------------------------------------------------------
 
 
-def _layernorm_backward(dy, x, weight, mean, rstd, eps):
-    """Backward of LayerNorm over last dim. All [M, C]. mean/rstd [M] fp32.
+def _proj_in_bwd_pointwise(z_n, Wp_t, Wg_t, d_out, mask_col_flat):
+    """Fused recompute + sigmoid-derivative for the input-projection backward.
 
-    Returns (dx, dweight, dbias). dweight/dbias summed over rows.
+    z_n: [M, D] (compute dtype). Wp_t/Wg_t: [D, D] = W^T (K, N) contiguous.
+    d_out: [M, D] (compute dtype). mask_col_flat: [M] fp32.
+    Returns (d_ap, d_ag), each [M, D] in the compute dtype.
     """
-    M, C = x.shape
-    x = x.float()
-    dy = dy.float()
-    w = weight.float()
-    mean = mean.view(M, 1)
-    rstd = rstd.view(M, 1)
-    x_hat = (x - mean) * rstd
-    # dx
-    dy_w = dy * w
-    dx = rstd * (
-        dy_w
-        - dy_w.mean(dim=1, keepdim=True)
-        - x_hat * (dy_w * x_hat).mean(dim=1, keepdim=True)
+    M, K = z_n.shape
+    N = Wp_t.shape[1]
+    cdtype = z_n.dtype
+    d_ap = torch.empty(M, N, device=z_n.device, dtype=cdtype)
+    d_ag = torch.empty(M, N, device=z_n.device, dtype=cdtype)
+    fg = _cfg_fused_gemm(N=N)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
+
+    _proj_in_bwd_grads[grid](
+        z_n,
+        Wp_t,
+        Wg_t,
+        d_out,
+        mask_col_flat,
+        d_ap,
+        d_ag,
+        z_n.stride(0),
+        z_n.stride(1),
+        Wp_t.stride(0),
+        Wp_t.stride(1),
+        Wg_t.stride(0),
+        Wg_t.stride(1),
+        d_out.stride(0),
+        d_out.stride(1),
+        M,
+        K,
+        N,
+        BLOCK_M=fg["BLOCK_M"],
+        BLOCK_N=fg["BLOCK_N"],
+        BLOCK_K=fg["BLOCK_K"],
+        num_warps=fg["num_warps"],
+        num_stages=fg["num_stages"],
     )
-    dweight = (dy * x_hat).sum(dim=0)
-    dbias = dy.sum(dim=0)
-    return dx, dweight, dbias
+    return d_ap, d_ag
 
 
 class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
     """Differentiable TMU. Forward uses Triton fused kernels; backward is a
-    correctness-first hybrid (Triton batched-GEMM for the combine step, eager
-    PyTorch for LN/linear/sigmoid/elementwise).
+    hybrid (Triton batched-GEMM for the combine step, fused Triton LayerNorm
+    backward, eager PyTorch for linear/sigmoid/elementwise).
 
     Weight convention (fused, bias-free): W_p_in / W_g_in are [2D, D] (rows 0:D
     -> a, D:2D -> b); W_z (= linear_z) and W_g_out (= linear_g) are [D, D]. All
@@ -643,7 +901,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         a_cm = torch.empty(B * D, N, N, device=z.device, dtype=compute_dtype)
         b_cm = torch.empty(B * D, N, N, device=z.device, dtype=compute_dtype)
 
-        fg = _cfg_fused_gemm(N=D)
+        fg = _cfg_fused_gemm(N=D, spatial=N)
 
         def proj_grid(meta):
             return (triton.cdiv(M, meta["BLOCK_M"]), 1, triton.cdiv(D, meta["BLOCK_N"]))
@@ -700,10 +958,10 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
 
         # Direction-specific transposes for the combine matmul.
         if outgoing:
-            b_comb = b_cm.transpose(-1, -2).contiguous()
+            b_comb = b_cm.transpose(-1, -2)
             a_comb = a_cm
         else:
-            a_comb = a_cm.transpose(-1, -2).contiguous()
+            a_comb = a_cm.transpose(-1, -2)
             b_comb = b_cm
 
         x_out = _combine_projection(a_comb, b_comb, batch_dims, D)  # [Bflat,N,N,D]
@@ -717,7 +975,8 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         W_p_out = p_out_weight.T.contiguous()
 
         out_flat = torch.empty(M, D, device=z.device, dtype=compute_dtype)
-        g_out_pre = torch.empty(M, D, device=z.device, dtype=torch.float32)
+        # Gate pre-activation is not saved: backward recomputes z_n @ Wg_out^T
+        # (one cheap [M,D]@[D,D] GEMM) rather than carrying a [M,D] fp32 buffer.
 
         def out_grid(meta):
             return (triton.cdiv(M, meta["BLOCK_M"]), 1, triton.cdiv(D, meta["BLOCK_N"]))
@@ -741,24 +1000,23 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             M,
             D,
             D,
-            True,
-            g_out_pre,
+            False,  # SAVE_G
+            None,  # G_ptr: unused when SAVE_G=False (constexpr branch compiled out)
             **fg,
         )
 
         ctx.save_for_backward(
-            z_flat,
             mask_flat,
             z_n_flat,
+            z_flat,
             mean_in,
             rstd_in,
             a_cm,
             b_cm,
-            x_flat,
             x_n_flat,
+            x_flat,
             mean_out,
             rstd_out,
-            g_out_pre,
             p_in_weight,
             g_in_weight,
             p_out_weight,
@@ -780,18 +1038,17 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         (
-            z_flat,
             mask_flat,
             z_n_flat,
+            z_flat,
             mean_in,
             rstd_in,
             a_cm,
             b_cm,
-            x_flat,
             x_n_flat,
+            x_flat,
             mean_out,
             rstd_out,
-            g_out_pre,
             p_in_weight,
             g_in_weight,
             p_out_weight,
@@ -802,10 +1059,9 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             norm_out_bias,
         ) = ctx.saved_tensors
         outgoing = ctx.outgoing
-        eps = ctx.eps
         N, D = ctx.N, ctx.D
         batch_dims = ctx.batch_dims
-        M = z_flat.shape[0]
+        M = z_n_flat.shape[0]
 
         # Precision: GEMM operands are the compute dtype (e.g. bf16 under
         # autocast) elementwise ops and matmuls accumulation happen in fp32 in
@@ -818,35 +1074,47 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         Wg_out = g_out_weight.to(cdtype)
 
         # ---- Output projection backward ----
-        # out = sigmoid(z_n @ Wg^T) * (x_n @ Wz^T)
-        sig_g = torch.sigmoid(g_out_pre)  # fp32 (saved preact)
-        xz = (x_n @ Wz.T).float()  # proj [M, D]
-        go = grad_out_flat.float()
-        d_g_pre = (go * xz * sig_g * (1.0 - sig_g)).to(cdtype)  # wrt gate preact
-        d_proj = (go * sig_g).to(cdtype)  # wrt proj
+        # out = sigmoid(z_n @ Wg^T) * (x_n @ Wz^T). Gate preact recomputed here
+        # (not saved) to avoid carrying a [M, D] buffer from forward.
+        sig_g = torch.sigmoid((z_n @ Wg_out.T).float()).to(cdtype)  # [M, D]
+        xz = x_n @ Wz.T  # proj [M, D], cdtype
+        d_g_pre = grad_out_flat * xz * sig_g * (1.0 - sig_g)  # wrt gate preact
+        del xz
+        d_proj = grad_out_flat * sig_g  # wrt proj
+        del sig_g
 
         d_p_out_weight = d_proj.T @ x_n  # [D, D]
-        d_x_n = d_proj @ Wz  # [M, D]
+        d_x_n = d_proj @ Wz  # [M, D], cdtype
+        del d_proj
         d_g_out_weight = d_g_pre.T @ z_n  # [D, D]
-        d_z_n = (d_g_pre @ Wg_out).float()  # accumulate (fp32)
+        d_z_n = d_g_pre @ Wg_out  # accumulate (cdtype)
+        del d_g_pre
 
         # ---- LN_out backward ----
-        d_x_flat, d_norm_out_weight, d_norm_out_bias = _layernorm_backward(
-            d_x_n, x_flat, norm_out_weight, mean_out, rstd_out, eps
+        d_x_flat, d_norm_out_weight, d_norm_out_bias = _triton_layernorm_backward(
+            d_x_n,
+            x_flat,
+            norm_out_weight,
+            mean_out,
+            rstd_out,
         )
+        del d_x_n
 
         # ---- Combine backward ----
         # x[bflat,N,N,D] = combine(a_comb,b_comb) per channel.
         Bflat = 1
         for d in batch_dims:
             Bflat *= d
+        # d_x_flat is already cdtype (LN backward emits the compute dtype). The
+        # permute to channel-major needs a contiguous buffer for the GEMM's
+        # channel stride; this copy is unavoidable but stays in cdtype.
         d_x_cm = (
-            d_x_flat.to(cdtype)
-            .reshape(Bflat, N, N, D)
+            d_x_flat.reshape(Bflat, N, N, D)
             .permute(0, 3, 1, 2)
             .reshape(Bflat * D, N, N)
             .contiguous()
         )
+        del d_x_flat
 
         # The batched GEMM kernel reads operands via arbitrary strides, so
         # transposed views can be passed directly (no .contiguous() copies).
@@ -860,6 +1128,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # p = a_comb @ b_comb  -> da = dp @ b_comb^T ; db = a_comb^T @ dp
         d_a_comb = _combine_projection_raw(d_x_cm, b_comb.transpose(-1, -2))
         d_b_comb = _combine_projection_raw(a_comb.transpose(-1, -2), d_x_cm)
+        del d_x_cm
 
         if outgoing:
             d_a_cm = d_a_comb
@@ -871,33 +1140,47 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # back to row-major [M, D]
         d_a = d_a_cm.reshape(Bflat, D, N, N).permute(0, 2, 3, 1).reshape(M, D)
         d_b = d_b_cm.reshape(Bflat, D, N, N).permute(0, 2, 3, 1).reshape(M, D)
+        del d_a_comb, d_b_comb, d_a_cm, d_b_cm
 
         # ---- Input projections backward ----
         # a = mask * sigmoid(z_n @ Wag^T) * (z_n @ Wap^T)
-        mask_col = mask_flat.float().view(M, 1)
         Wap = p_in_weight[:D].to(cdtype)
         Wbp = p_in_weight[D:].to(cdtype)
         Wag = g_in_weight[:D].to(cdtype)
         Wbg = g_in_weight[D:].to(cdtype)
+        # W^T = [K, N] = [D, D] contiguous for the fused-recompute kernel.
+        Wap_t = Wap.T.contiguous()
+        Wbp_t = Wbp.T.contiguous()
+        Wag_t = Wag.T.contiguous()
+        Wbg_t = Wbg.T.contiguous()
 
-        def proj_in_bwd(d_out, Wp, Wg):
-            ap = (z_n @ Wp.T).float()
-            sa = torch.sigmoid((z_n @ Wg.T).float())
-            d_after_mask = d_out.float() * mask_col
-            d_ap = (d_after_mask * sa).to(cdtype)
-            d_ag = (d_after_mask * ap * sa * (1.0 - sa)).to(cdtype)
-            d_Wp = d_ap.T @ z_n
-            d_Wg = d_ag.T @ z_n
-            d_zn = (d_ap @ Wp + d_ag @ Wg).float()
+        def proj_in_bwd(d_out, Wp, Wg, Wp_t, Wg_t):
+            # Fused Triton kernel recomputes proj/gate and does the sigmoid-deriv
+            # pointwise, emitting d_ap/d_ag directly (no large fp32 temporaries).
+            d_ap, d_ag = _proj_in_bwd_pointwise(
+                z_n, Wp_t, Wg_t, d_out.to(cdtype).contiguous(), mask_flat
+            )
+            d_Wp = (d_ap.T @ z_n).float()  # [D, D]
+            d_Wg = (d_ag.T @ z_n).float()  # [D, D]
+            d_zn = d_ap @ Wp + d_ag @ Wg  # cdtype
             return d_zn, d_Wp, d_Wg
 
-        d_zn_a, d_Wap, d_Wag = proj_in_bwd(d_a, Wap, Wag)
-        d_zn_b, d_Wbp, d_Wbg = proj_in_bwd(d_b, Wbp, Wbg)
-        d_z_n = d_z_n + d_zn_a + d_zn_b
+        d_zn_a, d_Wap, d_Wag = proj_in_bwd(d_a, Wap, Wag, Wap_t, Wag_t)
+        del d_a
+        d_z_n = d_z_n + d_zn_a
+        del d_zn_a
+        d_zn_b, d_Wbp, d_Wbg = proj_in_bwd(d_b, Wbp, Wbg, Wbp_t, Wbg_t)
+        del d_b
+        d_z_n = d_z_n + d_zn_b
+        del d_zn_b
 
         # ---- LN_in backward ----
-        d_z_flat, d_norm_in_weight, d_norm_in_bias = _layernorm_backward(
-            d_z_n, z_flat, norm_in_weight, mean_in, rstd_in, eps
+        d_z_flat, d_norm_in_weight, d_norm_in_bias = _triton_layernorm_backward(
+            d_z_n,
+            z_flat,
+            norm_in_weight,
+            mean_in,
+            rstd_in,
         )
 
         # Assemble fused weight grads.
