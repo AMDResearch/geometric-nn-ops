@@ -274,8 +274,7 @@ if TRITON_AVAILABLE:
         Douta_ptr,
         Doutb_ptr,
         mask_ptr,
-        Dap_ptr,
-        Dag_ptr,
+        Dall_ptr,
         stride_Zi,
         stride_Zk,
         stride_Wpb,
@@ -288,7 +287,9 @@ if TRITON_AVAILABLE:
         stride_Daj,
         stride_Dbi,
         stride_Dbj,
-        stride_Ob,
+        stride_Om,
+        stride_Op,
+        stride_On,
         M,
         K,
         N,
@@ -303,9 +304,17 @@ if TRITON_AVAILABLE:
         projections share ``z_n`` and ``mask`` but use distinct fused weights
         (``Wp_ptr``/``Wg_ptr`` are ``[2, D, D]`` stacked a/b) and distinct upstream
         grads (``Douta_ptr`` / ``Doutb_ptr``, each a possibly-strided ``[M, D]``
-        view). Outputs ``d_ap`` / ``d_ag`` are ``[2, M, D]`` (row ``pid_b``). This
-        halves the launch count of the two-projection input backward, which is a
-        win in the launch-overhead-bound small-N regime and neutral at large N.
+        view). This halves the launch count of the two-projection input backward.
+
+        The 4 outputs (d_ap/d_ag for a and b) are written into one ``[M, 4, N]``
+        buffer ``Dall`` interleaved along the feature (proj) axis: proj-index
+        ``2*pid_b`` = d_ap, ``2*pid_b+1`` = d_ag. Laid out this way,
+        ``Dall.reshape(M, 4N)^T @ z_n`` computes all four weight gradients in a
+        single GEMM (rows ``[j*D:(j+1)*D]`` = grad j), and the shared ``z_n``
+        operand is read once instead of four times -- the weight-grad GEMM
+        category is memory-bandwidth bound, so this is a win. Individual
+        ``d_ap_a`` etc. remain available as ``Dall[:, j, :]`` views for the
+        ``d_z_n`` accumulation.
         """
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -371,11 +380,13 @@ if TRITON_AVAILABLE:
         d_ag = d_after * acc_p * sa * (1.0 - sa)
 
         store_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        out_off = (
-            pid_b.to(tl.int64) * stride_Ob + offs_m_i64[:, None] * N + offs_n[None, :]
-        )
-        tl.store(Dap_ptr + out_off, d_ap, mask=store_mask)
-        tl.store(Dag_ptr + out_off, d_ag, mask=store_mask)
+        # Interleave into the [M, 4, N] buffer: proj-index 2*pid_b = d_ap,
+        # 2*pid_b+1 = d_ag. Order along the proj axis: [ap_a, ag_a, ap_b, ag_b].
+        p_ap = (2 * pid_b).to(tl.int64)
+        p_ag = (2 * pid_b + 1).to(tl.int64)
+        m_off = offs_m_i64[:, None] * stride_Om + offs_n[None, :] * stride_On
+        tl.store(Dall_ptr + p_ap * stride_Op + m_off, d_ap, mask=store_mask)
+        tl.store(Dall_ptr + p_ag * stride_Op + m_off, d_ag, mask=store_mask)
 
     @triton.jit
     def _proj_out_bwd_grads(
@@ -728,14 +739,15 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
     """Both input-projection backwards in one launch.
 
     z_n: [M, D]. Wp_t2/Wg_t2: [2, D, D] = stacked a/b W^T (K, N) contiguous.
-    d_out_a/d_out_b: [M, D] (possibly strided views). mask_col_flat: [M] fp32.
-    Returns (d_ap2, d_ag2), each [2, M, D] in the compute dtype (row 0 = a).
+    d_out_a/d_out_b: [M, D] (possibly strided views). mask_col_flat: [M], compute dtype.
+    Returns d_all: [M, 4, D] in the compute dtype, proj axis ordered
+    [d_ap_a, d_ag_a, d_ap_b, d_ag_b]. Reshaped to [M, 4D] the transpose-GEMM
+    against z_n yields all four weight grads in one launch (see kernel docstring).
     """
     M, K = z_n.shape
     N = Wp_t2.shape[2]
     cdtype = z_n.dtype
-    d_ap = torch.empty(2, M, N, device=z_n.device, dtype=cdtype)
-    d_ag = torch.empty(2, M, N, device=z_n.device, dtype=cdtype)
+    d_all = torch.empty(M, 4, N, device=z_n.device, dtype=cdtype)
     fg = _cfg_fused_gemm(N=N)
 
     def grid(meta):
@@ -748,8 +760,7 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
         d_out_a,
         d_out_b,
         mask_col_flat,
-        d_ap,
-        d_ag,
+        d_all,
         z_n.stride(0),
         z_n.stride(1),
         Wp_t2.stride(0),
@@ -762,7 +773,9 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
         d_out_a.stride(1),
         d_out_b.stride(0),
         d_out_b.stride(1),
-        d_ap.stride(0),
+        d_all.stride(0),
+        d_all.stride(1),
+        d_all.stride(2),
         M,
         K,
         N,
@@ -772,7 +785,7 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
         num_warps=fg["num_warps"],
         num_stages=fg["num_stages"],
     )
-    return d_ap, d_ag
+    return d_all
 
 
 def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
@@ -1165,25 +1178,33 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # the two small proj-in-bwd launches; a win in the launch-bound small-N
         # regime, neutral at large N). d_a/d_b may be strided [M, D] views over
         # the channel-major combine grad; the kernel reads them via their own
-        # strides, so no copy here. Outputs are [2, M, D] (row 0 = a).
-        d_ap2, d_ag2 = _proj_in_bwd_pointwise_dual(
-            z_n, Wp_t2, Wg_t2, d_a, d_b, mask_flat
-        )
+        # strides, so no copy here. Output is [M, 4, D] interleaved along the
+        # proj axis: [d_ap_a, d_ag_a, d_ap_b, d_ag_b].
+        d_all = _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_a, d_b, mask_flat)
         del d_a, d_b
-        d_ap_a, d_ap_b = d_ap2[0], d_ap2[1]
-        d_ag_a, d_ag_b = d_ag2[0], d_ag2[1]
+        d_ap_a, d_ag_a, d_ap_b, d_ag_b = (
+            d_all[:, 0],
+            d_all[:, 1],
+            d_all[:, 2],
+            d_all[:, 3],
+        )
 
         Wap = Wp_in[:D]
         Wbp = Wp_in[D:]
         Wag = Wg_in[:D]
         Wbg = Wg_in[D:]
-        d_Wap = (d_ap_a.T @ z_n).float()  # [D, D]
-        d_Wag = (d_ag_a.T @ z_n).float()
-        d_Wbp = (d_ap_b.T @ z_n).float()
-        d_Wbg = (d_ag_b.T @ z_n).float()
+        # All four input-proj weight grads in one GEMM: the 4 upstream grads sit
+        # contiguously along the feature axis of d_all, so [M, 4D]^T @ z_n reads
+        # the shared z_n operand once (this GEMM category is HBM-bandwidth
+        # bound; batching the shared read is the win over 4 separate ops).
+        d_W_in = (d_all.reshape(M, 4 * D).T @ z_n).float()  # [4D, D]
+        d_Wap = d_W_in[0 * D : 1 * D]
+        d_Wag = d_W_in[1 * D : 2 * D]
+        d_Wbp = d_W_in[2 * D : 3 * D]
+        d_Wbg = d_W_in[3 * D : 4 * D]
         d_z_n = d_z_n + d_ap_a @ Wap + d_ag_a @ Wag
         d_z_n = d_z_n + d_ap_b @ Wbp + d_ag_b @ Wbg
-        del d_ap2, d_ag2
+        del d_all
 
         # ---- LN_in backward ----
         d_z_flat, d_norm_in_weight, d_norm_in_bias = _triton_layernorm_backward(
