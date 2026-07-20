@@ -240,8 +240,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_g = tl.dot(A.to(tl.float32), W_g.to(tl.float32), acc_g)
-            acc_p = tl.dot(A.to(tl.float32), W_p.to(tl.float32), acc_p)
+            acc_g = tl.dot(A, W_g, acc_g)
+            acc_p = tl.dot(A, W_p, acc_p)
 
         gate_sigmoid = 1.0 / (1.0 + tl.exp(-acc_g))
         result = gate_sigmoid * acc_p
@@ -339,8 +339,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_g = tl.dot(A.to(tl.float32), W_g.to(tl.float32), acc_g)
-            acc_p = tl.dot(A_p.to(tl.float32), W_p.to(tl.float32), acc_p)
+            acc_g = tl.dot(A, W_g, acc_g)
+            acc_p = tl.dot(A_p, W_p, acc_p)
 
         gate_sigmoid = 1.0 / (1.0 + tl.exp(-acc_g))
         result = gate_sigmoid * acc_p
@@ -470,9 +470,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            Zf = Z.to(tl.float32)
-            acc_p = tl.dot(Zf, W_p.to(tl.float32), acc_p)
-            acc_g = tl.dot(Zf, W_g.to(tl.float32), acc_g)
+            acc_p = tl.dot(Z, W_p, acc_p)
+            acc_g = tl.dot(Z, W_g, acc_g)
 
         m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0)
         d_out = tl.load(
@@ -571,8 +570,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_p = tl.dot(X.to(tl.float32), W_p.to(tl.float32), acc_p)
-            acc_g = tl.dot(Z.to(tl.float32), W_g.to(tl.float32), acc_g)
+            acc_p = tl.dot(X, W_p, acc_p)
+            acc_g = tl.dot(Z, W_g, acc_g)
 
         d_out = tl.load(
             Dout_ptr + offs_m_i64[:, None] * stride_Di + offs_n[None, :] * stride_Dj,
