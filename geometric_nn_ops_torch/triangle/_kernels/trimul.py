@@ -1361,28 +1361,31 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # proj axis: [d_ap_a, d_ag_a, d_ap_b, d_ag_b].
         d_all = _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_a, d_b, mask_flat)
         del d_a, d_b
-        d_ap_a, d_ag_a, d_ap_b, d_ag_b = (
-            d_all[:, 0],
-            d_all[:, 1],
-            d_all[:, 2],
-            d_all[:, 3],
-        )
 
         Wap = Wp_in[:D]
         Wbp = Wp_in[D:]
         Wag = Wg_in[:D]
         Wbg = Wg_in[D:]
-        # All four input-proj weight grads in one GEMM: the 4 upstream grads sit
-        # contiguously along the feature axis of d_all, so [M, 4D]^T @ z_n reads
-        # the shared z_n operand once (this GEMM category is HBM-bandwidth
-        # bound; batching the shared read is the win over 4 separate ops).
-        d_W_in = (d_all.reshape(M, 4 * D).T @ z_n).float()  # [4D, D]
+        d_all_2d = d_all.reshape(M, 4 * D)
+        # All four input-proj weight grads in a single GEMM: the 4 upstream
+        # grads sit contiguously along the feature axis of d_all, so
+        # `[M, 4D]^T @ z_n` reads the shared z_n operand once (this GEMM category
+        # is HBM-bandwidth bound; batching the shared read is a win over 4 separate
+        # ops).
+        d_W_in = d_all_2d.T @ z_n  # [4D, D]
         d_Wap = d_W_in[0 * D : 1 * D]
         d_Wag = d_W_in[1 * D : 2 * D]
         d_Wbp = d_W_in[2 * D : 3 * D]
         d_Wbg = d_W_in[3 * D : 4 * D]
-        d_z_n = d_z_n + d_ap_a @ Wap + d_ag_a @ Wag
-        d_z_n = d_z_n + d_ap_b @ Wbp + d_ag_b @ Wbg
+        # d_z_n from the input projections is `sum_j d_all[:, j] @ W_j` over the 4
+        # projections. The 4 upstream grads are contiguous along d_all's feature
+        # axis, so stacking their weights [Wap; Wag; Wbp; Wbg] = [4D, D] turns
+        # the 4 [M,D]@[D,D] GEMMs + 3 eager adds into a single [M,4D]@[4D,D]
+        # GEMM. addmm folds the accumulation onto the output-proj d_z_n
+        # term into that same call (beta=1), so no intermediate [M,D] adds hit
+        # HBM. The stacked [4D,D] weight is tiny and built once.
+        W_in_stack = torch.cat([Wap, Wag, Wbp, Wbg], dim=0)  # [4D, D]
+        d_z_n = torch.addmm(d_z_n, d_all_2d, W_in_stack)  # [M, D], cdtype
         del d_all
 
         # ---- LN_in backward ----
