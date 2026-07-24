@@ -12,6 +12,11 @@ This is the optional, zero-code-change convenience surface. Where possible, we
 recommend using ``geometric-nn-ops`` directly instead.
 """
 
+# The imports below intentionally run after `_guard.check()`, so E402 (import
+# not at top of file) is disabled for this module. The guard must reject a
+# conflicting closed-source wheel before we import the shadowing submodules.
+# ruff: noqa: E402
+
 from . import _guard
 
 _guard.check()
@@ -19,8 +24,8 @@ _guard.check()
 from ._trimul_precision import TriMulPrecision
 
 # Rebinds the name to the function while the submodule stays importable, so both
-# `from cuequivariance_ops_torch import triangle_attention` and
-# `from cuequivariance_ops_torch.triangle_attention import CUEQ_TRIATTN_FALLBACK_THRESHOLD`
+# `from cuequivariance_ops_torch import triangle_attention` and the deep
+# `from cuequivariance_ops_torch.triangle_attention import CUEQ_TRIATTN_FALLBACK_THRESHOLD` # noqa: E501
 # resolve.
 from .triangle_attention import triangle_attention
 from .triangle_multiplicative_update import triangle_multiplicative_update

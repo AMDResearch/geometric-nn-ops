@@ -1,7 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shadow of cuequivariance_ops_torch.triangle_multiplicative_update, backed by geometric-nn-ops"""
+"""Shadow of cuequivariance_ops_torch.triangle_multiplicative_update backed by geometric-nn-ops."""  # noqa: E501
 
 from geometric_nn_ops.triangle import triangle_multiplicative_update as _tmu
 

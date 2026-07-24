@@ -12,12 +12,12 @@ import pytest
 
 def test_shim_paths_resolve():
     # Exactly the imports cuequivariance_torch (v0.9.1) performs against the ops layer.
-    from cuequivariance_ops_torch import (  # noqa: F401
+    from cuequivariance_ops_torch import (
         TriMulPrecision,
         triangle_attention,
         triangle_multiplicative_update,
     )
-    from cuequivariance_ops_torch.attention_pair_bias_torch import (  # noqa: F401
+    from cuequivariance_ops_torch.attention_pair_bias_torch import (
         attention_pair_bias,
     )
 
@@ -28,6 +28,7 @@ def test_shim_paths_resolve():
 
     assert callable(triangle_attention)
     assert callable(triangle_multiplicative_update)
+    assert callable(attention_pair_bias)
     assert isinstance(CUEQ_TRIATTN_FALLBACK_THRESHOLD, int)
     assert int(TriMulPrecision.IEEE) == 3
 

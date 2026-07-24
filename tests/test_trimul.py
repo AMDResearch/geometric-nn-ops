@@ -8,13 +8,17 @@
 (3) The torch fallback is autograd-differentiable (grads flow).
 """
 
+# The kernel imports run after `importorskip` so the module skips cleanly when
+# Triton is missing; E402 (import not at top of file) is disabled accordingly.
+# ruff: noqa: E402
+
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
 
-from geometric_nn_ops.triangle import _trimul as T  # noqa: E402
-from geometric_nn_ops.triangle import triangle_multiplicative_update  # noqa: E402
+from geometric_nn_ops.triangle import _trimul as T
+from geometric_nn_ops.triangle import triangle_multiplicative_update
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
@@ -25,7 +29,9 @@ def _weights(C_z, C_h, device, dtype, *, requires_grad=False):
     g = requires_grad
 
     def t(*shape, scale=1.0):
-        return (torch.randn(*shape, device=device, dtype=dtype) * scale).requires_grad_(g)
+        return (torch.randn(*shape, device=device, dtype=dtype) * scale).requires_grad_(
+            g
+        )
 
     return dict(
         norm_in_weight=torch.ones(C_z, device=device, dtype=dtype).requires_grad_(g),
@@ -70,7 +76,9 @@ def test_triton_matches_torch_reference(direction, dtype, monkeypatch):
 @pytest.mark.parametrize("outgoing", [True, False])
 def test_matches_openfold3_module(outgoing):
     """Pure-torch reference must match OpenFold-3's module for the same weights."""
-    of3 = pytest.importorskip("openfold3.core.model.layers.triangular_multiplicative_update")
+    of3 = pytest.importorskip(
+        "openfold3.core.model.layers.triangular_multiplicative_update"
+    )
     torch.manual_seed(1)
     N, C_z, C_h = 24, 32, 24
     device, dtype = "cuda", torch.float32

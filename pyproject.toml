@@ -28,9 +28,46 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# Keep the ruff pin in sync with `rev` in .pre-commit-config.yaml so the hook
+# and manual runs format identically (ruff is pre-1.0; output can shift).
+dev = ["ruff==0.14.2", "pre-commit"]
 
 [project.urls]
 "Source" = "https://github.com/AMDResearch/geometric-nn-ops"
 
 [tool.hatch.build.targets.wheel]
 packages = ["geometric_nn_ops"]
+
+[tool.ruff]
+line-length = 88  # Black/ruff default
+# Lowest supported interpreter (matches requires-python). Keeps pyupgrade (UP)
+# from rewriting to syntax newer than 3.10.
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modern type-hint syntax, etc.)
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports (TID251 bans `from __future__ import annotations`)
+]
+ignore = [
+    # Ambiguous single-char names (l/I/O). Kernel math uses e.g. `O` for the
+    # attention output tensor by convention.
+    "E741",
+    # Allow explicit if/else where it reads better than a ternary.
+    "SIM108",
+]
+# Let `ruff check --fix` apply the modern-type-hint rewrites (List->list,
+# Optional[X]->X | None, Union->|); these are unsafe-by-default.
+extend-safe-fixes = ["UP006", "UP007", "UP045"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# Ban `from __future__ import annotations`. PEP 649/749 (Python 3.14) make it
+# unnecessary, it is on a deprecation path, and it breaks runtime annotation
+# introspection (dataclasses / typing.get_type_hints).
+"__future__.annotations".msg = "`from __future__ import annotations` is no longer recommended and is on a deprecation path; PEP 649/749 (Python 3.14) supersede it."

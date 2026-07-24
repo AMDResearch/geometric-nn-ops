@@ -8,15 +8,19 @@ within bf16 tolerance on a small representative shape. Skips automatically
 when a Triton-capable GPU is not available.
 """
 
-import math
+# The kernel import runs after `importorskip` so the module skips cleanly when
+# Triton is missing; E402 (import not at top of file) is disabled accordingly.
+# ruff: noqa: E402
 
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
-from geometric_nn_ops.triangle import triangle_attention  # noqa: E402
+from geometric_nn_ops.triangle import triangle_attention
 
-requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + Triton")
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs GPU + Triton"
+)
 
 
 def _eager_triangle_attention(q, k, v, bias, mask, scale):
@@ -55,12 +59,18 @@ def test_triangle_attention_matches_eager(dtype):
     mask = torch.ones(B, N_seq, 1, 1, N_res, device=device, dtype=torch.bool)
     # mask out the last column
     mask[..., -1] = False
-    scale = D ** -0.5
+    scale = D**-0.5
 
-    o_triton = triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale).to(torch.float32)
+    o_triton = triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale).to(
+        torch.float32
+    )
     o_ref = _eager_triangle_attention(
-        q.to(torch.float32), k.to(torch.float32), v.to(torch.float32),
-        bias.to(torch.float32), mask, scale,
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        bias.to(torch.float32),
+        mask,
+        scale,
     )
 
     # bf16 tolerance is loose (~1e-2 abs is realistic for accumulated softmax);
@@ -83,14 +93,24 @@ def test_scale_override():
     bias = torch.zeros(B, 1, H, N_res, N_res, device=device, dtype=torch.bfloat16)
     mask = torch.ones(B, N_seq, 1, 1, N_res, device=device, dtype=torch.bool)
 
-    default = D ** -0.5
+    default = D**-0.5
     custom = default * 2.0
 
-    o_default = triangle_attention(q, k, v, bias=bias, mask=mask, scale=default).to(torch.float32)
-    o_custom = triangle_attention(q, k, v, bias=bias, mask=mask, scale=custom).to(torch.float32)
-    o_ref = _eager_triangle_attention(
-        q.to(torch.float32), k.to(torch.float32), v.to(torch.float32),
-        bias.to(torch.float32), mask, custom,
+    o_default = triangle_attention(q, k, v, bias=bias, mask=mask, scale=default).to(
+        torch.float32
     )
-    assert not torch.allclose(o_default, o_custom, atol=1e-2), "scale override had no effect"
+    o_custom = triangle_attention(q, k, v, bias=bias, mask=mask, scale=custom).to(
+        torch.float32
+    )
+    o_ref = _eager_triangle_attention(
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        bias.to(torch.float32),
+        mask,
+        custom,
+    )
+    assert not torch.allclose(o_default, o_custom, atol=1e-2), (
+        "scale override had no effect"
+    )
     assert torch.allclose(o_custom, o_ref, atol=5e-2, rtol=1e-2)

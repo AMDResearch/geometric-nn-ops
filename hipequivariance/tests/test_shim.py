@@ -32,6 +32,6 @@ def test_upstream_frontend_routes_through_shim():
     bias = torch.randn(B, 1, H, N_res, N_res, device=device, dtype=dtype) * 0.1
     mask = torch.ones(B, N_seq, 1, 1, N_res, device=device, dtype=torch.bool)
 
-    out = triangle_attention(q, k, v, bias, mask=mask, scale=D ** -0.5)
+    out = triangle_attention(q, k, v, bias, mask=mask, scale=D**-0.5)
     assert out.shape == (B, N_seq, H, N_res, D)
     assert out.dtype == dtype

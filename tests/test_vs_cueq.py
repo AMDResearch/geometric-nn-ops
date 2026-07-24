@@ -12,6 +12,10 @@ Run with:
     pytest tests/test_vs_cueq.py -v
 """
 
+# The kernel imports run after `importorskip` / `skip` so the module skips
+# cleanly without the dependencies; E402 (import not at top) is disabled here.
+# ruff: noqa: E402
+
 import pytest
 import torch
 
@@ -24,9 +28,11 @@ cuequivariance_torch = pytest.importorskip(
 if not torch.cuda.is_available():
     pytest.skip("needs CUDA for the cuequivariance reference", allow_module_level=True)
 
-from cuequivariance_torch.primitives.triangle import triangle_attention as cueq_triangle_attention  # noqa: E402
+from cuequivariance_torch.primitives.triangle import (
+    triangle_attention as cueq_triangle_attention,
+)
 
-from geometric_nn_ops.triangle import triangle_attention as hip_triangle_attention  # noqa: E402
+from geometric_nn_ops.triangle import triangle_attention as hip_triangle_attention
 
 DEVICE = "cuda"
 
@@ -82,7 +88,7 @@ def test_matches_cueq(shape, dtype):
     """Triton adapter and cueq's triangle_attention should agree within fp tolerance."""
     B, N_seq, N_res, H, D = shape
     q, k, v, bias, mask = _make_inputs(B, N_seq, N_res, H, D, dtype)
-    scale = D ** -0.5
+    scale = D**-0.5
 
     o_triton = hip_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
     o_cueq = _cueq(q, k, v, bias=bias, mask=mask, scale=scale)
@@ -92,7 +98,9 @@ def test_matches_cueq(shape, dtype):
     # enough to catch any real divergence.
     atol = 5e-2 if dtype == torch.bfloat16 else 1e-2
     diff = (o_triton.to(torch.float32) - o_cueq.to(torch.float32)).abs()
-    assert torch.allclose(o_triton.to(torch.float32), o_cueq.to(torch.float32), atol=atol, rtol=1e-2), (
+    assert torch.allclose(
+        o_triton.to(torch.float32), o_cueq.to(torch.float32), atol=atol, rtol=1e-2
+    ), (
         f"Disagreement on {shape} {dtype}: "
         f"max abs diff = {diff.max().item():.4f}, mean = {diff.mean().item():.4f}"
     )
@@ -103,7 +111,7 @@ def test_matches_cueq_custom_scale(dtype):
     """Custom (non-default) scale should still match cueq."""
     B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
     q, k, v, bias, mask = _make_inputs(B, N_seq, N_res, H, D, dtype, seed=1)
-    scale = (D ** -0.5) * 1.5  # arbitrary non-default
+    scale = (D**-0.5) * 1.5  # arbitrary non-default
 
     o_triton = hip_triangle_attention(q, k, v, bias=bias, mask=mask, scale=scale)
     o_cueq = _cueq(q, k, v, bias=bias, mask=mask, scale=scale)
@@ -119,13 +127,19 @@ def test_matches_cueq_backward():
     dtype = torch.bfloat16
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
     q, k, v, bias, mask = _make_inputs(B, N_seq, N_res, H, D, dtype, seed=2)
-    scale = D ** -0.5
+    scale = D**-0.5
 
     # Need separate copies because both adapters call .backward()
-    q_a, k_a, v_a, bias_a = (t.clone().detach().requires_grad_(True) for t in (q, k, v, bias))
-    q_c, k_c, v_c, bias_c = (t.clone().detach().requires_grad_(True) for t in (q, k, v, bias))
+    q_a, k_a, v_a, bias_a = (
+        t.clone().detach().requires_grad_(True) for t in (q, k, v, bias)
+    )
+    q_c, k_c, v_c, bias_c = (
+        t.clone().detach().requires_grad_(True) for t in (q, k, v, bias)
+    )
 
-    o_triton = hip_triangle_attention(q_a, k_a, v_a, bias=bias_a, mask=mask, scale=scale)
+    o_triton = hip_triangle_attention(
+        q_a, k_a, v_a, bias=bias_a, mask=mask, scale=scale
+    )
     o_cueq = _cueq(q_c, k_c, v_c, bias=bias_c, mask=mask, scale=scale)
 
     # Random (but matched) upstream gradient

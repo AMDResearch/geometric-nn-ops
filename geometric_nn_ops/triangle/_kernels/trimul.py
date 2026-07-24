@@ -16,6 +16,7 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
+
 if TRITON_AVAILABLE:
 
     @triton.jit
