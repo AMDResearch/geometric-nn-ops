@@ -13,45 +13,14 @@ import triton
 import triton.language as tl
 
 
-# Multi-channel batched GEMM kernel that processes multiple channels per launch
 @triton.autotune(
     configs=[
         # Larger block sizes for better GPU utilization
-        triton.Config(
-            {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-            num_stages=4,
-            num_warps=8,
-        ),
         # Original configs as fallback
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
             num_stages=3,
             num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-            num_stages=3,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-            num_stages=3,
-            num_warps=2,
         ),
     ],
     key=["M", "K", "N"],
@@ -150,28 +119,7 @@ def batched_gemm_multi_channel(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=2
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=2
         ),
     ],
     key=["M", "K", "N"],
@@ -219,7 +167,6 @@ def fused_gemm_sigmoid_multiply_channel_major(
     Key difference: Output is written in channel-major format [B*C, N, N]
     where each input row (b*N*N + i*N + j) writes to output (b*C + c, i, j)
     """
-    b = tl.program_id(0)
 
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -307,7 +254,8 @@ def fused_gemm_sigmoid_multiply_channel_major(
     spatial_j = remainder % N_spatial  # [BLOCK_M]
 
     # Compute output offsets for all (m, n) pairs
-    # out_idx[m, n] = (batch_idx[m] * N + n) * stride_Cb + spatial_i[m] * stride_Ci + spatial_j[m] * stride_Cj
+    # out_idx[m, n] = (batch_idx[m] * N + n) * stride_Cb
+    #                 + spatial_i[m] * stride_Ci + spatial_j[m] * stride_Cj
     out_offsets = (
         (batch_idx[:, None] * N + offs_n[None, :]) * stride_Cb
         + spatial_i[:, None] * stride_Ci
@@ -324,28 +272,7 @@ def fused_gemm_sigmoid_multiply_channel_major(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, num_stages=3, num_warps=8
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=2
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=2
         ),
     ],
     key=["M", "K", "N"],
@@ -388,7 +315,6 @@ def fused_gemm_sigmoid_multiply(
     proj = (A_p if A_p_ptr else A) @ W_p.T + bias_p
     output = sigmoid(gate) * proj * mask
     """
-    b = tl.program_id(0)
 
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -550,11 +476,7 @@ def triton_combine_projection(a, b, outgoing=True, batch_dims=None, c_hidden=Non
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_ROWS": 16, "BLOCK_C": 128}, num_warps=4),
-        triton.Config({"BLOCK_ROWS": 32, "BLOCK_C": 128}, num_warps=8),
         triton.Config({"BLOCK_ROWS": 64, "BLOCK_C": 128}, num_warps=8),
-        triton.Config({"BLOCK_ROWS": 16, "BLOCK_C": 64}, num_warps=2),
-        triton.Config({"BLOCK_ROWS": 32, "BLOCK_C": 64}, num_warps=4),
     ],
     key=["total_rows", "C"],
 )
@@ -640,3 +562,216 @@ def _layer_norm_2d_fwd_fused(
 
                 # Store output
                 tl.store(Y_row + c_offsets, y, mask=mask & row_valid)
+
+
+def triton_triangular_mult_forward(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    outgoing: bool,
+    norm_in_weight: torch.Tensor,
+    norm_in_bias: torch.Tensor,
+    p_in_weight: torch.Tensor,
+    g_in_weight: torch.Tensor,
+    norm_out_weight: torch.Tensor,
+    norm_out_bias: torch.Tensor,
+    p_out_weight: torch.Tensor,
+    g_out_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run triangular multiplicative update forward pass using Triton kernels.
+
+    Adapts fused weight layout to the kernel conventions.
+
+    Args:
+        x: Input tensor [B, N, N, D]
+        mask: Mask tensor [B, N, N]
+        outgoing: True for outgoing, False for incoming
+        norm_in_weight, norm_in_bias: Input LayerNorm parameters [D]
+        p_in_weight: Fused projection weight [2*D, D]
+        g_in_weight: Fused gate weight [2*D, D]
+        norm_out_weight, norm_out_bias: Output LayerNorm parameters [D]
+        p_out_weight: Output projection weight [D, D]
+        g_out_weight: Output gate weight [D, D]
+    """
+    B, N, _, D = x.shape
+    c_hidden = D  # Standard config c_hidden == c_z == dim
+
+    # Split fused weights: p_in.weight [2*D, D] -> a_p [D, D] and b_p [D, D]
+    # Transpose for matmul: kernel expects [K, N] = [D, D]
+    W_ap = p_in_weight[:D].T.contiguous()
+    W_bp = p_in_weight[D:].T.contiguous()
+    W_ag = g_in_weight[:D].T.contiguous()
+    W_bg = g_in_weight[D:].T.contiguous()
+
+    # === Build projections ===
+    z_flat = x.reshape(-1, D)
+    N_rows = z_flat.shape[0]
+
+    # Triton layer norm on flattened input
+    z_normed_flat = torch.empty_like(z_flat)
+
+    def ln_grid(meta):
+        return (triton.cdiv(N_rows, meta["BLOCK_ROWS"]),)
+
+    _layer_norm_2d_fwd_fused[ln_grid](
+        z_flat,
+        z_normed_flat,
+        norm_in_weight,
+        norm_in_bias,
+        z_flat.stride(0),
+        N_rows,
+        D,
+        1e-5,
+    )
+
+    # Allocate channel-major output tensors [B*c_hidden, N, N]
+    a_channel_major = torch.empty(B * c_hidden, N, N, device=x.device, dtype=x.dtype)
+    b_channel_major = torch.empty(B * c_hidden, N, N, device=x.device, dtype=x.dtype)
+
+    # Flatten mask for the fused kernel
+    mask_flat = mask.unsqueeze(-1).reshape(-1)
+
+    def proj_grid(meta):
+        return (
+            1,
+            triton.cdiv(N_rows, meta["BLOCK_M"]),
+            triton.cdiv(c_hidden, meta["BLOCK_N"]),
+        )
+
+    # Fused a projection: sigmoid(z_normed @ W_ag) * (z_normed @ W_ap) * mask
+    fused_gemm_sigmoid_multiply_channel_major[proj_grid](
+        z_normed_flat,
+        W_ag,
+        W_ap,
+        a_channel_major,
+        None,
+        None,  # No biases
+        mask_flat,
+        None,  # mask, no separate A_p
+        0,
+        z_normed_flat.stride(0),
+        z_normed_flat.stride(1),
+        W_ag.stride(0),
+        W_ag.stride(1),
+        W_ap.stride(0),
+        W_ap.stride(1),
+        a_channel_major.stride(0),
+        a_channel_major.stride(1),
+        a_channel_major.stride(2),
+        0,
+        0,
+        0,
+        N_rows,
+        D,
+        c_hidden,
+        B,
+        N,
+    )
+
+    # Fused b projection
+    fused_gemm_sigmoid_multiply_channel_major[proj_grid](
+        z_normed_flat,
+        W_bg,
+        W_bp,
+        b_channel_major,
+        None,
+        None,
+        mask_flat,
+        None,
+        0,
+        z_normed_flat.stride(0),
+        z_normed_flat.stride(1),
+        W_bg.stride(0),
+        W_bg.stride(1),
+        W_bp.stride(0),
+        W_bp.stride(1),
+        b_channel_major.stride(0),
+        b_channel_major.stride(1),
+        b_channel_major.stride(2),
+        0,
+        0,
+        0,
+        N_rows,
+        D,
+        c_hidden,
+        B,
+        N,
+    )
+
+    # Apply direction-specific transposes
+    if outgoing:
+        b_channel_major = b_channel_major.transpose(-1, -2)
+    else:
+        a_channel_major = a_channel_major.transpose(-1, -2)
+
+    # === Combine projections via batched GEMM ===
+    x_out = triton_combine_projection(
+        a_channel_major,
+        b_channel_major,
+        outgoing,
+        batch_dims=x.shape[:-3],
+        c_hidden=c_hidden,
+    )
+    del a_channel_major, b_channel_major
+
+    # === Post projections ===
+    x_flat = x_out.reshape(-1, c_hidden).contiguous()
+    N_rows_out = x_flat.shape[0]
+
+    # Layer norm on combined output
+    x_normed_flat = torch.empty_like(x_flat)
+
+    def ln_grid_out(meta):
+        return (triton.cdiv(N_rows_out, meta["BLOCK_ROWS"]),)
+
+    _layer_norm_2d_fwd_fused[ln_grid_out](
+        x_flat,
+        x_normed_flat,
+        norm_out_weight,
+        norm_out_bias,
+        x_flat.stride(0),
+        N_rows_out,
+        c_hidden,
+        1e-5,
+    )
+
+    # Fused output: sigmoid(z_normed @ W_g_out) * (x_normed @ W_p_out)
+    W_g_out = g_out_weight.T.contiguous()
+    W_p_out = p_out_weight.T.contiguous()
+
+    output_flat = torch.empty(N_rows_out, D, device=x.device, dtype=x.dtype)
+
+    def out_grid(meta):
+        return (
+            1,
+            triton.cdiv(N_rows_out, meta["BLOCK_M"]),
+            triton.cdiv(D, meta["BLOCK_N"]),
+        )
+
+    fused_gemm_sigmoid_multiply[out_grid](
+        z_normed_flat,
+        W_g_out,
+        W_p_out,
+        output_flat,
+        None,
+        None,
+        None,  # No mask for output projection
+        x_normed_flat,
+        0,
+        z_normed_flat.stride(0),
+        z_normed_flat.stride(1),
+        W_g_out.stride(0),
+        W_g_out.stride(1),
+        W_p_out.stride(0),
+        W_p_out.stride(1),
+        0,
+        output_flat.stride(0),
+        output_flat.stride(1),
+        0,
+        x_normed_flat.stride(0),
+        x_normed_flat.stride(1),
+        N_rows_out,
+        D,
+        D,
+    )
+
+    return output_flat.reshape(B, N, N, D)
