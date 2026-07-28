@@ -45,15 +45,20 @@ line-length = 88  # Black/ruff default
 target-version = "py310"
 
 [tool.ruff.lint]
+# Required for CPY001 (flake8-copyright), which is still a preview rule. Preview
+# also enables preview behavior of the other selected rules; kept deterministic
+# by the pinned ruff version above.
+preview = true
 select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # Pyflakes
-    "I",   # isort (import sorting)
-    "UP",  # pyupgrade (modern type-hint syntax, etc.)
-    "B",   # flake8-bugbear
-    "SIM", # flake8-simplify
-    "TID", # flake8-tidy-imports (TID251 bans `from __future__ import annotations`)
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort (import sorting)
+    "UP",     # pyupgrade (modern type-hint syntax, etc.)
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "TID",    # flake8-tidy-imports (TID251 bans `from __future__ import annotations`)
+    "CPY001", # flake8-copyright (require a copyright + SPDX license header)
 ]
 ignore = [
     # Ambiguous single-char names (l/I/O). Kernel math uses e.g. `O` for the
@@ -65,6 +70,15 @@ ignore = [
 # Let `ruff check --fix` apply the modern-type-hint rewrites (List->list,
 # Optional[X]->X | None, Union->|); these are unsafe-by-default.
 extend-safe-fixes = ["UP006", "UP007", "UP045"]
+
+[tool.ruff.lint.flake8-copyright]
+# Require an AMD copyright line directly followed by an Apache-2.0 SPDX
+# identifier. Matched anywhere near the top, so files copied from elsewhere can
+# keep their original notices above this block:
+#
+#     # Copyright Advanced Micro Devices, Inc.
+#     # SPDX-License-Identifier: Apache-2.0
+notice-rgx = '(?im)^# Copyright.*Advanced Micro Devices.*\n# SPDX-License-Identifier: Apache-2\.0'
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 # Ban `from __future__ import annotations`. PEP 649/749 (Python 3.14) make it
