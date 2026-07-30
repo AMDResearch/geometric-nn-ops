@@ -256,7 +256,7 @@ if TRITON_AVAILABLE:
         result = gate_sigmoid * acc_p
 
         if mask_ptr is not None:
-            m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0)
+            m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
             result = result * m[:, None]
 
         if SAVE_GP:
@@ -482,7 +482,7 @@ if TRITON_AVAILABLE:
             acc_p = tl.dot(Z, W_p, acc_p)
             acc_g = tl.dot(Z, W_g, acc_g)
 
-        m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0)
+        m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
         d_out = tl.load(
             d_base + offs_m_i64[:, None] * d_si + offs_n[None, :] * d_sj,
             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
@@ -630,8 +630,8 @@ if TRITON_AVAILABLE:
         c_offsets = tl.arange(0, BLOCK_C)
         cmask = c_offsets < C
         C_f = C.to(tl.float32)
-        w = tl.load(W + c_offsets, mask=cmask)
-        b = tl.load(B + c_offsets, mask=cmask)
+        w = tl.load(W + c_offsets, mask=cmask).to(tl.float32)
+        b = tl.load(B + c_offsets, mask=cmask).to(tl.float32)
 
         for row_offset in range(BLOCK_ROWS):
             row = row_start + row_offset
