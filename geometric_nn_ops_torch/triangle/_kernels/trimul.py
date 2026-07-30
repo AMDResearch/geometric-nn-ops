@@ -4,9 +4,7 @@
 """Differentiable Triton triangle_multiplicative_update (forward + backward).
 
 The Triton backend for
-:func:`geometric_nn_ops_torch.triangle.triangle_multiplicative_update`, exposed as a
-single ``autograd.Function`` used on the CUDA/Triton path for both inference and
-training.
+:func:`geometric_nn_ops_torch.triangle.triangle_multiplicative_update`.
 
   * Forward uses a channel-major fused GEMM (LayerNorm -> gate/proj GEMM ->
     sigmoid -> multiply -> mask, written channel-major ``[B*C, N, N]``) and a
@@ -23,8 +21,8 @@ training.
 The autograd.Function saves only minimal intermediates and recomputes the input
 projections (and the output gate pre-activation) in backward, trading compute
 for a large activation-memory saving. Large [M, D] pointwise intermediates stay
-in the compute dtype (bf16). Together these keep the training peak at/below
-eager.
+in the compute dtype (bf16). Together these keep the training peak memory
+at/below eager.
 
 Weight convention (fused layout, bias-free projections): ``p_in_weight`` /
 ``g_in_weight`` are ``[2D, D]`` (rows ``0:D`` -> ``a``, ``D:2D`` -> ``b``);
@@ -741,6 +739,10 @@ def _triton_layernorm(x_flat, weight, bias, eps, save_stats=False):
         mean = x_flat  # unused
         rstd = x_flat
     cfg = _cfg_layer_norm()
+    # The kernel covers a row with a single block; a wider row would silently
+    # drop channels.
+    if cfg["BLOCK_C"] < C:
+        raise ValueError(f"LayerNorm row width C={C} exceeds BLOCK_C={cfg['BLOCK_C']}")
 
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_ROWS"]),)
@@ -1443,21 +1445,17 @@ def trimul_triton(
 
     Takes the same arguments as ``trimul_torch``; see it for the layouts.
 
-    The kernels implement the standard config, and the configs outside it are
-    rejected here rather than ignored so that calling this directly cannot
-    silently produce something else. The public op routes them to the torch
-    path instead.
+    The kernels implement the standard config only, and the configs outside it
+    are rejected here to avoid silent failures. The public op routes them to the
+    torch path instead.
     """
-    named = [
-        name
-        for name, value in (
-            ("p_in_bias", p_in_bias),
-            ("g_in_bias", g_in_bias),
-            ("p_out_bias", p_out_bias),
-            ("g_out_bias", g_out_bias),
-        )
-        if value is not None
-    ]
+    biases = {
+        "p_in_bias": p_in_bias,
+        "g_in_bias": g_in_bias,
+        "p_out_bias": p_out_bias,
+        "g_out_bias": g_out_bias,
+    }
+    named = [name for name, value in biases.items() if value is not None]
     if named:
         raise ValueError(
             f"the Triton kernels have bias-free projections, got {', '.join(named)}"
@@ -1468,13 +1466,15 @@ def trimul_triton(
             f"the Triton kernels need a square hidden dim, got "
             f"c_hidden={c_hidden} against c_z={c_z}"
         )
+    outgoing = is_outgoing(direction)
 
-    *batch_dims, n, _, d = x.shape
-    x_flat = x.reshape(-1, n, n, d)
     if mask is None:
-        mask_flat = x_flat.new_ones(x_flat.shape[:-1])
-    else:
-        mask_flat = mask.expand(x.shape[:-1]).reshape(-1, n, n).contiguous()
+        mask = x.new_ones(x.shape[:-1])
+    elif mask.shape != x.shape[:-1]:
+        # The torch reference leaves this to broadcasting, but the kernels index
+        # one flat mask entry per pair row. That is one element per pair against
+        # the [M, C] activations it gates, so the copy is not worth avoiding.
+        mask = mask.expand(x.shape[:-1]).contiguous()
 
     # Under autocast the caller can pass an fp32 pair representation alongside
     # fp32 weights while the intended compute dtype is bf16. Every tl.dot
@@ -1490,10 +1490,10 @@ def trimul_triton(
     def cast(tensor):
         return None if tensor is None else tensor.to(compute_dtype)
 
-    out = _TriangleMultiplicativeUpdateFn.apply(
-        cast(x_flat),
-        cast(mask_flat),
-        is_outgoing(direction),
+    return _TriangleMultiplicativeUpdateFn.apply(
+        cast(x),
+        cast(mask),
+        outgoing,
         cast(norm_in_weight),
         cast(norm_in_bias),
         cast(p_in_weight),
@@ -1504,4 +1504,3 @@ def trimul_triton(
         cast(g_out_weight),
         eps,
     )
-    return out.reshape(*batch_dims, n, n, d)
