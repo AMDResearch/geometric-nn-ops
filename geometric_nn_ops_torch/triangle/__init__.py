@@ -3,13 +3,10 @@
 
 """Triangle (protein-folding) ops."""
 
-from ._kernels.triangle_attention import TritonEvoformer, TritonEvoformerDynamic
 from ._triattn import triangle_attention
 from ._trimul import triangle_multiplicative_update
 
 __all__ = [
     "triangle_attention",
     "triangle_multiplicative_update",
-    "TritonEvoformer",
-    "TritonEvoformerDynamic",
 ]
