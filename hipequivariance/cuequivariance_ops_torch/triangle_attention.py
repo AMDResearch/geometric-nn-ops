@@ -33,8 +33,8 @@ def triangle_attention(
 ):
     if return_aux:
         raise NotImplementedError(
-            "hipequivariance: triangle_attention(return_aux=True) is not supported "
-            "yet (the Triton kernel does not expose lse/max)."
+            "hipequivariance_ops_torch: triangle_attention(return_aux=True) is "
+            "not supported yet (the Triton kernel does not expose lse/max)."
         )
     # cueq (B, N, H, S, D) -> geometric-nn-ops (B, N, S, H, D); output back.
     q = q.transpose(-2, -3)

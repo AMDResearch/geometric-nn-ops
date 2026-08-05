@@ -10,5 +10,5 @@ path, so the module name must match upstream.
 
 def attention_pair_bias(*args, **kwargs):
     raise NotImplementedError(
-        "hipequivariance: attention_pair_bias is not implemented yet."
+        "hipequivariance_ops_torch: attention_pair_bias is not implemented yet."
     )

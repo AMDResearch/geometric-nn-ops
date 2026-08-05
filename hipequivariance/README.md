@@ -1,4 +1,4 @@
-# hipequivariance
+# hipequivariance-ops-torch
 
 Zero-code-change drop-in for NVIDIA's proprietary `cuequivariance_ops_torch`
 kernels, backed by Triton, with first-class support for AMD ROCm GPUs.
@@ -10,7 +10,7 @@ API instead where possible.
 
 ## What it does
 
-`hipequivariance` installs a Python package that shadows the
+`hipequivariance-ops-torch` installs a Python package that shadows the
 `cuequivariance_ops_torch` kernels package and exposes the symbols the open
 `cuequivariance_torch` frontend imports:
 
@@ -28,8 +28,8 @@ may incur a performance penalty.
 ## Install
 
 ```bash
-pip install geometric-nn-ops-torch        # the kernels (required)
-pip install hipequivariance         # this shim (shadows cuequivariance_ops_torch)
+pip install geometric-nn-ops-torch     # the kernels (required)
+pip install hipequivariance-ops-torch  # this shim (shadows cuequivariance_ops_torch)
 pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's OPEN python
 # do NOT install cuequivariance-ops-torch-cu12 / -cu13 (the closed binary)
 ```

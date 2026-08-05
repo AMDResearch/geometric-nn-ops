@@ -38,12 +38,12 @@ This repo ships two separately-installable packages:
 
 - **`geometric-nn-ops-torch`**: the portable Triton kernels and their direct,
   vendor-neutral API. This is the recommended dependency.
-- **`hipequivariance`**: an optional zero-code-change shim that shadows NVIDIA's
-  `cuequivariance_ops_torch` and routes into these kernels. It translates any
-  API differences. See [hipequivariance/README.md](./hipequivariance/README.md).
-  This is provided as a convenience for codebases already integrated with
-  `cuequivariance`. For long term stability, we suggest using the direct
-  dependency where possible.
+- **`hipequivariance-ops-torch`**: an optional zero-code-change shim that
+  shadows NVIDIA's `cuequivariance_ops_torch` and routes into these kernels. It
+  translates any API differences. See
+  [hipequivariance/README.md](./hipequivariance/README.md). This is provided as
+  a convenience for codebases already integrated with `cuequivariance`. For long
+  term stability, we suggest using the direct dependency where possible.
 
 ## License
 
