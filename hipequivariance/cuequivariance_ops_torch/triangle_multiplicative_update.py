@@ -3,7 +3,7 @@
 
 """Shadow of cuequivariance_ops_torch.triangle_multiplicative_update backed by geometric-nn-ops."""  # noqa: E501
 
-from geometric_nn_ops.triangle import triangle_multiplicative_update as _tmu
+from geometric_nn_ops_torch.triangle import triangle_multiplicative_update as _tmu
 
 
 def triangle_multiplicative_update(

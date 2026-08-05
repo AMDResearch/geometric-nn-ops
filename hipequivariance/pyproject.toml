@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "geometric-nn-ops",
+    "geometric-nn-ops-torch",
     "torch>=2.4",
 ]
 

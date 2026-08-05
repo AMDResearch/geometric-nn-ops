@@ -17,8 +17,8 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from geometric_nn_ops.triangle import _trimul as T
-from geometric_nn_ops.triangle import triangle_multiplicative_update
+from geometric_nn_ops_torch.triangle import _trimul as T
+from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"

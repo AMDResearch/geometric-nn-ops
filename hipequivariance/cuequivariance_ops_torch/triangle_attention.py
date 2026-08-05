@@ -7,7 +7,7 @@ Matches the contract that cuequivariance_torch calls:
     triangle_attention(q, k, v, bias, mask, scale, return_aux)   # positional
 where q/k/v are (B, N, H, S, D) (B=1 may be dropped to 4D).
 
-geometric_nn_ops expects q/k/v in (B, N, S, H, D). This shim is the compatibility
+geometric-nn-ops expects q/k/v in (B, N, S, H, D). This shim is the compatibility
 boundary, so it transposes the H and S axes on the way in and transposes the
 output back to the cueq layout. bias (B, 1, H, S, S) and mask (B, N, 1, 1, S) are
 already layout-compatible and pass through unchanged.
@@ -15,7 +15,7 @@ already layout-compatible and pass through unchanged.
 
 import torch
 
-from geometric_nn_ops.triangle import triangle_attention as _ta
+from geometric_nn_ops_torch.triangle import triangle_attention as _ta
 
 # Our kernel handles short sequences fine, so expose a low threshold to prefer
 # it.
@@ -36,7 +36,7 @@ def triangle_attention(
             "hipequivariance: triangle_attention(return_aux=True) is not supported "
             "yet (the Triton kernel does not expose lse/max)."
         )
-    # cueq (B, N, H, S, D) -> geometric_nn_ops (B, N, S, H, D); output back.
+    # cueq (B, N, H, S, D) -> geometric-nn-ops (B, N, S, H, D); output back.
     q = q.transpose(-2, -3)
     k = k.transpose(-2, -3)
     v = v.transpose(-2, -3)

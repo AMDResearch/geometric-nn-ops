@@ -4,7 +4,7 @@ Zero-code-change drop-in for NVIDIA's proprietary `cuequivariance_ops_torch`
 kernels, backed by Triton, with first-class support for AMD ROCm GPUs.
 
 This is the *optional convenience* half of this repo. The real compute — and the
-recommended integration path — lives in the `geometric-nn-ops` package (portable
+recommended integration path — lives in the `geometric-nn-ops-torch` package (portable
 Triton kernels, fwd+bwd, AMD + NVIDIA). We recommend a direct dependency on that
 API instead where possible.
 
@@ -14,8 +14,8 @@ API instead where possible.
 `cuequivariance_ops_torch` kernels package and exposes the symbols the open
 `cuequivariance_torch` frontend imports:
 
-- `triangle_attention` — routed to `geometric_nn_ops` (Triton fwd+bwd)
-- `triangle_multiplicative_update` — routed to `geometric_nn_ops`
+- `triangle_attention` — routed to `geometric-nn-ops` (Triton fwd+bwd)
+- `triangle_multiplicative_update` — routed to `geometric-nn-ops`
 - `attention_pair_bias` — stub (`NotImplementedError`)
 - `TriMulPrecision`
 - `CUEQ_TRIATTN_FALLBACK_THRESHOLD`
@@ -28,7 +28,7 @@ may incur a performance penalty.
 ## Install
 
 ```bash
-pip install geometric-nn-ops        # the kernels (required)
+pip install geometric-nn-ops-torch        # the kernels (required)
 pip install hipequivariance         # this shim (shadows cuequivariance_ops_torch)
 pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's OPEN python
 # do NOT install cuequivariance-ops-torch-cu12 / -cu13 (the closed binary)
