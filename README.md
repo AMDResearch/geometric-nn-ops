@@ -5,7 +5,8 @@ written in Triton that run on both AMD/ROCm and NVIDIA.
 
 Kernels are namespaced by family:
 
-- `geometric_nn_ops_torch.triangle` — protein-folding (triangle) ops. **In scope.**
+- `geometric_nn_ops_torch.triangle` — protein-folding (triangle) ops. **In
+  scope.**
   - `triangle_attention` (forward + backward)
   - `triangle_multiplicative_update` (Triton forward; pure-torch differentiable
     fallback)
@@ -19,7 +20,6 @@ o = triangle_attention(q, k, v, bias=pair_bias, mask=mask, scale=scale)
 ```
 
 See the docstring for the appropriate tensor layouts and other options.
-
 
 ```python
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
@@ -41,9 +41,10 @@ This repo ships two separately-installable packages:
 - **`hipequivariance-ops-torch`**: an optional zero-code-change shim that
   shadows NVIDIA's `cuequivariance_ops_torch` and routes into these kernels. It
   translates any API differences. See
-  [hipequivariance/README.md](./hipequivariance/README.md). This is provided as
-  a convenience for codebases already integrated with `cuequivariance`. For long
-  term stability, we suggest using the direct dependency where possible.
+  [hipequivariance_ops_torch/README.md](./hipequivariance_ops_torch/README.md).
+  This is provided as a convenience for codebases already integrated with
+  `cuequivariance`. For long term stability, we suggest using the direct
+  dependency where possible.
 
 ## License
 
