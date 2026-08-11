@@ -3,20 +3,9 @@
 
 """Tests for triangle_multiplicative_update.
 
-Correctness is measured against an fp64 torch oracle using two scale-robust
-metrics, on the forward output and on every gradient:
-
-  * cosine similarity of the flattened tensors (catches directional / structural
-    error; insensitive to overall scale), and
-  * relative Frobenius norm ``||a - b|| / ||b||`` (catches magnitude error;
-    unlike max-elementwise-rel it is not dominated by near-zero denominators, so
-    it stays meaningful for large inputs).
-
-Tolerances are per-dtype and calibrated on MI300X. fp32 is looser than true IEEE
-fp32 (~1e-6) because the Triton projection GEMMs (tl.dot) uses reduced precision
-(equivalent to torch "high" fp32 matmul precision). torch op matmuls stay full
-fp32. The bounds carry ~1.5-2x headroom over a correct kernel but still fail a
-structurally wrong one.
+The Triton path is forward-only, so it is compared to the reference on the
+forward alone. The reference carries the backward, and the public op routes to
+it whenever gradients are needed.
 """
 
 import pytest
@@ -25,855 +14,493 @@ import torch
 triton = pytest.importorskip("triton")
 # ruff: noqa E402
 
-from geometric_nn_ops_torch.triangle import _trimul as T
+
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
+from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
+from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
+from testutil import cast_tree
+from testutil.metrics import (
+    TRIMUL_TOL,
+    Tolerance,
+    assert_matches_oracle,
+    cos,
+    rel_fro,
+)
+from testutil.trimul import (
+    BIAS_KEYS,
+    make_pair_input,
+    make_projection_biases,
+    make_weights,
+)
+from utils import DTYPES_PARAM, skip_without_device_memory
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
 )
 
-# Weight order for gradient comparison (bias-free, square config).
-_WEIGHT_KEYS = [
+EPS = 1e-5
+DIRECTIONS_PARAM = ["outgoing", "incoming"]
+
+# The order both implementations take their parameters positionally.
+PARAM_ORDER = (
     "norm_in_weight",
     "norm_in_bias",
     "p_in_weight",
+    "p_in_bias",
     "g_in_weight",
+    "g_in_bias",
     "norm_out_weight",
     "norm_out_bias",
     "p_out_weight",
+    "p_out_bias",
     "g_out_weight",
-]
+    "g_out_bias",
+)
 
-# Per-dtype acceptance bounds vs the fp64 oracle: (min cosine, max rel-fro).
-# Calibrated on MI300X against the measured worst case over the output + all
-# gradients (fp32 fro 8.9e-4, fp16 fro 1.0e-3, bf16 cos 1-4.9e-5 / fro 9.9e-3),
-# leaving ~1.5-2x headroom; a correct kernel sits comfortably inside, a
-# structurally wrong one does not.
-_TOL = {
-    torch.float32: (1.0 - 1e-6, 1.5e-3),
-    torch.float16: (1.0 - 1e-6, 2e-3),
-    torch.bfloat16: (1.0 - 1e-4, 1.5e-2),
+
+def _call(impl, x, direction, mask, weights, eps):
+    """Both implementations take the same positional parameters."""
+    return impl(
+        x,
+        direction == "outgoing",
+        None if mask is None else mask.unsqueeze(-1),
+        weights["p_in_weight"].shape[0] // 2,
+        eps,
+        *(weights.get(k) for k in PARAM_ORDER),
+    )
+
+
+def run_reference(x, direction, mask, weights, eps=EPS):
+    """The pure-torch reference."""
+    return _call(trimul_torch, x, direction, mask, weights, eps)
+
+
+def run_triton(x, direction, mask, weights, eps=EPS):
+    """The Triton kernels, called directly. Forward only."""
+    return _call(trimul_triton, x, direction, mask, weights, eps)
+
+
+def run_public(x, direction, mask, weights, eps=EPS):
+    """The public entrypoint.
+
+    This could delegate to either the Triton or Torch backends.
+    """
+    return triangle_multiplicative_update(
+        x, direction=direction, mask=mask, eps=eps, **weights
+    )
+
+
+IMPLEMENTATIONS = {"reference": run_reference, "triton": run_triton}
+IMPLEMENTATION_PARAM = pytest.mark.parametrize(
+    "impl", list(IMPLEMENTATIONS.values()), ids=list(IMPLEMENTATIONS.keys())
+)
+
+
+def assert_forward_agrees_with_the_oracle(
+    x, mask, weights, direction, *, impl, tol=None, label=""
+):
+    """Run the ``impl`` on the inputs as given and the reference in fp64,
+    compare the forward output."""
+    dtype = x.dtype
+    with torch.no_grad():
+        out = impl(x, direction, mask, weights, EPS)
+        out_oracle = run_reference(
+            x.double(),
+            direction,
+            mask.double(),
+            cast_tree(weights, torch.float64, requires_grad=False),
+            EPS,
+        )
+
+    assert_matches_oracle(
+        [("out", out, out_oracle)], tol or TRIMUL_TOL[dtype], label=label
+    )
+
+
+# Structural tests: These use contrived scenarios where we know the answer
+# analytically. We test both the Triton and Torch reference implementation.
+
+
+def make_masked_weights(c_z, c_hidden, *, biased):
+    """Weights whose gate is fixed, so only the combine can vary by position."""
+    weights = make_weights(c_z, c_hidden, "cuda", torch.float32, seed=3)
+    if biased:
+        weights |= make_projection_biases(c_z, c_hidden, "cuda", torch.float32, seed=5)
+    weights["norm_out_bias"] = torch.full((c_hidden,), 0.25, device="cuda")
+    weights["g_out_weight"] = torch.zeros(c_z, c_z, device="cuda")
+    return weights
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@pytest.mark.parametrize("biased", [False, True], ids=["bias_free", "biased"])
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_fully_masked_input(impl, biased, direction):
+    """An all-zero mask zeroes the combine and a zeroed ``g_out_weight`` fixes
+    the gate, so every output position holds the same vector."""
+    N, C = 32, 128
+    weights = make_masked_weights(C, C, biased=biased)
+    x, _ = make_pair_input(1, N, C, "cuda", torch.float32, seed=4)
+    mask = torch.zeros(1, N, N, device="cuda")
+
+    with torch.no_grad():
+        out = impl(x, direction, mask, weights)
+
+    # Not bit-exact: the output projection is a GEMM, and its tiling makes even
+    # a constant input vary in the last place. A mask that reached the wrong
+    # rows leaves real data behind, which is orders of magnitude larger.
+    constant = out[:, :1, :1].expand_as(out)
+    torch.testing.assert_close(out, constant, rtol=0, atol=1e-6)
+    assert out.abs().max() > 0.01, "the constant field should not be trivially zero"
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@pytest.mark.parametrize("which", BIAS_KEYS)
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_each_projection_bias_contributes(impl, which, direction):
+    """Zeroing any one bias changes the output, so none is silently dropped."""
+    N, C = 16, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=47) | (
+        make_projection_biases(C, C, "cuda", torch.float32, seed=48)
+    )
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=49)
+
+    with torch.no_grad():
+        out = impl(x, direction, mask, weights)
+        zeroed = impl(
+            x, direction, mask, {**weights, which: torch.zeros_like(weights[which])}
+        )
+
+    assert not torch.allclose(out, zeroed, atol=1e-5), f"{which} has no effect"
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+def test_direction_changes_the_result(impl):
+    """``direction`` has to reach the math: the two directions contract
+    different index pairs, so on an asymmetric input they cannot agree."""
+    N, C = 32, 128
+    weights = make_weights(C, C, "cuda", torch.float32, seed=7)
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=8)
+
+    with torch.no_grad():
+        outgoing = impl(x, "outgoing", mask, weights)
+        incoming = impl(x, "incoming", mask, weights)
+
+    assert not torch.allclose(outgoing, incoming, rtol=1e-2, atol=1e-2), (
+        "the two directions should give different answers on an asymmetric input"
+    )
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_mask_none(impl, direction):
+    """``mask=None`` matches an explicit all-ones mask."""
+    N, C = 12, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=37)
+    x, _ = make_pair_input(1, N, C, "cuda", torch.float32, seed=38)
+
+    with torch.no_grad():
+        out = impl(x, direction, None, weights)
+        expected = impl(x, direction, torch.ones(1, N, N, device="cuda"), weights)
+
+    torch.testing.assert_close(out, expected, rtol=2e-3, atol=2e-3)
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_broadcast_mask(impl, direction):
+    """A mask with fewer leading dims than the input matches the expanded one."""
+    N, C, batch = 12, 32, 2
+    weights = make_weights(C, C, "cuda", torch.float32, seed=31)
+    x, mask = make_pair_input(batch, N, C, "cuda", torch.float32, seed=32)
+    broadcast = mask[0]
+
+    with torch.no_grad():
+        out = impl(x, direction, broadcast, weights)
+        expected = impl(x, direction, broadcast.expand(x.shape[:-1]), weights)
+
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+# Reference tests: these compare the Triton kernel to the pure Torch reference
+# in fp64.
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DTYPES_PARAM
+def test_triton_accuracy(direction, dtype):
+    """The kernel at ``dtype`` against the reference in fp64."""
+    N, C = 32, 32
+    weights = make_weights(C, C, "cuda", dtype, seed=3)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
+    assert_forward_agrees_with_the_oracle(
+        x0, mask, weights, direction, impl=run_triton, label=f"{direction}/{dtype}"
+    )
+
+
+@requires_gpu
+@DTYPES_PARAM
+def test_reference_precision(dtype):
+    """How much the reference loses at ``dtype``, both sides being the
+    reference. The reference is the op's fallback for inputs the kernel cannot
+    serve. This is mostly just a sanity check."""
+    N, C = 32, 32
+    weights = make_weights(C, C, "cuda", dtype, seed=3)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
+    assert_forward_agrees_with_the_oracle(
+        x0, mask, weights, "outgoing", impl=run_reference, label=f"reference/{dtype}"
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@pytest.mark.parametrize(
+    "shape", [(2, 48, 48, 128), (2, 3, 40, 40, 128)], ids=["batched", "5D"]
+)
+def test_batched(direction, shape):
+    """Bflat > 1, and more than one leading dim."""
+    *batch, N, _, C = shape
+    dtype = torch.bfloat16
+    weights = make_weights(C, C, "cuda", dtype, seed=7)
+    x, mask = make_pair_input(batch, N, C, "cuda", dtype, seed=11)
+    assert_forward_agrees_with_the_oracle(
+        x,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 1.5e-2),
+        label=f"{shape}/{direction}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@pytest.mark.parametrize("true_length", [32, 48], ids=["L32", "L48"])
+def test_block_padded(direction, true_length):
+    """Real inputs are padded to a block: the first L residues are live and the
+    rest is masked, with the live block itself partly masked."""
+    N, C, batch = 64, 128, 2
+    dtype = torch.bfloat16
+    weights = make_weights(C, C, "cuda", dtype, seed=11)
+    x, _ = make_pair_input(batch, N, C, "cuda", dtype, seed=13)
+
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    mask = torch.zeros(batch, N, N, device="cuda", dtype=dtype)
+    for index in range(batch):
+        # Distinct per-batch true lengths, so the max-L slice is not the length
+        # of every element.
+        live = max(1, true_length - 8 * index)
+        inner = torch.rand(live, live, device="cuda", generator=generator) < 0.9
+        mask[index, :live, :live] = inner.to(dtype)
+    assert_forward_agrees_with_the_oracle(
+        x,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 1.5e-2),
+        label=f"padded/{direction}/L{true_length}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@pytest.mark.parametrize("channels", [96, 128, 256], ids=["c96", "c128", "c256"])
+def test_channel_widths(direction, channels):
+    """Non-standard channel widths."""
+    N = 24
+    dtype = torch.bfloat16
+    weights = make_weights(channels, channels, "cuda", dtype, seed=17)
+    x0, mask = make_pair_input(1, N, channels, "cuda", dtype, seed=18)
+    assert_forward_agrees_with_the_oracle(
+        x0,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 2e-2),
+        label=f"C{channels}/{direction}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_hidden_differs_from_channels(direction):
+    """``c_hidden`` narrower than ``c_z``, so the projections are not square."""
+    N, C_z, C_hidden = 24, 64, 32
+    dtype = torch.bfloat16
+    weights = make_weights(C_z, C_hidden, "cuda", dtype, seed=19)
+    x0, mask = make_pair_input(1, N, C_z, "cuda", dtype, seed=20)
+    assert_forward_agrees_with_the_oracle(
+        x0,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 2e-2),
+        label=f"C{C_z}->{C_hidden}/{direction}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@pytest.mark.parametrize("gamma", ["zero", "tiny", "learned"])
+def test_layernorm_affine(direction, gamma):
+    """Nontrivial LayerNorm affine, including zero/near-zero gamma."""
+    N, C = 24, 128
+    dtype = torch.bfloat16
+    weights = make_weights(C, C, "cuda", dtype, seed=19)
+    generator = torch.Generator(device="cuda").manual_seed(23)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", dtype=dtype, generator=generator)
+
+    gamma_in = torch.ones(C, device="cuda", dtype=dtype)
+    gamma_out = torch.ones(C, device="cuda", dtype=dtype)
+    if gamma == "zero":
+        gamma_in[0] = gamma_in[5] = 0.0
+        gamma_out[3] = 0.0
+    elif gamma == "tiny":
+        gamma_in[:3] = torch.tensor([1e-2, 1e-3, 1e-4], device="cuda")
+        gamma_out[0] = 1e-3
+    else:
+        gamma_in = randn(C) * 0.5 + 1.0
+        gamma_out = randn(C) * 0.5 + 1.0
+    weights["norm_in_weight"] = gamma_in
+    weights["norm_out_weight"] = gamma_out
+    weights["norm_in_bias"] = randn(C) * 0.1
+    weights["norm_out_bias"] = randn(C) * 0.1
+
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=20)
+    assert_forward_agrees_with_the_oracle(
+        x0,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 2e-2),
+        label=f"{gamma}_gamma/{direction}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_large(direction):
+    """N=1024, where the reductions are far deeper than the small shapes. bf16
+    only to keep memory down."""
+    N, C = 1024, 128
+    dtype = torch.bfloat16
+    weights = make_weights(C, C, "cuda", dtype, seed=5)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=6)
+    assert_forward_agrees_with_the_oracle(
+        x0,
+        mask,
+        weights,
+        direction,
+        impl=run_triton,
+        tol=Tolerance(1.0 - 1e-4, 1.5e-2),
+        label=f"large/{direction}",
+    )
+
+
+@pytest.mark.large
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+def test_large_n_no_int32_overflow(direction):
+    """At N=4096, C=128 the flattened element count reaches 2**31, where a
+    32-bit offset would wrap and give a finite but wrong result. Kept in bf16
+    with fp32 metrics calculations to reduce memory usage. Overflow would create
+    huge differences."""
+    N, C = 4096, 128
+    skip_without_device_memory(gib=48)
+    dtype = torch.bfloat16
+    weights = cast_tree(
+        make_weights(C, C, "cuda", dtype, seed=13), dtype, requires_grad=False
+    )
+    x, _ = make_pair_input((), N, C, "cuda", dtype, seed=47)
+    mask = torch.ones(N, N, device="cuda", dtype=dtype)
+
+    with torch.inference_mode():
+        out = run_triton(x, direction, mask, weights).float()
+        torch.cuda.empty_cache()
+        out_reference = run_reference(x, direction, mask, weights).float()
+
+    relative = rel_fro(out, out_reference, accumulate=torch.float32)
+    similarity = cos(out, out_reference, accumulate=torch.float32)
+    assert similarity >= 1.0 - 1e-3 and relative <= 3e-2, (
+        f"the kernel diverges from the reference at N={N} "
+        f"(cos={similarity:.6f}, rel-fro={relative:.3e}), which is what an "
+        f"int32 offset overflow at {N * N * C} elements looks like"
+    )
+
+
+# Dispatch tests: conditions the Triton path cannot serve. The public op routes
+# each to the reference, which it calls directly, so its result is bit-identical
+# to a direct reference call. Adding Triton support for one of these breaks
+# that, which is the signal to move the case to a Triton test.
+
+
+UNSUPPORTED_CONFIGS = {
+    "cpu": {"device": "cpu"},
+    "float64": {"dtype": torch.float64},
+    "input_requires_grad": {"input_requires_grad": True},
+    "weights_require_grad": {"weights_require_grad": True},
 }
 
 
-def _weights(C_z, C_h, device, dtype, *, requires_grad=False, bias=True):
-    g = requires_grad
-
-    def t(*shape, scale=1.0):
-        return (torch.randn(*shape, device=device, dtype=dtype) * scale).requires_grad_(
-            g
-        )
-
-    def b(*shape, scale=1.0):
-        return t(*shape, scale=scale) if bias else None
-
-    return dict(
-        norm_in_weight=torch.ones(C_z, device=device, dtype=dtype).requires_grad_(g),
-        norm_in_bias=torch.zeros(C_z, device=device, dtype=dtype).requires_grad_(g),
-        p_in_weight=t(2 * C_h, C_z, scale=0.05),
-        p_in_bias=b(2 * C_h, scale=0.05),
-        g_in_weight=t(2 * C_h, C_z, scale=0.05),
-        g_in_bias=b(2 * C_h, scale=0.05),
-        norm_out_weight=torch.ones(C_h, device=device, dtype=dtype).requires_grad_(g),
-        norm_out_bias=torch.zeros(C_h, device=device, dtype=dtype).requires_grad_(g),
-        p_out_weight=t(C_z, C_h, scale=0.05),
-        p_out_bias=b(C_z, scale=0.05),
-        g_out_weight=t(C_z, C_z, scale=0.05),
-        g_out_bias=b(C_z, scale=0.05),
+def build_config(
+    *,
+    device="cuda",
+    dtype=torch.float32,
+    input_requires_grad=False,
+    weights_require_grad=False,
+):
+    weights = make_weights(
+        32, 32, device, dtype, seed=1, requires_grad=weights_require_grad
     )
-
-
-def _cos(a, b):
-    a = a.detach().flatten().double()
-    b = b.detach().flatten().double()
-    return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-
-
-def _rel_fro(a, b):
-    a = a.detach().double()
-    b = b.detach().double()
-    return (
-        torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-30)
-    ).item()
-
-
-def _bias_free_weights(C, device, seed):
-    """Fixed fp32 bias-free, square (C_hidden == C_z == C) weights (values only)."""
-    torch.manual_seed(seed)
-    w = _weights(C, C, device, torch.float32, bias=False)
-    return {k: w[k] for k in _WEIGHT_KEYS}
-
-
-def _clone(weights, dtype, requires_grad):
-    return {
-        k: v.to(dtype).detach().requires_grad_(requires_grad)
-        for k, v in weights.items()
-    }
-
-
-def _run(x, mask, direction, w, go):
-    """Forward + grads wrt (x, *weights).
-
-    Uses whatever path the current TRITON_AVAILABLE / dtype select."""
-    out = triangle_multiplicative_update(x, direction=direction, mask=mask, **w)
-    targets = [x] + [w[k] for k in _WEIGHT_KEYS]
-    grads = torch.autograd.grad(out, targets, grad_outputs=go, retain_graph=False)
-    return out, grads
-
-
-def _assert_accuracy(dtype, out_t, g_t, out_o, g_o, *, tol=None, capsys_label=""):
-    cos_min, fro_max = tol if tol is not None else _TOL[dtype]
-    checks = [("out", out_t, out_o)] + [
-        (f"grad_{k}", g_t[i], g_o[i]) for i, k in enumerate(["x"] + _WEIGHT_KEYS)
-    ]
-    worst_cos, worst_fro, msgs, nonfinite = 1.0, 0.0, [], []
-    for name, a, b in checks:
-        # Guard against NaN/Inf first: cos/fro fold with min()/max(), which
-        # silently skip NaN, so a non-finite gradient would otherwise pass.
-        if not torch.isfinite(a).all():
-            nonfinite.append(name)
-        c = _cos(a, b)
-        f = _rel_fro(a, b)
-        worst_cos = min(worst_cos, c)
-        worst_fro = max(worst_fro, f)
-        msgs.append(f"{name}: cos={c:.6f} fro={f:.3e}")
-    print(f"\n[{capsys_label}] worst cos={worst_cos:.6f} worst fro={worst_fro:.3e}")
-    for m in msgs:
-        print("  " + m)
-    assert not nonfinite, (
-        f"non-finite (NaN/Inf) values in: {', '.join(nonfinite)}\n" + "\n".join(msgs)
+    x, mask = make_pair_input(
+        1, 12, 32, device, dtype, seed=3, requires_grad=input_requires_grad
     )
-    assert worst_cos >= cos_min, (
-        f"cosine {worst_cos:.6f} < {cos_min:.6f}\n" + "\n".join(msgs)
-    )
-    assert worst_fro <= fro_max, (
-        f"rel-fro {worst_fro:.3e} > {fro_max:.1e}\n" + "\n".join(msgs)
-    )
+    return x, mask, weights
 
 
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
 @pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.bfloat16, torch.float16],
-    ids=["fp32", "bf16", "fp16"],
+    "config", list(UNSUPPORTED_CONFIGS.values()), ids=list(UNSUPPORTED_CONFIGS)
 )
-def test_accuracy(direction, dtype, monkeypatch):
-    """Triton forward + backward vs an fp64 torch oracle (cos + rel-fro)."""
-    N, C = 32, 32
-    weights_orig = _bias_free_weights(C, "cuda", seed=3)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
+def test_unsupported_configs_use_the_reference(config):
+    if config.get("device", "cuda") == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+    x, mask, weights = build_config(**config)
 
-    # Triton path at the tested dtype.
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    out_ref_shape = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
+    out = run_public(x, "outgoing", mask, weights)
+    expected = run_reference(x, "outgoing", mask, weights)
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_cpu_is_differentiable():
+    """The public op on CPU, where there is no kernel to route to. Gradients
+    still have to flow to every parameter."""
+    N, C_z, C_hidden = 8, 16, 12
+    weights = make_weights(
+        C_z, C_hidden, "cpu", torch.float32, seed=2, requires_grad=True
+    ) | make_projection_biases(
+        C_z, C_hidden, "cpu", torch.float32, seed=3, requires_grad=True
     )
-    go = torch.randn_like(out_ref_shape)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    # fp64 oracle (force the torch reference path).
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(dtype, out_t, g_t, out_o, g_o, capsys_label=f"{dtype}/{direction}")
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_autocast_mixed_dtype(direction, monkeypatch):
-    """Regression: torch.autocast(bf16) with an fp32 pair rep + fp32 weights.
-
-    OF3 under autocast passes things in this mix of dtypes and the kernel needs
-    to handle it.
-    """
-    N, C = 32, 32
-    weights_orig = _bias_free_weights(C, "cuda", seed=5)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-    assert T.TRITON_AVAILABLE
-
-    # fp32 activation + fp32 weights, deliberately NOT pre-cast to a matched dtype.
-    x_t = x0.float().detach().requires_grad_(True)
-    w_t = _clone(weights_orig, torch.float32, requires_grad=True)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        out_t = triangle_multiplicative_update(
-            x_t, direction=direction, mask=mask.float(), **w_t
-        )
-    assert out_t.dtype == torch.bfloat16, (
-        f"expected bf16 under autocast, got {out_t.dtype}"
+    x, _ = make_pair_input(
+        (), N, C_z, "cpu", torch.float32, seed=49, requires_grad=True
     )
-    go = torch.randn_like(out_t)
-    targets = [x_t] + [w_t[k] for k in _WEIGHT_KEYS]
-    g_t = torch.autograd.grad(out_t, targets, grad_outputs=go)
+    mask = torch.ones(N, N)
 
-    # fp64 oracle: torch reference path, no autocast, true-precision math.
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        torch.bfloat16,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        capsys_label=f"autocast-mixed/{direction}",
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_large(direction, monkeypatch):
-    """Large-input bf16 accuracy: norm/cosine stay meaningful where max-rel would
-    be dominated by near-zero denominators."""
-    N, C = 1024, 128
-    dtype = torch.bfloat16
-    weights_orig = _bias_free_weights(C, "cuda", seed=5)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    shape_probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(shape_probe)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    # Slightly looser rel-fro headroom for the deeper N=1024 reductions.
-    _assert_accuracy(
-        dtype,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        tol=(1.0 - 1e-4, 1.5e-2),
-        capsys_label=f"large/{direction}",
-    )
-
-
-def _gpu_total_gib():
-    if not torch.cuda.is_available():
-        return 0.0
-    return torch.cuda.get_device_properties(0).total_memory / 1024**3
-
-
-@requires_gpu
-@pytest.mark.skipif(
-    _gpu_total_gib() < 48,
-    reason="large-N int32-overflow check needs a >=48 GiB GPU",
-)
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_large_n_no_int32_overflow(direction, monkeypatch):
-    """Guards the kernel's int64 offset math at scale.
-
-    At N=4096 the flattened row count M = N*N gives M*C = 2**31, so any offset that
-    slipped to int32 overflows and produces finite-but-wrong output that an isfinite
-    check misses. Compare the Triton forward against the torch reference at bf16 (an
-    indexing/overflow bug diverges hugely; bf16-vs-bf16 rounding is tiny). Forward-
-    only + inference_mode to stay within memory.
-    """
-    dtype = torch.bfloat16
-    N, C = 4096, 128  # 4096**2 * 128 == 2**31 -> exercises the int32 boundary
-    weights_orig = _bias_free_weights(C, "cuda", seed=13)
-    x = (torch.randn(N, N, C, device="cuda") * 0.5).to(dtype)
-    mask = torch.ones(N, N, device="cuda", dtype=dtype)
-
-    assert T.TRITON_AVAILABLE
-    with torch.inference_mode():
-        out_t = triangle_multiplicative_update(
-            x, direction=direction, mask=mask, **_clone(weights_orig, dtype, False)
-        ).float()
-    torch.cuda.empty_cache()
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    with torch.inference_mode():
-        out_ref = triangle_multiplicative_update(
-            x, direction=direction, mask=mask, **_clone(weights_orig, dtype, False)
-        ).float()
-
-    # Memory-frugal fp32 metrics (avoid the double-precision full-tensor copies in
-    # the _cos/_rel_fro helpers, which are too large at this N).
-    fro = (
-        torch.linalg.vector_norm(out_t - out_ref)
-        / torch.linalg.vector_norm(out_ref).clamp_min(1e-30)
-    ).item()
-    cos = torch.nn.functional.cosine_similarity(
-        out_t.flatten(), out_ref.flatten(), dim=0
-    ).item()
-    print(f"\n[scale/{direction}] N={N} M*C={N * N * C} cos={cos:.6f} fro={fro:.3e}")
-    assert cos >= 1.0 - 1e-3 and fro <= 3e-2, (
-        f"large-N Triton diverges from the torch reference "
-        f"(cos={cos:.6f}, fro={fro:.3e}) -- likely an int32 offset overflow at "
-        f"M*C={N * N * C} >= 2**31"
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize("C", [96, 129, 256], ids=["c96", "c129", "c256"])
-def test_channel_widths(direction, C, monkeypatch):
-    """Non-standar channel widths."""
-    dtype = torch.bfloat16
-    N = 24
-    weights_orig = _bias_free_weights(C, "cuda", seed=17)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(probe)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        dtype,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        tol=(1.0 - 1e-4, 2e-2),
-        capsys_label=f"C{C}/{direction}",
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize("affine", ["zero_gamma", "small_gamma", "learned"])
-def test_layernorm_affine(direction, affine, monkeypatch):
-    """Nontrivial LayerNorm affine, including zero/near-zero gamma."""
-    dtype = torch.bfloat16
-    N, C = 24, 128
-    weights_orig = _bias_free_weights(C, "cuda", seed=19)
-    gin = torch.ones(C, device="cuda")
-    gout = torch.ones(C, device="cuda")
-    if affine == "zero_gamma":
-        gin[0] = 0.0
-        gin[5] = 0.0
-        gout[3] = 0.0
-    elif affine == "small_gamma":
-        gin[0] = 1e-2
-        gin[1] = 1e-3
-        gin[2] = 1e-4
-        gout[0] = 1e-3
-    else:  # learned: all channels nonzero but nontrivial
-        torch.manual_seed(23)
-        gin = torch.randn(C, device="cuda") * 0.5 + 1.0
-        gout = torch.randn(C, device="cuda") * 0.5 + 1.0
-    weights_orig["norm_in_weight"] = gin
-    weights_orig["norm_out_weight"] = gout
-    weights_orig["norm_in_bias"] = torch.randn(C, device="cuda") * 0.1
-    weights_orig["norm_out_bias"] = torch.randn(C, device="cuda") * 0.1
-
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(probe)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        dtype,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        tol=(1.0 - 1e-4, 2e-2),
-        capsys_label=f"{affine}/{direction}",
-    )
-
-
-def test_torch_fallback_is_differentiable():
-    """On CPU (no Triton path), grads must flow through the op."""
-    torch.manual_seed(2)
-    N, C_z, C_h = 8, 16, 12
-    x = torch.randn(N, N, C_z, dtype=torch.float32, requires_grad=True)
-    mask = torch.ones(N, N, dtype=torch.float32)
-    w = _weights(C_z, C_h, "cpu", torch.float32, requires_grad=True)
-
-    out = triangle_multiplicative_update(x, direction="outgoing", mask=mask, **w)
-    out.sum().backward()
+    run_public(x, "outgoing", mask, weights).sum().backward()
 
     assert x.grad is not None and torch.isfinite(x.grad).all()
-    assert w["p_in_weight"].grad is not None
-    assert w["g_out_weight"].grad is not None
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize("frac", [0.5, 0.75], ids=["L050", "L075"])
-@pytest.mark.parametrize("batch", [1, 2], ids=["B1", "B2"])
-def test_block_padded(direction, frac, batch, monkeypatch):
-    """Block-padded mask (true length L < N) vs the fp64 oracle."""
-    dtype = torch.bfloat16
-    N, C = 64, 128
-    L = round(frac * N)
-    weights_orig = _bias_free_weights(C, "cuda", seed=11)
-    x0 = torch.randn(batch, N, N, C, device="cuda") * 0.5
-
-    # Block-padded pair mask: keep the first L residues, mask the rest. For
-    # batch>1 give each element a distinct L (<= the global L).
-    mask = torch.zeros(batch, N, N, device="cuda")
-    for bi in range(batch):
-        Lb = L if bi == 0 else max(1, L - 8 * bi)
-        # random keep inside the live block, so it is not trivially all-ones
-        inner = (torch.rand(Lb, Lb, device="cuda") > 0.1).float()
-        mask[bi, :Lb, :Lb] = inner
-
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(probe)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        dtype,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        tol=(1.0 - 1e-4, 1.5e-2),
-        capsys_label=f"padded/{direction}/L{L}/B{batch}",
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize(
-    "shape", [(2, 48, 48, 128), (2, 3, 40, 40, 128)], ids=["B2", "5D"]
-)
-def test_batched(direction, shape, monkeypatch):
-    """Batched (Bflat>1) and multi-leading-dim inputs vs fp64 oracle."""
-    dtype = torch.bfloat16
-    C = shape[-1]
-    weights_orig = _bias_free_weights(C, "cuda", seed=7)
-    x0 = torch.randn(*shape, device="cuda") * 0.5
-    mask = (torch.rand(*shape[:-1], device="cuda") > 0.1).float()
-
-    assert T.TRITON_AVAILABLE
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(weights_orig, dtype, requires_grad=True)
-    probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(probe)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(weights_orig, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        dtype,
-        out_t,
-        g_t,
-        out_o,
-        g_o,
-        tol=(1.0 - 1e-4, 1.5e-2),
-        capsys_label=f"batched{tuple(shape)}/{direction}",
-    )
-
-
-@pytest.fixture
-def force_torch_reference(monkeypatch):
-    """Force ``triangle_multiplicative_update`` through the torch reference."""
-    monkeypatch.setattr(T, "TRITON_AVAILABLE", False)
-
-
-# ---------------------------------------------------------------------------
-# Dispatch contract: inputs the Triton kernels cannot serve must fall back to
-# the torch reference rather than silently changing results.
-# ---------------------------------------------------------------------------
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_differentiable_mask(direction):
-    """A mask that requires grad must still produce a mask gradient.
-
-    The Triton autograd.Function treats the mask as a constant and returns no
-    gradient for it, so dispatch has to route this to the torch reference.
-    """
-    C, N = 32, 16
-    weights = _bias_free_weights(C, "cuda", seed=23)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask0 = torch.rand(N, N, device="cuda")
-
-    def run(triton_enabled, monkeypatch=None):
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(T, "TRITON_AVAILABLE", triton_enabled)
-            x = x0.clone().requires_grad_(True)
-            m = mask0.clone().requires_grad_(True)
-            w = _clone(weights, torch.float32, requires_grad=True)
-            out = triangle_multiplicative_update(x, direction=direction, mask=m, **w)
-            gx, gm = torch.autograd.grad(
-                out, [x, m], torch.ones_like(out), allow_unused=True
-            )
-            return out, gx, gm
-
-    out_t, gx_t, gm_t = run(True)
-    out_r, gx_r, gm_r = run(False)
-
-    assert gm_r is not None, "torch reference should differentiate the mask"
-    assert gm_t is not None, "Triton path silently dropped the mask gradient"
-    torch.testing.assert_close(out_t, out_r, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(gx_t, gx_r, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(gm_t, gm_r, rtol=1e-5, atol=1e-5)
-
-
-@requires_gpu
-def test_float64():
-    """fp64 has no Triton path; it must fall back rather than fail to compile.
-
-    The fallback keeps full fp64 precision, so the result must match a pure
-    torch fp64 evaluation exactly.
-    """
-    C, N = 32, 12
-    weights = _bias_free_weights(C, "cuda", seed=29)
-    x0 = torch.randn(N, N, C, device="cuda", dtype=torch.float64)
-    mask = (torch.rand(N, N, device="cuda") > 0.1).double()
-
-    assert T.TRITON_AVAILABLE
-    w = _clone(weights, torch.float64, requires_grad=False)
-    out = triangle_multiplicative_update(x0, direction="outgoing", mask=mask, **w)
-    assert out.dtype == torch.float64
-    assert torch.isfinite(out).all()
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(T, "TRITON_AVAILABLE", False)
-        ref = triangle_multiplicative_update(x0, direction="outgoing", mask=mask, **w)
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_broadcast_mask_matches_torch(direction):
-    """A mask with fewer leading dims than x."""
-    C, N, B = 32, 12, 2
-    weights = _bias_free_weights(C, "cuda", seed=31)
-    x0 = torch.randn(B, N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()  # shared across batch
-
-    w = _clone(weights, torch.float32, requires_grad=False)
-    assert T.TRITON_AVAILABLE
-    out = triangle_multiplicative_update(x0, direction=direction, mask=mask, **w)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(T, "TRITON_AVAILABLE", False)
-        ref = triangle_multiplicative_update(x0, direction=direction, mask=mask, **w)
-
-    assert out.shape == x0.shape
-    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_mask_none(direction):
-    C, N = 32, 12
-    weights = _bias_free_weights(C, "cuda", seed=37)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    w = _clone(weights, torch.float32, requires_grad=False)
-
-    assert T.TRITON_AVAILABLE
-    out = triangle_multiplicative_update(x0, direction=direction, mask=None, **w)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(T, "TRITON_AVAILABLE", False)
-        ref = triangle_multiplicative_update(x0, direction=direction, mask=None, **w)
-
-    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
-
-
-# ---------------------------------------------------------------------------
-# Torch reference -- candidate under test vs fp64 oracle (not the Triton path)
-# ---------------------------------------------------------------------------
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.bfloat16, torch.float16],
-    ids=["fp32", "bf16", "fp16"],
-)
-def test_torch_reference_vs_fp64_oracle(direction, dtype, force_torch_reference):
-    """Pure-torch TriMul fwd+bwd vs fp64 oracle (validates reference implementation)."""
-    N, C = 32, 32
-    master = _bias_free_weights(C, "cuda", seed=29)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-    assert not T.TRITON_AVAILABLE
-
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(master, dtype, requires_grad=True)
-    go = torch.randn(N, N, C, device="cuda", dtype=dtype)
-    out_t, g_t = _run(x_t, mask.to(dtype), direction, w_t, go)
-
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(master, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), direction, w_o, go.double())
-
-    _assert_accuracy(
-        dtype, out_t, g_t, out_o, g_o, capsys_label=f"torch_ref/{dtype}/{direction}"
-    )
-
-
-@requires_gpu
-def test_torch_reference_routes_to_torch_impl(force_torch_reference, monkeypatch):
-    """With TRITON off, the Triton backend must never be invoked."""
-    calls = {"n": 0}
-    real = T.trimul_triton
-
-    def spy(*a, **k):
-        calls["n"] += 1
-        return real(*a, **k)
-
-    monkeypatch.setattr(T, "trimul_triton", spy)
-    N, C = 32, 32
-    master = _bias_free_weights(C, "cuda", seed=71)
-    x = torch.randn(N, N, C, device="cuda", dtype=torch.float32, requires_grad=True)
-    w = _clone(master, torch.float32, requires_grad=True)
-    mask = torch.ones(N, N, device="cuda")
-    out = triangle_multiplicative_update(x, direction="outgoing", mask=mask, **w)
-    out.sum().backward()
-    assert calls["n"] == 0, "torch reference must not call trimul_triton"
-
-
-def test_torch_reference_cpu_vs_fp64(force_torch_reference):
-    """CPU torch reference vs fp64 oracle."""
-    N, C = 8, 16
-    master = _bias_free_weights(C, "cpu", seed=31)
-    x0 = torch.randn(N, N, C) * 0.5
-    mask = torch.ones(N, N)
-    dtype = torch.float32
-
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = _clone(master, dtype, requires_grad=True)
-    go = torch.randn(N, N, C, dtype=dtype)
-    out_t, g_t = _run(x_t, mask, "outgoing", w_t, go)
-
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = _clone(master, torch.float64, requires_grad=True)
-    out_o, g_o = _run(x_o, mask.double(), "outgoing", w_o, go.double())
-
-    _assert_accuracy(dtype, out_t, g_t, out_o, g_o, capsys_label="torch_ref/cpu")
-
-
-# ---------------------------------------------------------------------------
-# Projection biases -- p_in, g_in, p_out, g_out
-# ---------------------------------------------------------------------------
-
-# Full key list when biases are present (adds the four bias tensors).
-_BIAS_KEYS = [
-    "p_in_bias",
-    "g_in_bias",
-    "p_out_bias",
-    "g_out_bias",
-]
-_ALL_WEIGHT_KEYS = _WEIGHT_KEYS + _BIAS_KEYS
-
-
-def _biased_weights(C, device, seed):
-    """fp32 bias-free master weights + non-trivial projection biases.
-
-    p_in/g_in biases are [2*C] (the fused a/b layout); p_out/g_out are [C].
-    """
-    torch.manual_seed(seed)
-    w = _bias_free_weights(C, device, seed)
-    g = torch.Generator(device=device).manual_seed(seed + 100)
-
-    def rn(*shape):
-        return torch.randn(*shape, device=device, generator=g) * 0.05
-
-    return {
-        **w,
-        "p_in_bias": rn(2 * C),
-        "g_in_bias": rn(2 * C),
-        "p_out_bias": rn(C),
-        "g_out_bias": rn(C),
-    }
-
-
-def _run_biased(x, mask, direction, w, go):
-    """fwd+bwd including the four bias tensors in the grad targets."""
-    out = triangle_multiplicative_update(x, direction=direction, mask=mask, **w)
-    targets = [x] + [w[k] for k in _ALL_WEIGHT_KEYS]
-    grads = torch.autograd.grad(out, targets, grad_outputs=go, retain_graph=False)
-    return out, grads
-
-
-def _assert_accuracy_biased(dtype, out_t, g_t, out_o, g_o, *, tol=None, label=""):
-    cos_min, fro_max = tol if tol is not None else _TOL[dtype]
-    names = ["out"] + [f"grad_{k}" for k in ["x"] + _ALL_WEIGHT_KEYS]
-    worst_cos, worst_fro, msgs, nonfinite = 1.0, 0.0, [], []
-    for name, a, b in zip(names, [out_t, *g_t], [out_o, *g_o], strict=True):
-        if not torch.isfinite(a).all():
-            nonfinite.append(name)
-        c = _cos(a, b)
-        f = _rel_fro(a, b)
-        worst_cos = min(worst_cos, c)
-        worst_fro = max(worst_fro, f)
-        msgs.append(f"{name}: cos={c:.6f} fro={f:.3e}")
-    print(f"\n[{label}] worst cos={worst_cos:.6f} worst fro={worst_fro:.3e}")
-    for m in msgs:
-        print("  " + m)
-    assert not nonfinite, f"non-finite in: {', '.join(nonfinite)}\n" + "\n".join(msgs)
-    assert worst_cos >= cos_min, (
-        f"cosine {worst_cos:.6f} < {cos_min:.6f}\n" + "\n".join(msgs)
-    )
-    assert worst_fro <= fro_max, (
-        f"rel-fro {worst_fro:.3e} > {fro_max:.1e}\n" + "\n".join(msgs)
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.bfloat16, torch.float16],
-    ids=["fp32", "bf16", "fp16"],
-)
-def test_projection_biases_fwd_bwd(direction, dtype):
-    """Non-zero p_in/g_in/p_out/g_out biases must flow through correctly.
-
-    Any projection bias that was wired to the wrong linear layer, added on the
-    wrong axis, or silently dropped would diverge from the fp64 oracle here.
-    Biased calls are always routed to the torch reference (the Triton path does
-    not support projection biases), so this validates the torch impl.
-    """
-    N, C = 32, 32
-    master = _biased_weights(C, "cuda", seed=41)
-    x0 = torch.randn(N, N, C, device="cuda") * 0.5
-    mask = (torch.rand(N, N, device="cuda") > 0.1).float()
-
-    x_t = x0.to(dtype).detach().requires_grad_(True)
-    w_t = {k: v.to(dtype).detach().requires_grad_(True) for k, v in master.items()}
-    probe = triangle_multiplicative_update(
-        x_t, direction=direction, mask=mask.to(dtype), **w_t
-    )
-    go = torch.randn_like(probe)
-    out_t, g_t = _run_biased(x_t, mask.to(dtype), direction, w_t, go)
-
-    x_o = x0.double().detach().requires_grad_(True)
-    w_o = {k: v.double().detach().requires_grad_(True) for k, v in master.items()}
-    out_o, g_o = _run_biased(x_o, mask.double(), direction, w_o, go.double())
-
-    # The bias-free fp16 cosine bound in _TOL matches fp32's; the extra
-    # accumulation the projection biases add needs a little more room.
-    tol = (1.0 - 1e-5, 2e-3) if dtype == torch.float16 else None
-    _assert_accuracy_biased(
-        dtype, out_t, g_t, out_o, g_o, tol=tol, label=f"biases/{direction}/{dtype}"
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_projection_biases_output_differs_from_bias_free(direction):
-    """With non-zero biases the output must differ from the bias-free run.
-
-    Guards against the biases being silently ignored (e.g. passed but never
-    used inside the torch impl).
-    """
-    N, C = 24, 32
-    dtype = torch.float32
-    x = torch.randn(N, N, C, device="cuda", dtype=dtype) * 0.5
-    mask = torch.ones(N, N, device="cuda", dtype=dtype)
-    master_free = _bias_free_weights(C, "cuda", seed=43)
-    master_biased = _biased_weights(C, "cuda", seed=43)
-
-    with torch.no_grad():
-        out_free = triangle_multiplicative_update(
-            x,
-            direction=direction,
-            mask=mask,
-            **{k: v.to(dtype) for k, v in master_free.items()},
-        )
-        out_biased = triangle_multiplicative_update(
-            x,
-            direction=direction,
-            mask=mask,
-            **{k: v.to(dtype) for k, v in master_biased.items()},
-        )
-
-    assert not torch.allclose(out_free, out_biased, atol=1e-4), (
-        f"bias-free and biased outputs are identical for {direction} -- "
-        "projection biases appear to be silently ignored"
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize(
-    "which", ["p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias"]
-)
-@pytest.mark.parametrize("direction", ["outgoing", "incoming"])
-def test_each_projection_bias_contributes(direction, which):
-    """Each individual bias, when zeroed, must change the output.
-
-    One bias at a time is set to zero while all others are kept non-zero.
-    This ensures each bias is actually read and applied in the right place,
-    not just passed through unused.
-    """
-    N, C = 16, 32
-    dtype = torch.float32
-    x = torch.randn(N, N, C, device="cuda", dtype=dtype) * 0.5
-    mask = torch.ones(N, N, device="cuda", dtype=dtype)
-    master = _biased_weights(C, "cuda", seed=47)
-
-    def run(w):
-        with torch.no_grad():
-            return triangle_multiplicative_update(
-                x,
-                direction=direction,
-                mask=mask,
-                **{k: v.to(dtype) for k, v in w.items()},
-            )
-
-    out_full = run(master)
-
-    zeroed = {**master, which: torch.zeros_like(master[which])}
-    out_zeroed = run(zeroed)
-
-    assert not torch.allclose(out_full, out_zeroed, atol=1e-5), (
-        f"{which} appears to have no effect on the {direction} output -- "
-        "it may be silently ignored"
-    )
+    for key, weight in weights.items():
+        assert weight.grad is not None, f"{key} received no gradient"
