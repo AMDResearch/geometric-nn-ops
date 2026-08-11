@@ -9,7 +9,7 @@ resolve to the geometric-nn-ops kernels, so unmodified code using
 changes.
 
 This is the optional, zero-code-change convenience surface. Where possible, we
-recommend using ``geometric-nn-ops`` directly instead.
+recommend using ``geometric-nn-ops-torch`` directly instead.
 """
 
 # The imports below intentionally run after `_guard.check()`, so E402 (import

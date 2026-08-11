@@ -24,7 +24,7 @@ from ._kernels.trimul import (
 )
 
 # For now we reuse _combine_projections from the pure torch implementation
-from .reference.trimul import _combine_projections, trimul_torch
+from ._reference.trimul import _combine_projections, trimul_torch
 
 __all__ = ["triangle_multiplicative_update"]
 

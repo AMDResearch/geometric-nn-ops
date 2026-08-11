@@ -32,7 +32,7 @@ from cuequivariance_torch.primitives.triangle import (
     triangle_attention as cueq_triangle_attention,
 )
 
-from geometric_nn_ops.triangle import triangle_attention as hip_triangle_attention
+from geometric_nn_ops_torch.triangle import triangle_attention as hip_triangle_attention
 
 DEVICE = "cuda"
 
@@ -52,7 +52,7 @@ def _make_inputs(B, N_seq, N_res, H, D, dtype, seed=0):
 def _cueq(q, k, v, bias, mask, scale):
     """Call cueq's triangle_attention for comparison with our direct API.
 
-    geometric_nn_ops uses q/k/v layout ``(B, N, S, H, D)``; cuequivariance uses
+    geometric-nn-ops uses q/k/v layout ``(B, N, S, H, D)``; cuequivariance uses
     ``(B, N, H, S, D)``. Transpose the H/S axes on the way in and transpose the
     output back so results are comparable in our layout. (bias/mask share the
     same shape in both.)

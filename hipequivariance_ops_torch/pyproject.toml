@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hipequivariance"
+name = "hipequivariance-ops-torch"
 version = "0.1.0"
 description = "Zero-code-change cuequivariance_ops_torch shim for AMD ROCm, backed by geometric-nn-ops Triton kernels."
 readme = "README.md"
@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "geometric-nn-ops",
+    "geometric-nn-ops-torch",
     "torch>=2.4",
 ]
 

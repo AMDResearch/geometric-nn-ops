@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "geometric-nn-ops"
+name = "geometric-nn-ops-torch"
 version = "0.1.0"
 description = "Vendor-neutral GPU kernels for geometry-aware neural nets (triangle/folding ops)"
 readme = "README.md"
@@ -36,7 +36,7 @@ dev = ["ruff==0.14.2", "pre-commit"]
 "Source" = "https://github.com/AMDResearch/geometric-nn-ops"
 
 [tool.hatch.build.targets.wheel]
-packages = ["geometric_nn_ops"]
+packages = ["geometric_nn_ops_torch"]
 
 [tool.ruff]
 line-length = 88  # Black/ruff default

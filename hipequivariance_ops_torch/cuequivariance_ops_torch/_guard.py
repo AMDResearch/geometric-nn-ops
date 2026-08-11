@@ -41,8 +41,9 @@ def check() -> None:
     clashes = [d for d in _REAL_OPS_DISTS if d in installed]
     if clashes:
         raise RuntimeError(
-            "hipequivariance: both the real closed cuequivariance ops wheel "
-            f"({', '.join(clashes)}) and the hipequivariance shim are installed. "
+            "hipequivariance_ops_torch: both the real closed cuequivariance ops "
+            f"wheel ({', '.join(clashes)}) and the hipequivariance_ops_torch shim "
+            "are installed. "
             "They both provide the import package 'cuequivariance_ops_torch', so "
             "which one loads is nondeterministic. Uninstall the closed wheel "
             "(`pip uninstall " + " ".join(clashes) + "`) to use the AMD shim."
@@ -54,7 +55,7 @@ def check() -> None:
         cueq_torch_version = None
     if cueq_torch_version is not None and cueq_torch_version != _PINNED_CUEQ_TORCH:
         warnings.warn(
-            "hipequivariance: the cuequivariance_ops_torch shim is pinned to "
+            "hipequivariance_ops_torch: the cuequivariance_ops_torch shim is pinned to "
             f"cuequivariance-torch=={_PINNED_CUEQ_TORCH}, but "
             f"{cueq_torch_version} is installed. The frontend's private import "
             "contract may have drifted; routing may break.",
