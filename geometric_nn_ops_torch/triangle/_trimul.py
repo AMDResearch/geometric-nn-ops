@@ -23,8 +23,12 @@ from ._reference.trimul import trimul_torch
 __all__ = ["triangle_multiplicative_update"]
 
 
+# Dtypes the Triton kernels compile for. Anything else takes the torch path.
+_TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+
 def _needs_torch_path(x: torch.Tensor, weights) -> bool:
-    if not TRITON_AVAILABLE or not x.is_cuda:
+    if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
         return True
     return x.requires_grad or (
         torch.is_grad_enabled()

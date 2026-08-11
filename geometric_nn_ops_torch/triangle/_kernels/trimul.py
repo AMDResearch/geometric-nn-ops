@@ -603,6 +603,10 @@ def trimul_triton(
     g_out_weight,
     g_out_bias,
 ):
+    if m is not None:
+        # The kernels index one entry per pair row, so we need to make the
+        # broadcast explicit.
+        m = m.expand(*x.shape[:-1], 1)
     z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
     pg = triton_linear_fused(z, g_in_weight, g_in_bias, apply_sigmoid=True)
     p = triton_linear_fused(z, p_in_weight, p_in_bias, other=pg, mask=m)
