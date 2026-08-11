@@ -9,6 +9,9 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 
 import torch
 
+# For now we reuse this from the pure torch implementation.
+from geometric_nn_ops_torch.triangle._reference.trimul import _combine_projections
+
 try:
     import triton
     import triton.language as tl
@@ -579,3 +582,34 @@ def triton_linear_fused(
 
     output_shape = input_shape[:-1] + (N,)
     return output_2d.reshape(output_shape)
+
+
+def trimul_triton(
+    x,
+    outgoing,
+    m,
+    c_hidden,
+    eps,
+    norm_in_weight,
+    norm_in_bias,
+    p_in_weight,
+    p_in_bias,
+    g_in_weight,
+    g_in_bias,
+    norm_out_weight,
+    norm_out_bias,
+    p_out_weight,
+    p_out_bias,
+    g_out_weight,
+    g_out_bias,
+):
+    z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
+    pg = triton_linear_fused(z, g_in_weight, g_in_bias, apply_sigmoid=True)
+    p = triton_linear_fused(z, p_in_weight, p_in_bias, other=pg, mask=m)
+    a = p[..., :c_hidden]
+    b = p[..., c_hidden:]
+    o = _combine_projections(a, b, outgoing)
+    o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
+    o = triton_linear_fused(o, p_out_weight, p_out_bias)
+    g = triton_linear_fused(z, g_out_weight, g_out_bias, apply_sigmoid=True)
+    return o * g
