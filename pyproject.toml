@@ -32,6 +32,16 @@ test = ["pytest>=7"]
 # and manual runs format identically (ruff is pre-1.0; output can shift).
 dev = ["ruff==0.14.2", "pre-commit"]
 
+[tool.pytest.ini_options]
+markers = [
+    "large: tests of large inputs. These require significant memory and take a long time.",
+]
+# Large tests are generally not appropriate for local runs, as they can require
+# datacenter-class GPU memory and be extremely slow otherwise. They are
+# deselected by default; opt in with `-m large` or `-m ""`. Tests with specific
+# memory requirements also skip if the GPU has insufficient memory.
+addopts = "-m 'not large'"
+
 [project.urls]
 "Source" = "https://github.com/AMDResearch/geometric-nn-ops"
 
@@ -85,3 +95,8 @@ notice-rgx = '(?im)^# Copyright.*Advanced Micro Devices.*\n# SPDX-License-Identi
 # unnecessary, it is on a deprecation path, and it breaks runtime annotation
 # introspection (dataclasses / typing.get_type_hints).
 "__future__.annotations".msg = "`from __future__ import annotations` is no longer recommended and is on a deprecation path; PEP 649/749 (Python 3.14) supersede it."
+
+[tool.ruff.lint.isort]
+# `utils` is `tests/utils.py`, which pytest makes importable by putting the test
+# directory on sys.path. Without this it sorts as a third-party package.
+known-first-party = ["geometric_nn_ops_torch", "testutil", "utils"]
