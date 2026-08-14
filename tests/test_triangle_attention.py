@@ -351,17 +351,7 @@ def strided_case_inputs(case, dtype, shape=STRIDE_SHAPE):
     return qkv, bias, mask
 
 
-# The forward kernel addresses K, V and O with the slab offset computed from Q's
-# strides. O comes from empty_like(Q), which only preserves Q's strides when Q
-# is dense, so stores can land past the end of O.
-strided_forward_xfail = pytest.mark.xfail(
-    strict=True,
-    reason="forward kernel gives K, V and O the offset it computed for Q",
-)
-
-
 @requires_gpu
-@strided_forward_xfail
 @LAYOUT_PARAM
 @DTYPES_PARAM
 def test_strided_qkv_inference(case, dtype):
@@ -503,7 +493,6 @@ def test_strided_mask(case, dtype):
 
 
 @requires_gpu
-@strided_forward_xfail
 @DTYPES_PARAM
 def test_strided_qkv_head_dim_one(dtype):
     """Strided inputs when only one lane of the padded head dim is valid."""
@@ -521,7 +510,6 @@ def test_strided_qkv_head_dim_one(dtype):
 
 
 @requires_gpu
-@strided_forward_xfail
 def test_strided_qkv_dynamic():
     """Strided q/k/v through the dynamic-shape kernel.
 

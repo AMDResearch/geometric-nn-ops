@@ -254,25 +254,22 @@ if _TRITON_AVAILABLE:
         index_batch = index_batch_msa // N_SEQ
         index_msa = index_batch_msa % N_SEQ
 
-        # Cast to int64 to avoid int32 overflow for large sequences
-        qvk_offset = (
-            index_batch.to(tl.int64) * stride_Q_batch
-            + index_msa.to(tl.int64) * stride_Q_msa
-            + index_head * stride_Q_head
-        )
+        # Cast to int64 to avoid int32 overflow for large sequences.
+        ib = index_batch.to(tl.int64)
+        im = index_msa.to(tl.int64)
+        ih = index_head.to(tl.int64)
+        q_offset = ib * stride_Q_batch + im * stride_Q_msa + ih * stride_Q_head
+        k_offset = ib * stride_K_batch + im * stride_K_msa + ih * stride_K_head
+        v_offset = ib * stride_V_batch + im * stride_V_msa + ih * stride_V_head
+        o_offset = ib * stride_O_batch + im * stride_O_msa + ih * stride_O_head
+
         offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
         offs_d = tl.arange(0, BLOCK_DIM)
 
-        Q_block_ptr = (
-            Q + qvk_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
-        )
-        V_block_ptr = (
-            V + qvk_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
-        )
-        K_block_ptr = (
-            K + qvk_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
-        )
+        Q_block_ptr = Q + q_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
+        V_block_ptr = V + v_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
+        K_block_ptr = K + k_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
         pair_bias_block_ptr = (
             pair_bias
             + index_batch * stride_pair_bias_batch
@@ -282,9 +279,7 @@ if _TRITON_AVAILABLE:
                 + offs_kv[None, :] * stride_pair_bias_seq2
             )
         )
-        O_block_ptr = (
-            O + qvk_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
-        )
+        O_block_ptr = O + o_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
 
         res_mask_block_ptr = (
             res_mask
@@ -435,25 +430,22 @@ if _TRITON_AVAILABLE:
         index_batch = index_batch_msa // N_SEQ
         index_msa = index_batch_msa % N_SEQ
 
-        # Cast to int64 to avoid int32 overflow for large sequences
-        qvk_offset = (
-            index_batch.to(tl.int64) * stride_Q_batch
-            + index_msa.to(tl.int64) * stride_Q_msa
-            + index_head * stride_Q_head
-        )
+        # Cast to int64 to avoid int32 overflow for large sequences.
+        ib = index_batch.to(tl.int64)
+        im = index_msa.to(tl.int64)
+        ih = index_head.to(tl.int64)
+        q_offset = ib * stride_Q_batch + im * stride_Q_msa + ih * stride_Q_head
+        k_offset = ib * stride_K_batch + im * stride_K_msa + ih * stride_K_head
+        v_offset = ib * stride_V_batch + im * stride_V_msa + ih * stride_V_head
+        o_offset = ib * stride_O_batch + im * stride_O_msa + ih * stride_O_head
+
         offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
         offs_d = tl.arange(0, BLOCK_DIM)
 
-        Q_block_ptr = (
-            Q + qvk_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
-        )
-        V_block_ptr = (
-            V + qvk_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
-        )
-        K_block_ptr = (
-            K + qvk_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
-        )
+        Q_block_ptr = Q + q_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
+        V_block_ptr = V + v_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
+        K_block_ptr = K + k_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
         pair_bias_block_ptr = (
             pair_bias
             + index_batch * stride_pair_bias_batch
@@ -463,9 +455,7 @@ if _TRITON_AVAILABLE:
                 + offs_kv[None, :] * stride_pair_bias_seq2
             )
         )
-        O_block_ptr = (
-            O + qvk_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
-        )
+        O_block_ptr = O + o_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
 
         res_mask_block_ptr = (
             res_mask
@@ -1132,25 +1122,27 @@ if _TRITON_AVAILABLE:
             DIM_Q, DIM_K, DIM_V = Q.shape[-1], K.shape[-1], V.shape[-1]
             assert DIM_Q == DIM_K and DIM_K == DIM_V
 
-            # TRANSPOSE-FOLD (grad-gated): in inference (no grad needed) pass
-            # strided views and skip the 3 .contiguous() copies -> faster forward.
-            # In training keep contiguous so the backward reads coalesced (strided
-            # backward reads are slower than the copies). NOTE: torch disables grad
-            # *inside* autograd.Function.forward, so is_grad_enabled() is always
-            # False here -- gate on input requires_grad instead.
-            if (
+            # In inference, q/k/v go to the kernel as strided views where possible
+            # rather than being copied. The kernels assume a unit stride on the
+            # head dim, so a tensor strided there is copied regardless. In
+            # training all three are made contiguous: the backward kernels assume
+            # Q, K, V and O share strides, and strided backward reads are slower
+            # than the copies. torch disables grad inside
+            # autograd.Function.forward, so is_grad_enabled() is always False
+            # here; gate on the inputs' requires_grad instead.
+            needs_grad = (
                 Q.requires_grad
                 or K.requires_grad
                 or V.requires_grad
                 or pair_bias.requires_grad
-            ):
-                Q = Q.transpose(-2, -3).contiguous()
-                K = K.transpose(-2, -3).contiguous()
-                V = V.transpose(-2, -3).contiguous()
-            else:
-                Q = Q.transpose(-2, -3)
-                K = K.transpose(-2, -3)
-                V = V.transpose(-2, -3)
+            )
+
+            def to_internal_layout(T):
+                """[B, N_seq, N_res, H, D] -> the kernel's [B, N_seq, H, N_res, D]."""
+                T = T.transpose(-2, -3)
+                return T.contiguous() if needs_grad or T.stride(-1) != 1 else T
+
+            Q, K, V = (to_internal_layout(T) for T in (Q, K, V))
 
             BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM = Q.shape
 
