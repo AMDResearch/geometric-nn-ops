@@ -7,12 +7,17 @@
 # Triton is missing; E402 (import not at top of file) is disabled accordingly.
 # ruff: noqa: E402
 
+import collections
 import functools
+import re
+from unittest import mock
 
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
+
+from triton.runtime.jit import JITFunction
 
 from geometric_nn_ops_torch.triangle import triangle_attention
 from geometric_nn_ops_torch.triangle._kernels.triangle_attention import (
@@ -39,6 +44,7 @@ from utils import (
     DTYPE_PRECISION_PARAM,
     DTYPES_PARAM,
     gpu_arch,
+    require_device_memory,
     requires_gpu,
     skip_without_reduced_precision_dot,
 )
@@ -917,3 +923,110 @@ def test_pairformer_shape():
         Tolerance(1.0 - 1e-4, 5e-2),
         label="pairformer_384",
     )
+
+
+@pytest.mark.large
+@requires_gpu
+def test_large_slab_offset_no_int32_overflow():
+    """Slab offsets past 2**31 are computed in int64.
+
+    Only the pair bias is made large, since it reaches such offsets with the
+    least computation. For a contiguous ``[B, 1, H, N, N]`` bias the batch
+    stride is ``H * N * N``, exactly 2**30 at H=64 and N=4096, so batch index 2
+    lands on 2**31. A stride of 2**31 or more would itself arrive as int64 (so
+    H=64 with N=8192 would pass regardless); overflow needs a stride below
+    2**31 whose product with an index exceeds it.
+
+    Zeroing q makes the scores the bias alone, and one large entry per row
+    collapses the softmax onto a single key, so the answer is a gather:
+    ``out[b, 0, i, h] == v[b, 0, target[b, h, i], h]``.
+    """
+    B, N_seq, N_res, H, D = 3, 1, 4096, 64, 8
+    stride_bias_batch = H * N_res * N_res
+    assert stride_bias_batch < 2**31 <= stride_bias_batch * (B - 1), (
+        "input shape would not cause overflow"
+    )
+    require_device_memory(gib=8)
+    dtype = torch.bfloat16
+    peak = 40.0
+
+    v = seeded_randn(B, N_seq, N_res, H, D, device="cuda", dtype=dtype, seed=5)
+    # q and k are expanded from a single vector to save memory.
+    zeros = torch.zeros(D, device="cuda", dtype=dtype)
+    q = k = zeros.expand(B, N_seq, N_res, H, D)
+
+    b_idx = torch.arange(B, device="cuda")[:, None, None]
+    h_idx = torch.arange(H, device="cuda")[None, :, None]
+    i_idx = torch.arange(N_res, device="cuda")[None, None, :]
+    target = (i_idx * 7 + b_idx * 1013 + h_idx * 101) % N_res
+
+    bias = torch.zeros(B, 1, H, N_res, N_res, device="cuda", dtype=dtype)
+    bias[b_idx, 0, h_idx, i_idx, target] = peak
+
+    with torch.no_grad():
+        out = triangle_attention(q, k, v, bias=bias, scale=D**-0.5)
+
+    expected = v[
+        b_idx[..., None],
+        0,
+        target[..., None],
+        h_idx[..., None],
+        torch.arange(D, device="cuda"),
+    ].permute(0, 2, 1, 3)[:, None]
+
+    torch.testing.assert_close(
+        out,
+        expected,
+        rtol=0,
+        atol=1e-10,
+        msg=lambda m: f"the output is not the row of v the bias selected: {m}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_kernels_no_i64_tensors(dynamic):
+    """int64 offsets must not reach the per-element offset vectors.
+
+    Scalar int64 costs a few instructions per program, outside the inner loop.
+    An int64 offset *vector* would double the register footprint of the
+    addressing. Check to make sure no i64 tensors are present in the IR. We
+    check TTIR because it precedes the passes that fold away unnecessary
+    widening, which are dependent on the particular input shape.
+    """
+    B, N_seq, N_res, H, D = 2, 2, 64, 4, 32
+
+    tensors = make_inputs(
+        B,
+        N_seq,
+        N_res,
+        H,
+        D,
+        "cuda",
+        torch.bfloat16,
+        seed=5,
+        requires_grad=True,
+    )
+    launched = collections.defaultdict(list)
+    real_run = JITFunction.run
+
+    def recording_run(self, *args, **kwargs):
+        kernel = real_run(self, *args, **kwargs)
+        launched[self.fn.__name__].append(kernel)
+        return kernel
+
+    with mock.patch.object(JITFunction, "run", recording_run):
+        out = triangle_attention(**tensors, scale=D**-0.5, dynamic=dynamic)
+        out.sum().backward()
+
+    assert launched, "Capturing launched Triton kernels failed"
+    for name, kernels in launched.items():
+        for kernel in kernels:
+            ttir = kernel.asm["ttir"]
+            vectors = re.findall(r"tensor<[0-9x]+xi64>", ttir)
+            assert not vectors, f"{name}: an offset vector was widened: {set(vectors)}"
+            # The index helpers should all be inlined; a call would hide its
+            # body from this check.
+            assert not re.search(r"tt\.call|func\.call", ttir), (
+                f"{name} has function calls"
+            )
