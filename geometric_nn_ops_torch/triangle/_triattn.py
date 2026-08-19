@@ -30,6 +30,7 @@ def triangle_attention(
     mask: torch.Tensor | None = None,
     scale: float | None = None,
     dynamic: bool = False,
+    use_exp2: bool = False,
 ) -> torch.Tensor:
     """Triangle attention with a cueq-compatible signature.
 
@@ -48,6 +49,9 @@ def triangle_attention(
             Triton compile across all sequence lengths). Trades a small per-call
             cost for no per-size recompile; best for variable-size / cold-cache
             workloads. Output is identical to the default specialized path.
+        use_exp2: when ``True``, evaluate the softmax in base 2, which is faster
+            on some backends. Mathematically identical to the default base-e
+            softmax, but not bit-identical.
 
     Returns:
         Tensor of the same shape and dtype as ``q``.
@@ -115,7 +119,7 @@ def triangle_attention(
     q_, k_, v_ = q.to(compute_dtype), k.to(compute_dtype), v.to(compute_dtype)
     rm_, pb_ = res_mask.to(compute_dtype), pair_bias.to(compute_dtype)
 
-    o = TritonEvoformer(q_, k_, v_, rm_, pb_, has_pair_bias, dynamic, scale)
+    o = TritonEvoformer(q_, k_, v_, rm_, pb_, has_pair_bias, dynamic, scale, use_exp2)
     o = o.to(orig_dtype)
 
     return o.reshape(orig_shape)

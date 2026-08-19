@@ -7,6 +7,8 @@
 # Triton is missing; E402 (import not at top of file) is disabled accordingly.
 # ruff: noqa: E402
 
+import functools
+
 import pytest
 import torch
 
@@ -348,6 +350,27 @@ def test_triton_accuracy(shape, dtype):
     )
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
     assert_agrees_with_the_oracle(tensors, mask, D**-0.5, label=f"{shape}/{dtype}")
+
+
+@requires_gpu
+@pytest.mark.parametrize("shape", SHAPES)
+@DTYPES_PARAM
+def test_exp2_softmax(shape, dtype):
+    """The base-2 softmax is an alternate evaluation of the same function, so it
+    holds to the same tolerance as the default base-e path. The backward has to
+    pick up the base the forward used, hence the gradient comparison."""
+    B, N_seq, N_res, H, D = shape
+    tensors = make_inputs(
+        B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True
+    )
+    mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
+    assert_agrees_with_the_oracle(
+        tensors,
+        mask,
+        D**-0.5,
+        impl=functools.partial(triangle_attention, use_exp2=True),
+        label=f"exp2/{shape}/{dtype}",
+    )
 
 
 @requires_gpu

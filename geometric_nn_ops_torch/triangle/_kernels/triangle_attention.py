@@ -14,7 +14,6 @@ Fused forward with an optimized backward:
 Acknowledges prior LLNL evoformer training optimization work.
 """
 
-import os
 import warnings
 
 import torch
@@ -1056,6 +1055,7 @@ if _TRITON_AVAILABLE:
             has_pair_bias=True,
             dynamic=False,
             softmax_scale=None,
+            use_exp2=False,
         ):
             """Run the forward pass of the attention mechanism.
 
@@ -1067,6 +1067,10 @@ if _TRITON_AVAILABLE:
 
             has_pair_bias: set False when pair_bias is all-zeros (MSA column attention).
             This eliminates all pair_bias HBM loads in the forward kernel.
+
+            use_exp2=True evaluates the softmax in base 2, which is faster on some
+            backends. Mathematically identical, but not bit-identical. The value is
+            saved on ctx so the backward matches the base the forward used.
             """
             # Q, K, V: [Batch, N_seq, N_res, Head, Dim]
             # res_mask: [Batch, N_seq, 1, 1, N_res]
@@ -1150,10 +1154,6 @@ if _TRITON_AVAILABLE:
             M = torch.empty(
                 (BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN), device=Q.device, dtype=torch.float32
             )
-
-            # exp2 base-2 softmax: opt-in (default off), works for both fp32 and bf16.
-            # Enable with env OF3_TRITON_EXP2=1.
-            use_exp2 = os.environ.get("OF3_TRITON_EXP2") == "1"
 
             # Default: specialized _attn_fwd (SEQ_LEN/EVEN_* constexpr via heuristics).
             # dynamic: _attn_fwd_dyn (SEQ_LEN/N_SEQ runtime) with EVEN_* passed off.
@@ -1386,8 +1386,9 @@ if _TRITON_AVAILABLE:
             dQ = dQ_acc.to(Q.dtype)
             dQ = dQ.transpose(-2, -3).contiguous()
             d_pb = d_pair_bias.to(dO.dtype) if ctx.has_pair_bias else None
-            # grads: Q,K,V, res_mask, pair_bias, has_pair_bias, dynamic, softmax_scale
-            return dQ, dK, dV, None, d_pb, None, None, None
+            # grads: Q,K,V, res_mask, pair_bias, has_pair_bias, dynamic,
+            # softmax_scale, use_exp2
+            return dQ, dK, dV, None, d_pb, None, None, None, None
 
     TritonEvoformer = EvoformerAttention.apply
 
