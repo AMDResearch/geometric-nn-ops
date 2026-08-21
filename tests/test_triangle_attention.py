@@ -15,11 +15,14 @@ import torch
 triton = pytest.importorskip("triton")
 
 from geometric_nn_ops_torch.triangle import triangle_attention
+from geometric_nn_ops_torch.triangle._kernels.triangle_attention import (
+    triangle_attention_triton,
+)
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
+    mask_val,
     triangle_attention_torch,
 )
-from geometric_nn_ops_torch.triangle._triattn import NEG_INF
-from testutil import cast_tree, generator, make_grad_output
+from testutil import cast_tree, generator, masked_noise, seeded_randn
 from testutil.metrics import (
     TRIANGLE_ATTENTION_TOL,
     Tolerance,
@@ -44,7 +47,7 @@ SHAPES = [
 # layout only, and is the oracle rather than something the op can run.
 IMPLEMENTATIONS = {
     "reference": triangle_attention_torch,
-    "triton": triangle_attention,
+    "triton": triangle_attention_triton,
 }
 IMPLEMENTATION_PARAM = pytest.mark.parametrize(
     "impl", list(IMPLEMENTATIONS.values()), ids=list(IMPLEMENTATIONS.keys())
@@ -66,13 +69,11 @@ def comparisons(out, grads, out_oracle, grads_oracle):
     return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
 
 
-def assert_agrees_with_the_oracle(
-    tensors, mask, scale, *, impl=triangle_attention, tol=None, label=""
-):
+def assert_agrees_with_the_oracle(tensors, mask, scale, *, impl, tol=None, label=""):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
     compare the output and every input gradient."""
     dtype = tensors["q"].dtype
-    grad_out = make_grad_output(
+    grad_out = seeded_randn(
         *tensors["q"].shape, device=tensors["q"].device, dtype=dtype, seed=31
     )
 
@@ -119,20 +120,9 @@ def uniform_attention_inputs(b, n_seq, n_res, h, d, dtype, *, seed=0):
 @IMPLEMENTATION_PARAM
 @DTYPES_PARAM
 @pytest.mark.parametrize("kept_key", [0, 7, 31], ids=["first", "interior", "last"])
-def test_one_unmasked_key_returns_that_key(request, impl, dtype, kept_key):
+def test_one_unmasked_key_returns_that_key(impl, dtype, kept_key):
     """One unmasked key saturates the softmax: its probability is exactly 1 and
     every other exactly 0, so the output is exactly ``v`` at that key."""
-    # -1e9 is not representable in fp16, so the sentinel becomes -inf and the
-    # online softmax evaluates -inf - -inf on a key tile that is masked in its
-    # entirety. Only reachable when such a tile precedes every live key, so the
-    # usual trailing-padding layout is unaffected.
-    if impl is triangle_attention and dtype is torch.float16 and kept_key == 31:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="inf sentinel unrepresentable in fp16 causing NaNs",
-            )
-        )
     B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
     tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", dtype, seed=3)
     mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
@@ -184,6 +174,76 @@ def test_mask_none(impl):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
+@DTYPES_PARAM
+def test_masked_keys_are_ignored(request, impl, dtype):
+    """A masked key's ``v`` reaches the output only through a zero softmax
+    weight, so it should leave the output bit-identical however large it is."""
+
+    B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
+    tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", dtype, seed=3)
+    mask = make_key_mask(B, N_seq, N_res, "cuda", seed=5)
+    perturbed = {
+        **tensors,
+        "v": masked_noise(tensors["v"], ~mask.reshape(B, N_seq, N_res, 1, 1), 9),
+    }
+
+    with torch.no_grad():
+        out = impl(**tensors, mask=mask, scale=D**-0.5)
+        out_perturbed = impl(**perturbed, mask=mask, scale=D**-0.5)
+        unmasked = impl(**tensors, mask=None, scale=D**-0.5)
+        unmasked_perturbed = impl(**perturbed, mask=None, scale=D**-0.5)
+
+    # FP16 Triton is off by one ULP. Do a close test first and then xfail FP16
+    # Triton before doing the exact test.
+    # TODO(gmngeoffrey): root cause this issue
+    torch.testing.assert_close(out, out_perturbed, rtol=0, atol=1e-6)
+    assert not torch.allclose(unmasked, unmasked_perturbed), (
+        "the perturbation does not change the result even unmasked"
+    )
+
+    if impl is triangle_attention_triton and dtype is torch.float16:
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True, reason="fp16: masked v perturbs the output by one ulp"
+            )
+        )
+
+    torch.testing.assert_close(out, out_perturbed, rtol=0, atol=0)
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@DTYPES_PARAM
+def test_masked_logits_are_suppressed(impl, dtype):
+    """``k`` and the bias at masked keys move those logits, and the sentinel has
+    to bury them whatever they are.
+
+    Bounded by ``test_mask_val_suppresses_any_realistic_logit``: fp16 allows
+    16324, and ``k += n`` moves a logit by roughly ``3n``.
+    """
+    B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
+    tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", dtype, seed=3)
+    mask = make_key_mask(B, N_seq, N_res, "cuda", seed=5)
+    perturbed = {
+        **tensors,
+        "k": masked_noise(tensors["k"], ~mask.reshape(B, N_seq, N_res, 1, 1), 7),
+        "bias": masked_noise(tensors["bias"], ~mask, 11),
+    }
+
+    with torch.no_grad():
+        out = impl(**tensors, mask=mask, scale=D**-0.5)
+        out_perturbed = impl(**perturbed, mask=mask, scale=D**-0.5)
+        unmasked = impl(**tensors, mask=None, scale=D**-0.5)
+        unmasked_perturbed = impl(**perturbed, mask=None, scale=D**-0.5)
+
+    torch.testing.assert_close(out, out_perturbed, rtol=0, atol=0)
+    assert not torch.allclose(unmasked, unmasked_perturbed), (
+        "the perturbation does not change the result even unmasked"
+    )
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
 def test_no_bias(impl):
     """Omitting the bias matches an explicit zero bias."""
     B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
@@ -200,18 +260,108 @@ def test_no_bias(impl):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
-def test_additive_mask(impl):
-    """A boolean mask matches the additive mask it is converted to."""
+@DTYPES_PARAM
+def test_fully_masked_row_small_logits(request, impl, dtype):
+    """With every key masked the output is the mean of ``v``.
+
+    ``mask_val`` is large enough that adding it rounds logits away entirely, so
+    every logit in the row lands on the same value and ``exp(logit - max)`` is
+    exactly 1 for all of them. Softmax is then uniform. ``v`` holds small
+    integers over a power-of-two ``N_res`` so the mean is exactly representable.
+
+    ``-mask_val`` rounds logits away entirely when they're < ULP/2, so every
+    logit in the row lands on the same value, ``exp(logit - max)`` is 1 for all
+    of them, and softmax is uniform. ``v`` holds small integers over a
+    power-of-two ``N_res`` so the mean is exactly representable.
+
+    At inf=1e9 for fp32 and bf16 1 ULP is 64, so this requires logits under 32.
+    fp16 xfails because its ulp puts the bound at 0.001, so its logits stay
+    distinct.
+
+    Softmax over no keys is undefined, so this pins what the finite sentinel
+    happens to produce, not a mathematical truth.
+    """
+    if impl is triangle_attention_triton and dtype is torch.float16:
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="fp16 ulp puts the collapse bound at 0.001",
+            )
+        )
+    B, N_seq, N_res, H, D = 1, 1, 32, 4, 16
+    values = torch.randint(
+        -4, 5, (B, N_seq, N_res, H, D), device="cuda", generator=generator("cuda", 5)
+    )
+    tensors = {
+        "q": torch.randn(
+            B,
+            N_seq,
+            N_res,
+            H,
+            D,
+            device="cuda",
+            dtype=dtype,
+            generator=generator("cuda", 7),
+        ),
+        "k": torch.randn(
+            B,
+            N_seq,
+            N_res,
+            H,
+            D,
+            device="cuda",
+            dtype=dtype,
+            generator=generator("cuda", 8),
+        ),
+        "v": values.to(dtype),
+        "bias": torch.zeros(B, 1, H, N_res, N_res, device="cuda", dtype=dtype),
+    }
+    mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
+
+    with torch.no_grad():
+        out = impl(**tensors, mask=mask, scale=D**-0.5)
+
+    expected = values.double().mean(dim=2, keepdim=True).expand_as(out)
+    accumulator_ulp = torch.finfo(torch.float32).eps * expected.abs().max().item()
+    torch.testing.assert_close(out.double(), expected, rtol=0, atol=accumulator_ulp)
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.uint8], ids=["fp32", "bf16", "uint8"]
+)
+def test_non_boolean_mask_is_rejected(dtype):
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
     tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", torch.bfloat16, seed=11)
     boolean = make_key_mask(B, N_seq, N_res, "cuda", seed=4)
-    additive = (~boolean).to(torch.float32) * NEG_INF
 
-    with torch.no_grad():
-        from_bool = impl(**tensors, mask=boolean, scale=D**-0.5)
-        from_additive = impl(**tensors, mask=additive, scale=D**-0.5)
+    with pytest.raises(ValueError, match="mask must be bool"):
+        triangle_attention(**tensors, mask=boolean.to(dtype), scale=D**-0.5)
 
-    torch.testing.assert_close(from_bool, from_additive, rtol=0, atol=0)
+
+@DTYPES_PARAM
+def test_mask_val_is_representable(dtype):
+    """The additive mask val must not overflow."""
+    assert torch.tensor(-mask_val(dtype), dtype=dtype).isfinite()
+
+
+@DTYPES_PARAM
+def test_mask_val_suppresses_any_realistic_logit(dtype):
+    """A masked key has to end up far enough below the largest unmasked one
+    that softmax gives it exactly zero.
+
+    The kernel reduces the softmax in fp32 whatever the input dtype, and fp32
+    ``exp`` underflows to exactly zero below -103.97. Worst case is a masked key
+    whose own logit sits at ``+L`` against an unmasked key at ``-L``, so
+    suppression needs ``(L - mask_val) - (-L) < -104``, i.e.
+
+        L < mask_val / 2 - 52
+
+    where ``L`` bounds ``|qk * scale| + |pair bias|`` together. The tightest
+    case is fp16, which still clears 16324 -- orders above anything a real
+    model produces.
+    """
+    assert mask_val(dtype) / 2 - 52 > 1e4
 
 
 @requires_gpu
@@ -246,6 +396,21 @@ def test_4d_input():
 
     assert out_4d.shape == unbatched["q"].shape
     torch.testing.assert_close(out_4d, out_5d[0], rtol=0, atol=0)
+
+
+@requires_gpu
+def test_four_dimensional_bias():
+    """A ``[B, H, N, N]`` bias gains the N_seq axis. Rank normalization, so it
+    is the public op's job -- the functional entry takes shapes as given."""
+    B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
+    tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", torch.bfloat16, seed=5)
+    without_seq = {**tensors, "bias": tensors["bias"][:, 0]}  # [B, H, N, N]
+
+    with torch.no_grad():
+        out_4d = triangle_attention(**without_seq, mask=None, scale=D**-0.5)
+        out_5d = triangle_attention(**tensors, mask=None, scale=D**-0.5)
+
+    torch.testing.assert_close(out_4d, out_5d, rtol=0, atol=0)
 
 
 @requires_gpu
@@ -285,61 +450,6 @@ def test_dynamic_entry_point():
 
 
 @requires_gpu
-@pytest.mark.parametrize(
-    "inf_sentinel",
-    [9e2, 1e3, 1e6, 1e9],
-)
-def test_fully_masked_row_gradient(request, inf_sentinel):
-    """A fully-masked row across a range of magnitudes for the mask "inf" magnitude.
-
-    The backward rebuilds probabilities as ``exp(QK - M)`` from the stored
-    logsumexp. For a fully masked row, once the "inf" magnitude is large enough,
-    the ``m + log(l)`` in the forward loses the ``log(l)`` term to rounding,
-    leaving the reconstruction short by a factor of ``l``. The kernel currently
-    works around this by dividing by ``SEQ_LEN`` to compensate. But whether or
-    not the term was lost depends on the magnitude of "inf", the accumulator
-    dtype (fortunately fixed in our kernel), and the sequence length (weakly
-    since it scales with log).
-
-    We compare against the reference at fp32 rather than the usual fp64 oracle.
-    Folding the inf sentinel into the logits is the one place in this op where a
-    huge constant is added to O(1) values. At inf magnitude 1e9 fp32 ulp is 64,
-    far wider than the spread of the logits, so the whole row collapses to a
-    single value and softmax is exactly uniform. In fp64 the logits remain
-    intact (basically the mask is *removed* due to softmax scale invariance).
-    This is a separate weirdness with all-masked rows that doesn't apply to the
-    Triton path. Using fp32 for the reference precision avoids conflating these
-    two issues.
-    """
-    if 1e3 <= inf_sentinel < 1e8:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="backward divides by SEQ_LEN having corrected nothing",
-            )
-        )
-    B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
-    tensors = make_inputs(
-        B, N_seq, N_res, H, D, "cuda", torch.float32, seed=3, requires_grad=True
-    )
-    mask = torch.full((B, N_seq, 1, 1, N_res), -inf_sentinel, device="cuda")
-    grad_out = make_grad_output(
-        *tensors["q"].shape, device="cuda", dtype=torch.float32, seed=31
-    )
-
-    out, grads = fwd_bwd(triangle_attention, tensors, mask, D**-0.5, grad_out)
-    out_ref, grads_ref = fwd_bwd(
-        triangle_attention_torch, tensors, mask, D**-0.5, grad_out
-    )
-
-    assert_matches_oracle(
-        comparisons(out, grads, out_ref, grads_ref),
-        TRIANGLE_ATTENTION_TOL[torch.float32],
-        label=f"fully_masked/{inf_sentinel:.0e}",
-    )
-
-
-@requires_gpu
 @pytest.mark.parametrize("shape", SHAPES)
 @DTYPES_PARAM
 def test_triton_accuracy(shape, dtype):
@@ -349,7 +459,9 @@ def test_triton_accuracy(shape, dtype):
         B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True
     )
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
-    assert_agrees_with_the_oracle(tensors, mask, D**-0.5, label=f"{shape}/{dtype}")
+    assert_agrees_with_the_oracle(
+        tensors, mask, D**-0.5, impl=triangle_attention_triton, label=f"{shape}/{dtype}"
+    )
 
 
 @requires_gpu
@@ -374,9 +486,39 @@ def test_exp2_softmax(shape, dtype):
 
 
 @requires_gpu
-@pytest.mark.parametrize(
-    "case", ["no_bias", "no_mask", "four_dimensional_bias", "custom_scale"]
-)
+@DTYPES_PARAM
+def test_fully_masked_row(request, dtype):
+    """Fully masked row, against the reference in fp64.
+
+    The forward for small logits is analytically the mean of ``v`` (see
+    ``test_fully_masked_row_small_logits``) but the gradients are not -- they
+    are an artifact of what the finite sentinel leaves behind, so the reference
+    is the only thing to hold them to.
+    """
+    if dtype is torch.float16:
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="fp16 mask_val too small to swamp the logits",
+            )
+        )
+    B, N_seq, N_res, H, D = 1, 1, 64, 4, 32
+    tensors = make_inputs(
+        B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True
+    )
+    mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
+
+    assert_agrees_with_the_oracle(
+        tensors,
+        mask,
+        D**-0.5,
+        impl=triangle_attention_triton,
+        label=f"fully_masked/{dtype}",
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("case", ["no_bias", "no_mask", "custom_scale"])
 def test_optional_arguments(case):
     """One case per branch through the adapter's optional arguments."""
     B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
@@ -393,12 +535,12 @@ def test_optional_arguments(case):
         with_bias=case != "no_bias",
         requires_grad=True,
     )
-    if case == "four_dimensional_bias":
-        tensors["bias"] = tensors["bias"][:, 0].detach().requires_grad_(True)
     mask = None if case == "no_mask" else make_key_mask(B, N_seq, N_res, "cuda")
     scale = D**-0.5 * (1.75 if case == "custom_scale" else 1.0)
 
-    assert_agrees_with_the_oracle(tensors, mask, scale, label=case)
+    assert_agrees_with_the_oracle(
+        tensors, mask, scale, impl=triangle_attention_triton, label=case
+    )
 
 
 @requires_gpu

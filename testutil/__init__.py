@@ -15,10 +15,16 @@ def generator(device, seed: int) -> torch.Generator:
     return torch.Generator(device=device).manual_seed(seed)
 
 
-def make_grad_output(*shape, device, dtype=torch.float32, seed: int = 0):
-    """Seeded upstream gradient with the requested shape."""
+def seeded_randn(*shape, device, dtype=torch.float32, seed: int = 0):
+    """Standard normal of the requested shape, from a seeded generator."""
     g = generator(device, seed)
     return torch.randn(*shape, device=device, dtype=dtype, generator=g)
+
+
+def masked_noise(t: torch.Tensor, mask: torch.Tensor, seed: int, size: float = 1e3):
+    """``t`` with noise far larger than its own values wherever ``mask`` is set."""
+    noise = size * seeded_randn(t.shape, device=t.device, dtype=t.dtype, seed=seed)
+    return torch.where(mask, t + noise, t)
 
 
 def cast_tree(tensors: dict, dtype, *, requires_grad: bool = True) -> dict:

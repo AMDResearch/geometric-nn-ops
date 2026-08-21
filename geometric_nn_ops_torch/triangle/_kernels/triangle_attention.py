@@ -18,6 +18,10 @@ import warnings
 
 import torch
 
+from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
+    masked_key_bias,
+)
+
 try:
     import triton
     import triton.language as tl
@@ -729,12 +733,24 @@ if _TRITON_AVAILABLE:
             if USE_EXP2:  # opt-in exp2 (match fwd); both fp32 and bf16
                 log2e = 1.4426950408889634  # log2(e): exp(x) == exp2(x * log2e)
                 QK_block = QK_block * log2e
-            # Fully-masked rows lose the logsumexp correction (the masking bias is a
-            # large finite value), so clamp (qk-M <= 0 by construction) and renormalize
-            # the reconstructed probabilities. Threshold -1e3 is decoupled from the
-            # masking ``inf`` (fires for any inf >= 1e3, never on real logits ~O(1e2)).
+            # M is the stored logsumexp and QK is recomputed here, so QK - M can
+            # come out fractionally positive; clamp before exp. By definition
+            # `QK - M <= 0`.
             P_arg = tl.minimum(QK_block - M_block, 0.0)
             P_block = tl.math.exp2(P_arg) if USE_EXP2 else tl.math.exp(P_arg)
+            # In a fully masked row every logit is -MASK, so the row max m is
+            # -MASK. log(l) is then below the fp32 accumulator ULP at this
+            # magnitude and the forward's `m += log(l)` correction is absorbed
+            # by rounding, so M holds the bare max, leaving exp(QK - M) short by
+            # l. in these cases, l == SEQ_LEN because for that row (QK - M) is
+            # all 0 -> P is all 1 and alpha is 1. So we correct after the exp by
+            # dividing by SEQ_LEN. Without this, the gradients blow up. The
+            # threshold only identifies masked cells; it says nothing about
+            # whether log(l) was absorbed, so it fires for fp16 too, whose
+            # smaller mask_val keeps log(l) and where correcting is wrong -- see
+            # the fp16 xfail on test_fully_masked_row.
+            # TODO(gmnngeoffrey): rework how we do masking and avoid the need
+            # for this workaround
             P_block = tl.where(res_mask_block <= -1e3, P_block / SEQ_LEN, P_block)
             dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
             dS_block = P_block * (dP_block - Di[:, None])
@@ -1399,3 +1415,33 @@ if _TRITON_AVAILABLE:
         return EvoformerAttention.apply(
             Q, K, V, res_mask, pair_bias, has_pair_bias, True
         )
+
+
+def triangle_attention_triton(
+    q, k, v, bias=None, mask=None, scale=None, dynamic=False, use_exp2=False
+):
+    """Triangle attention on the canonical 5D layout, boolean mask.
+
+    q/k/v ``[B, N_seq, N_res, H, D]``; bias ``[B, 1, H, N_res, N_res]`` or
+    ``None``; mask ``[B, N_seq, 1, 1, N_res]`` boolean or ``None``.
+    """
+    if TritonEvoformer is None:
+        raise RuntimeError(
+            "Triton kernel unavailable. Ensure `triton` is installed and "
+            "ROCm / CUDA is visible."
+        )
+    Batch, N_seq, N_res = q.shape[0], q.shape[1], q.shape[2]
+    Head = q.shape[3]
+
+    has_pair_bias = bias is not None
+    pair_bias = (
+        bias if has_pair_bias else q.new_zeros(()).expand(Batch, 1, Head, N_res, N_res)
+    )
+    if mask is None:
+        res_mask = q.new_zeros(()).expand(Batch, N_seq, 1, 1, N_res)
+    else:
+        res_mask = masked_key_bias(mask, q.dtype).to(q.dtype)
+
+    return TritonEvoformer(
+        q, k, v, res_mask, pair_bias, has_pair_bias, dynamic, scale, use_exp2
+    )

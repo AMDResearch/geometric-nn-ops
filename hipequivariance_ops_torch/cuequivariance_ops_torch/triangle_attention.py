@@ -40,5 +40,8 @@ def triangle_attention(
     q = q.transpose(-2, -3)
     k = k.transpose(-2, -3)
     v = v.transpose(-2, -3)
+    # cueq documents the mask as "cast to bool internally"; our op requires bool.
+    if mask is not None:
+        mask = mask.bool()
     o = _ta(q, k, v, bias, mask, scale)
     return o.transpose(-2, -3)
