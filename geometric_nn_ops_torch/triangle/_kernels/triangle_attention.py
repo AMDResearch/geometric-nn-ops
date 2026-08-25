@@ -37,8 +37,6 @@ except ImportError:
 
 # Sentinel: replaced with EvoformerAttention.apply when Triton is available.
 TritonEvoformer = None
-# Opt-in variable-shape entry point (set when Triton is available).
-TritonEvoformerDynamic = None
 
 if _TRITON_AVAILABLE:
 
@@ -1407,14 +1405,6 @@ if _TRITON_AVAILABLE:
             return dQ, dK, dV, None, d_pb, None, None, None, None
 
     TritonEvoformer = EvoformerAttention.apply
-
-    def TritonEvoformerDynamic(Q, K, V, res_mask, pair_bias, has_pair_bias=True):
-        """Variable-shape entry point: one Triton compile across all sequence
-        lengths (opt-in). Same output as TritonEvoformer; trades a small per-call
-        cost for no per-size recompile. Best for variable-size / cold-cache."""
-        return EvoformerAttention.apply(
-            Q, K, V, res_mask, pair_bias, has_pair_bias, True
-        )
 
 
 def triangle_attention_triton(
