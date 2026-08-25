@@ -7,9 +7,10 @@ Two backends with identical math:
   * Triton fast path (forward-only) using the fused kernels in ``_kernels.trimul``.
   * Pure-torch fallback that is fully autograd-differentiable.
 
-Dispatch picks the torch path whenever gradients are needed (any input
-``requires_grad``), the tensor is not on CUDA, or Triton is unavailable; otherwise
-the Triton path runs. The torch path doubles as the numerical correctness oracle.
+Dispatch picks the torch path when a backward could run (grad is enabled and
+some input requires it), the tensor is not on CUDA, its dtype has no kernel, or
+Triton is unavailable; otherwise the Triton path runs. The torch path doubles as
+the numerical correctness oracle.
 
 ``p_in_weight`` / ``g_in_weight`` are the concatenated ``[a; b]`` projections
 (shape ``[2 * C_hidden, C_z]``), matching cuequivariance / Boltz fusion.
@@ -30,9 +31,8 @@ _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 def _needs_torch_path(x: torch.Tensor, weights) -> bool:
     if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
         return True
-    return x.requires_grad or (
-        torch.is_grad_enabled()
-        and any(w is not None and w.requires_grad for w in weights)
+    return torch.is_grad_enabled() and (
+        x.requires_grad or any(w is not None and w.requires_grad for w in weights)
     )
 
 

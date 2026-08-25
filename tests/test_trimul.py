@@ -8,6 +8,10 @@ forward alone. The reference carries the backward, and the public op routes to
 it whenever gradients are needed.
 """
 
+import contextlib
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 import torch
 
@@ -15,7 +19,7 @@ triton = pytest.importorskip("triton")
 # ruff: noqa E402
 
 
-from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
+from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
@@ -442,9 +446,8 @@ def test_large_n_no_int32_overflow(direction):
 
 
 # Dispatch tests: conditions the Triton path cannot serve. The public op routes
-# each to the reference, which it calls directly, so its result is bit-identical
-# to a direct reference call. Adding Triton support for one of these breaks
-# that, which is the signal to move the case to a Triton test.
+# each to the reference. Adding Triton support for one of these breaks that,
+# which is the signal to move the case to a full Triton test.
 
 
 UNSUPPORTED_CONFIGS = {
@@ -471,6 +474,16 @@ def build_config(
     return x, mask, weights
 
 
+@contextlib.contextmanager
+def dispatch_spy():
+    """Record which implementation the public op calls."""
+    with (
+        mock.patch.object(_trimul, "trimul_torch", wraps=trimul_torch) as reference,
+        mock.patch.object(_trimul, "trimul_triton", wraps=trimul_triton) as kernel,
+    ):
+        yield SimpleNamespace(reference=reference, kernel=kernel)
+
+
 @pytest.mark.parametrize(
     "config", list(UNSUPPORTED_CONFIGS.values()), ids=list(UNSUPPORTED_CONFIGS)
 )
@@ -479,10 +492,27 @@ def test_unsupported_configs_use_the_reference(config):
         pytest.skip("needs GPU")
     x, mask, weights = build_config(**config)
 
-    out = run_public(x, "outgoing", mask, weights)
-    expected = run_reference(x, "outgoing", mask, weights)
+    with dispatch_spy() as spy:
+        run_public(x, "outgoing", mask, weights)
 
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert spy.reference.called
+    assert not spy.kernel.called
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "no_backward", [torch.no_grad, torch.inference_mode], ids=["no_grad", "inference"]
+)
+def test_no_grad_modes_use_triton(no_backward):
+    """Inputs keep ``requires_grad`` inside ``no_grad`` and ``inference_mode``, but no
+    graph is recorded there, so the forward-only kernel is safe."""
+    x, mask, weights = build_config(input_requires_grad=True, weights_require_grad=True)
+
+    with no_backward(), dispatch_spy() as spy:
+        run_public(x, "outgoing", mask, weights)
+
+    assert spy.kernel.called
+    assert not spy.reference.called
 
 
 def test_cpu_is_differentiable():
