@@ -414,6 +414,30 @@ def test_four_dimensional_bias():
 
 
 @requires_gpu
+@pytest.mark.parametrize("rank", [5, 4, 3], ids=["canonical", "no_batch", "no_seq"])
+def test_lower_rank_mask(rank):
+    """A mask below the canonical rank broadcasts onto it.
+
+    ``[B, N_seq, 1, 1, N_res]`` is the canonical layout, but the documented
+    contract is any shape broadcastable to it. Notably, cuequivariance allows
+    omitting the batch axis when ``B`` is 1.
+    """
+    B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
+    tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", torch.bfloat16, seed=5)
+
+    canonical = make_key_mask(B, N_seq, N_res, "cuda", seed=9)
+    lower = canonical[(0,) * (5 - rank)]
+    explicit = lower.expand_as(canonical).contiguous()
+    assert lower.dim() == rank
+
+    with torch.no_grad():
+        out_lower = triangle_attention(**tensors, mask=lower, scale=D**-0.5)
+        out_explicit = triangle_attention(**tensors, mask=explicit, scale=D**-0.5)
+
+    torch.testing.assert_close(out_lower, out_explicit, rtol=0, atol=0)
+
+
+@requires_gpu
 def test_6d_input():
     """Ranks above 5 fold their leading dims into the batch axis."""
     B0, B1, N_seq, N_res, H, D = 2, 3, 1, 32, 4, 32

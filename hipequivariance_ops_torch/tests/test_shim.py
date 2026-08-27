@@ -35,3 +35,30 @@ def test_upstream_frontend_routes_through_shim():
     out = triangle_attention(q, k, v, bias, mask=mask, scale=D**-0.5)
     assert out.shape == (B, N_seq, H, N_res, D)
     assert out.dtype == dtype
+
+
+@requires_gpu
+def test_batchless_call_matches_explicit_batch():
+    """The batch axis being dropped must not change the result.
+
+    cuequivariance documents that ``B == 1`` may be left out of q/k/v, the bias
+    and the mask. Adding the axis back by hand should be a no-op.
+    """
+    from cuequivariance_torch.primitives.triangle import triangle_attention
+
+    N_seq, H, N_res, D = 2, 4, 64, 32
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(N_seq, H, N_res, D, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    bias = torch.randn(1, H, N_res, N_res, device=device, dtype=dtype) * 0.1
+    mask = torch.rand(N_seq, 1, 1, N_res, device=device) < 0.75
+    mask[..., 0] = True  # a fully masked row leaves softmax undefined
+
+    batchless = triangle_attention(q, k, v, bias, mask=mask, scale=D**-0.5)
+    batched = triangle_attention(
+        q[None], k[None], v[None], bias[None], mask=mask[None], scale=D**-0.5
+    )
+
+    assert batchless.shape == q.shape
+    torch.testing.assert_close(batchless[None], batched, rtol=0, atol=0)

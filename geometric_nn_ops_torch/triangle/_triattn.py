@@ -78,11 +78,10 @@ def triangle_attention(
             bias = bias.unsqueeze(-4)  # [B, H, N, N] -> [B, 1, H, N, N]
         elif bias.dim() > 5:
             bias = bias.reshape(-1, *bias.shape[-4:])
-        bias = bias.expand(Batch, 1, Head, N_res, N_res).contiguous()
+        bias = bias.broadcast_to(Batch, 1, Head, N_res, N_res).contiguous()
     if mask is not None:
-        while mask.dim() > 5:
+        if mask.dim() > 5:
             mask = mask.reshape(-1, *mask.shape[-4:])
-        mask = mask.reshape(*mask.shape, *([1] * (5 - mask.dim())))
         mask = mask.broadcast_to(Batch, N_seq, 1, 1, N_res).contiguous()
 
     # Kernel runs bf16/fp16/fp32 natively (fp32 accumulators); only cast
