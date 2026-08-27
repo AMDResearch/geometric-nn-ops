@@ -10,7 +10,10 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 import torch
 
 # For now we reuse this from the pure torch implementation.
-from geometric_nn_ops_torch.triangle._reference.trimul import _combine_projections
+from geometric_nn_ops_torch.triangle._reference.trimul import (
+    _combine_projections,
+    is_outgoing,
+)
 
 try:
     import triton
@@ -394,27 +397,34 @@ def triton_linear_fused(
 
 def trimul_triton(
     x,
-    outgoing,
-    m,
-    c_hidden,
-    eps,
-    norm_in_weight,
-    norm_in_bias,
-    p_in_weight,
-    p_in_bias,
-    g_in_weight,
-    g_in_bias,
-    norm_out_weight,
-    norm_out_bias,
-    p_out_weight,
-    p_out_bias,
-    g_out_weight,
-    g_out_bias,
+    direction="outgoing",
+    mask=None,
+    *,
+    eps=1e-5,
+    norm_in_weight=None,
+    norm_in_bias=None,
+    p_in_weight=None,
+    p_in_bias=None,
+    g_in_weight=None,
+    g_in_bias=None,
+    norm_out_weight=None,
+    norm_out_bias=None,
+    p_out_weight=None,
+    p_out_bias=None,
+    g_out_weight=None,
+    g_out_bias=None,
 ):
-    if m is not None:
+    """Triangle multiplicative update using fused Triton kernels. Forward only.
+
+    Takes the same arguments as ``trimul_torch``; see it for the layouts.
+    """
+    outgoing = is_outgoing(direction)
+    c_hidden = p_in_weight.shape[0] // 2
+    m = None
+    if mask is not None:
         # The kernels index one entry per pair row, so we need to make the
         # broadcast explicit.
-        m = m.expand(*x.shape[:-1], 1)
+        m = mask.unsqueeze(-1).expand(*x.shape[:-1], 1)
     z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
     pg = triton_linear_fused(z, g_in_weight, g_in_bias, apply_sigmoid=True)
     p = triton_linear_fused(z, p_in_weight, p_in_bias, other=pg, mask=m)

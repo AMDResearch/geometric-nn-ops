@@ -32,6 +32,7 @@ from testutil.metrics import (
 )
 from testutil.trimul import (
     BIAS_KEYS,
+    assert_forward_agrees_with_the_oracle,
     make_pair_input,
     make_projection_biases,
     make_weights,
@@ -42,83 +43,14 @@ requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
 )
 
-EPS = 1e-5
 DIRECTIONS_PARAM = ["outgoing", "incoming"]
 
-# The order both implementations take their parameters positionally.
-PARAM_ORDER = (
-    "norm_in_weight",
-    "norm_in_bias",
-    "p_in_weight",
-    "p_in_bias",
-    "g_in_weight",
-    "g_in_bias",
-    "norm_out_weight",
-    "norm_out_bias",
-    "p_out_weight",
-    "p_out_bias",
-    "g_out_weight",
-    "g_out_bias",
-)
 
-
-def _call(impl, x, direction, mask, weights, eps):
-    """Both implementations take the same positional parameters."""
-    return impl(
-        x,
-        direction == "outgoing",
-        None if mask is None else mask.unsqueeze(-1),
-        weights["p_in_weight"].shape[0] // 2,
-        eps,
-        *(weights.get(k) for k in PARAM_ORDER),
-    )
-
-
-def run_reference(x, direction, mask, weights, eps=EPS):
-    """The pure-torch reference."""
-    return _call(trimul_torch, x, direction, mask, weights, eps)
-
-
-def run_triton(x, direction, mask, weights, eps=EPS):
-    """The Triton kernels, called directly. Forward only."""
-    return _call(trimul_triton, x, direction, mask, weights, eps)
-
-
-def run_public(x, direction, mask, weights, eps=EPS):
-    """The public entrypoint.
-
-    This could delegate to either the Triton or Torch backends.
-    """
-    return triangle_multiplicative_update(
-        x, direction=direction, mask=mask, eps=eps, **weights
-    )
-
-
-IMPLEMENTATIONS = {"reference": run_reference, "triton": run_triton}
+# The structural tests hold for both implementations. The accuracy tests take
+# the reference as their oracle, so there it is not also a candidate.
 IMPLEMENTATION_PARAM = pytest.mark.parametrize(
-    "impl", list(IMPLEMENTATIONS.values()), ids=list(IMPLEMENTATIONS.keys())
+    "impl", [trimul_torch, trimul_triton], ids=["reference", "triton"]
 )
-
-
-def assert_forward_agrees_with_the_oracle(
-    x, mask, weights, direction, *, impl, tol=None, label=""
-):
-    """Run the ``impl`` on the inputs as given and the reference in fp64,
-    compare the forward output."""
-    dtype = x.dtype
-    with torch.no_grad():
-        out = impl(x, direction, mask, weights, EPS)
-        out_oracle = run_reference(
-            x.double(),
-            direction,
-            mask.double(),
-            cast_tree(weights, torch.float64, requires_grad=False),
-            EPS,
-        )
-
-    assert_matches_oracle(
-        [("out", out, out_oracle)], tol or TRIMUL_TOL[dtype], label=label
-    )
 
 
 # Structural tests: These use contrived scenarios where we know the answer
@@ -148,7 +80,7 @@ def test_fully_masked_input(impl, biased, direction):
     mask = torch.zeros(1, N, N, device="cuda")
 
     with torch.no_grad():
-        out = impl(x, direction, mask, weights)
+        out = impl(x, direction, mask, **weights)
 
     # Not bit-exact: the output projection is a GEMM, and its tiling makes even
     # a constant input vary in the last place. A mask that reached the wrong
@@ -171,9 +103,9 @@ def test_each_projection_bias_contributes(impl, which, direction):
     x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=49)
 
     with torch.no_grad():
-        out = impl(x, direction, mask, weights)
+        out = impl(x, direction, mask, **weights)
         zeroed = impl(
-            x, direction, mask, {**weights, which: torch.zeros_like(weights[which])}
+            x, direction, mask, **{**weights, which: torch.zeros_like(weights[which])}
         )
 
     assert not torch.allclose(out, zeroed, atol=1e-5), f"{which} has no effect"
@@ -189,12 +121,29 @@ def test_direction_changes_the_result(impl):
     x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=8)
 
     with torch.no_grad():
-        outgoing = impl(x, "outgoing", mask, weights)
-        incoming = impl(x, "incoming", mask, weights)
+        outgoing = impl(x, "outgoing", mask, **weights)
+        incoming = impl(x, "incoming", mask, **weights)
 
     assert not torch.allclose(outgoing, incoming, rtol=1e-2, atol=1e-2), (
         "the two directions should give different answers on an asymmetric input"
     )
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "impl",
+    [trimul_torch, trimul_triton, triangle_multiplicative_update],
+    ids=["reference", "triton", "public"],
+)
+def test_unknown_direction_is_rejected(impl):
+    """Every entry point, since a direction that is merely misspelled would
+    otherwise compute the other one."""
+    N, C = 12, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=7)
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=8)
+
+    with pytest.raises(ValueError, match="direction must be one of"):
+        impl(x, "outgoin", mask, **weights)
 
 
 @requires_gpu
@@ -207,8 +156,8 @@ def test_mask_none(impl, direction):
     x, _ = make_pair_input(1, N, C, "cuda", torch.float32, seed=38)
 
     with torch.no_grad():
-        out = impl(x, direction, None, weights)
-        expected = impl(x, direction, torch.ones(1, N, N, device="cuda"), weights)
+        out = impl(x, direction, None, **weights)
+        expected = impl(x, direction, torch.ones(1, N, N, device="cuda"), **weights)
 
     torch.testing.assert_close(out, expected, rtol=2e-3, atol=2e-3)
 
@@ -224,8 +173,8 @@ def test_broadcast_mask(impl, direction):
     broadcast = mask[0]
 
     with torch.no_grad():
-        out = impl(x, direction, broadcast, weights)
-        expected = impl(x, direction, broadcast.expand(x.shape[:-1]), weights)
+        out = impl(x, direction, broadcast, **weights)
+        expected = impl(x, direction, broadcast.expand(x.shape[:-1]), **weights)
 
     assert out.shape == x.shape
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
@@ -244,7 +193,12 @@ def test_triton_accuracy(direction, dtype):
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
     assert_forward_agrees_with_the_oracle(
-        x0, mask, weights, direction, impl=run_triton, label=f"{direction}/{dtype}"
+        x0,
+        mask,
+        weights,
+        direction,
+        impl=trimul_triton,
+        label=f"{direction}/{dtype}",
     )
 
 
@@ -258,7 +212,12 @@ def test_reference_precision(dtype):
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
     assert_forward_agrees_with_the_oracle(
-        x0, mask, weights, "outgoing", impl=run_reference, label=f"reference/{dtype}"
+        x0,
+        mask,
+        weights,
+        "outgoing",
+        impl=trimul_torch,
+        label=f"reference/{dtype}",
     )
 
 
@@ -278,7 +237,7 @@ def test_batched(direction, shape):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 1.5e-2),
         label=f"{shape}/{direction}",
     )
@@ -308,7 +267,7 @@ def test_block_padded(direction, true_length):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 1.5e-2),
         label=f"padded/{direction}/L{true_length}",
     )
@@ -328,7 +287,7 @@ def test_channel_widths(direction, channels):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 2e-2),
         label=f"C{channels}/{direction}",
     )
@@ -347,7 +306,7 @@ def test_hidden_differs_from_channels(direction):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 2e-2),
         label=f"C{C_z}->{C_hidden}/{direction}",
     )
@@ -388,7 +347,7 @@ def test_layernorm_affine(direction, gamma):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 2e-2),
         label=f"{gamma}_gamma/{direction}",
     )
@@ -408,7 +367,7 @@ def test_large(direction):
         mask,
         weights,
         direction,
-        impl=run_triton,
+        impl=trimul_triton,
         tol=Tolerance(1.0 - 1e-4, 1.5e-2),
         label=f"large/{direction}",
     )
@@ -432,9 +391,9 @@ def test_large_n_no_int32_overflow(direction):
     mask = torch.ones(N, N, device="cuda", dtype=dtype)
 
     with torch.inference_mode():
-        out = run_triton(x, direction, mask, weights).float()
+        out = trimul_triton(x, direction, mask, **weights).float()
         torch.cuda.empty_cache()
-        out_reference = run_reference(x, direction, mask, weights).float()
+        out_reference = trimul_torch(x, direction, mask, **weights).float()
 
     relative = rel_fro(out, out_reference, accumulate=torch.float32)
     similarity = cos(out, out_reference, accumulate=torch.float32)
@@ -493,7 +452,7 @@ def test_unsupported_configs_use_the_reference(config):
     x, mask, weights = build_config(**config)
 
     with dispatch_spy() as spy:
-        run_public(x, "outgoing", mask, weights)
+        triangle_multiplicative_update(x, "outgoing", mask, **weights)
 
     assert spy.reference.called
     assert not spy.kernel.called
@@ -509,7 +468,7 @@ def test_no_grad_modes_use_triton(no_backward):
     x, mask, weights = build_config(input_requires_grad=True, weights_require_grad=True)
 
     with no_backward(), dispatch_spy() as spy:
-        run_public(x, "outgoing", mask, weights)
+        triangle_multiplicative_update(x, "outgoing", mask, **weights)
 
     assert spy.kernel.called
     assert not spy.reference.called
@@ -529,7 +488,7 @@ def test_cpu_is_differentiable():
     )
     mask = torch.ones(N, N)
 
-    run_public(x, "outgoing", mask, weights).sum().backward()
+    triangle_multiplicative_update(x, "outgoing", mask, **weights).sum().backward()
 
     assert x.grad is not None and torch.isfinite(x.grad).all()
     for key, weight in weights.items():

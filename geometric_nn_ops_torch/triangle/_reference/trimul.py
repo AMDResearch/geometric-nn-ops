@@ -24,6 +24,15 @@ Adapted from OpenFold-3.
 import torch
 import torch.nn.functional as F
 
+DIRECTIONS = ("outgoing", "incoming")
+
+
+def is_outgoing(direction: str) -> bool:
+    """Validate ``direction`` and reduce it to the combine's orientation."""
+    if direction not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
+    return direction == "outgoing"
+
 
 def _permute_final_dims(t: torch.Tensor, inds: tuple[int, ...]) -> torch.Tensor:
     """Permute the last ``len(inds)`` dims of ``t`` (mirrors OF3's helper)."""
@@ -47,30 +56,38 @@ def _combine_projections(
 
 def trimul_torch(
     x,
-    outgoing,
-    m,
-    c_hidden,
-    eps,
-    norm_in_weight,
-    norm_in_bias,
-    p_in_weight,
-    p_in_bias,
-    g_in_weight,
-    g_in_bias,
-    norm_out_weight,
-    norm_out_bias,
-    p_out_weight,
-    p_out_bias,
-    g_out_weight,
-    g_out_bias,
+    direction="outgoing",
+    mask=None,
+    *,
+    eps=1e-5,
+    norm_in_weight=None,
+    norm_in_bias=None,
+    p_in_weight=None,
+    p_in_bias=None,
+    g_in_weight=None,
+    g_in_bias=None,
+    norm_out_weight=None,
+    norm_out_bias=None,
+    p_out_weight=None,
+    p_out_bias=None,
+    g_out_weight=None,
+    g_out_bias=None,
 ):
+    """Triangle multiplicative update in stock PyTorch.
+
+    ``x`` is ``[*, N, N, C_z]`` and ``mask`` ``[*, N, N]``. ``p_in_weight`` and
+    ``g_in_weight`` are the concatenated ``[a; b]`` projections, so the hidden
+    width follows from their row count.
+    """
+    outgoing = is_outgoing(direction)
     c_z = x.shape[-1]
+    c_hidden = p_in_weight.shape[0] // 2
     z = F.layer_norm(x, (c_z,), norm_in_weight, norm_in_bias, eps)
     p = F.linear(z, p_in_weight, p_in_bias) * torch.sigmoid(
         F.linear(z, g_in_weight, g_in_bias)
     )
-    if m is not None:
-        p = p * m
+    if mask is not None:
+        p = p * mask.unsqueeze(-1)
     a = p[..., :c_hidden]
     b = p[..., c_hidden:]
     o = _combine_projections(a, b, outgoing)

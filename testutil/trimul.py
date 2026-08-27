@@ -7,7 +7,10 @@ from collections.abc import Sequence
 
 import torch
 
-from . import generator
+from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
+
+from . import cast_tree, generator
+from .metrics import TRIMUL_TOL, assert_matches_oracle
 
 # Bias-free weight names, in the order tests compare gradients.
 WEIGHT_KEYS = (
@@ -112,3 +115,85 @@ def make_pair_input(
         dtype
     )
     return x.requires_grad_(requires_grad), mask
+
+
+class TrimulLayer(torch.nn.Module):
+    """One triangle multiplicative update, holding its own parameters.
+
+    The implementation is passed in rather than dispatched to, so a caller
+    measuring this module knows which one it is measuring. The public entry
+    point is a valid choice when the dispatch decision is what you want
+    included.
+    """
+
+    def __init__(self, impl, c_z, c_hidden, direction, dtype, *, seed=0, biases=False):
+        super().__init__()
+        self.impl = impl
+        self.direction = direction
+        parameters = make_weights(c_z, c_hidden, "cuda", dtype, seed=seed)
+        if biases:
+            parameters |= make_projection_biases(
+                c_z, c_hidden, "cuda", dtype, seed=seed + 1
+            )
+        self.parameter_names = tuple(parameters)
+        for name, tensor in parameters.items():
+            self.register_parameter(name, torch.nn.Parameter(tensor))
+
+    def forward(self, x, mask):
+        weights = {name: getattr(self, name) for name in self.parameter_names}
+        return self.impl(x, self.direction, mask, **weights)
+
+
+class TrimulStack(torch.nn.Module):
+    """Residual stack of :class:`TrimulLayer`, as a pairformer trunk applies it.
+
+    ``direction`` may be ``"alternate"``, which is how the trunk actually runs:
+    every pair block applies the outgoing update then the incoming one, so the
+    flattened sequence alternates.
+    """
+
+    def __init__(self, impl, depth, c_z, c_hidden, direction, dtype, *, biases=False):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            TrimulLayer(
+                impl,
+                c_z,
+                c_hidden,
+                self._direction_for(direction, index),
+                dtype,
+                seed=2 * index,
+                biases=biases,
+            )
+            for index in range(depth)
+        )
+
+    @staticmethod
+    def _direction_for(direction, index):
+        if direction != "alternate":
+            return direction
+        return "outgoing" if index % 2 == 0 else "incoming"
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = x + layer(x, mask)
+        return x
+
+
+def assert_forward_agrees_with_the_oracle(
+    x, mask, weights, direction, *, impl, tol=None, label=""
+):
+    """Run the ``impl`` on the inputs as given and the reference in fp64,
+    compare the forward output."""
+    dtype = x.dtype
+    with torch.no_grad():
+        out = impl(x, direction, mask, **weights)
+        out_oracle = trimul_torch(
+            x.double(),
+            direction,
+            mask.double(),
+            **cast_tree(weights, torch.float64, requires_grad=False),
+        )
+
+    assert_matches_oracle(
+        [("out", out, out_oracle)], tol or TRIMUL_TOL[dtype], label=label
+    )

@@ -70,66 +70,20 @@ def triangle_multiplicative_update(
     Returns:
         ``[*, N, N, C_z]`` updated pair representation.
     """
-    if direction not in ("outgoing", "incoming"):
-        raise ValueError(
-            f"direction must be 'outgoing' or 'incoming', got {direction!r}"
-        )
-    outgoing = direction == "outgoing"
-    c_hidden = p_in_weight.shape[0] // 2
-
-    m = mask.unsqueeze(-1) if mask is not None else None
-
-    weights = (
-        norm_in_weight,
-        norm_in_bias,
-        p_in_weight,
-        p_in_bias,
-        g_in_weight,
-        g_in_bias,
-        norm_out_weight,
-        norm_out_bias,
-        p_out_weight,
-        p_out_bias,
-        g_out_weight,
-        g_out_bias,
+    weights = dict(
+        norm_in_weight=norm_in_weight,
+        norm_in_bias=norm_in_bias,
+        p_in_weight=p_in_weight,
+        p_in_bias=p_in_bias,
+        g_in_weight=g_in_weight,
+        g_in_bias=g_in_bias,
+        norm_out_weight=norm_out_weight,
+        norm_out_bias=norm_out_bias,
+        p_out_weight=p_out_weight,
+        p_out_bias=p_out_bias,
+        g_out_weight=g_out_weight,
+        g_out_bias=g_out_bias,
     )
 
-    if _needs_torch_path(x, weights):
-        return trimul_torch(
-            x,
-            outgoing,
-            m,
-            c_hidden,
-            eps,
-            norm_in_weight,
-            norm_in_bias,
-            p_in_weight,
-            p_in_bias,
-            g_in_weight,
-            g_in_bias,
-            norm_out_weight,
-            norm_out_bias,
-            p_out_weight,
-            p_out_bias,
-            g_out_weight,
-            g_out_bias,
-        )
-    return trimul_triton(
-        x,
-        outgoing,
-        m,
-        c_hidden,
-        eps,
-        norm_in_weight,
-        norm_in_bias,
-        p_in_weight,
-        p_in_bias,
-        g_in_weight,
-        g_in_bias,
-        norm_out_weight,
-        norm_out_bias,
-        p_out_weight,
-        p_out_bias,
-        g_out_weight,
-        g_out_bias,
-    )
+    impl = trimul_torch if _needs_torch_path(x, weights.values()) else trimul_triton
+    return impl(x, direction, mask, eps=eps, **weights)
