@@ -94,3 +94,36 @@ def test_attention_pair_bias_routes_through_shim():
     assert out.shape == (BM, U, D)
     assert out.dtype == dtype
     assert proj_z is not None and proj_z.shape == (B, H, U, V)
+
+
+@requires_gpu
+def test_upstream_trimul_routes_through_shim():
+    from cuequivariance_torch.primitives.triangle import (
+        triangle_multiplicative_update,
+    )
+
+    # cuequivariance layout: x (B, N, N, C_z), mask (B, N, N). The input
+    # projections are the concatenated [a; b] form, so they carry 2 * C_hidden
+    # rows.
+    B, N, C_z, C_hidden = 1, 32, 32, 32
+    device, dtype = "cuda", torch.bfloat16
+
+    def rn(*shape, scale=1.0):
+        return torch.randn(*shape, device=device, dtype=dtype) * scale
+
+    out = triangle_multiplicative_update(
+        rn(B, N, N, C_z, scale=0.5),
+        "outgoing",
+        mask=(torch.rand(B, N, N, device=device) > 0.1).to(dtype),
+        norm_in_weight=torch.ones(C_z, device=device, dtype=dtype),
+        norm_in_bias=torch.zeros(C_z, device=device, dtype=dtype),
+        p_in_weight=rn(2 * C_hidden, C_z, scale=0.05),
+        g_in_weight=rn(2 * C_hidden, C_z, scale=0.05),
+        norm_out_weight=torch.ones(C_hidden, device=device, dtype=dtype),
+        norm_out_bias=torch.zeros(C_hidden, device=device, dtype=dtype),
+        p_out_weight=rn(C_z, C_hidden, scale=0.05),
+        g_out_weight=rn(C_z, C_z, scale=0.05),
+    )
+
+    assert out.shape == (B, N, N, C_z)
+    assert out.dtype == dtype

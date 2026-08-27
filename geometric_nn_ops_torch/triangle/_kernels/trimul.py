@@ -23,35 +23,6 @@ except ImportError:
 if TRITON_AVAILABLE:
 
     @triton.jit
-    def sigmoid_mul_kernel(
-        x_ptr,
-        gate_ptr,
-        output_ptr,
-        N,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Fused kernel: output = x * sigmoid(gate)
-        """
-        pid = tl.program_id(0)
-
-        block_start = pid * BLOCK_SIZE
-        if block_start >= N:
-            return
-
-        offs = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = (offs >= 0) & (offs < N)
-
-        safe_offs = offs.to(tl.int64)
-        x_vals = tl.load(x_ptr + safe_offs, mask=mask, other=0.0)
-        gate_vals = tl.load(gate_ptr + safe_offs, mask=mask, other=0.0)
-
-        sigmoid_gate = 1.0 / (1.0 + tl.exp(-gate_vals))
-        result = x_vals * sigmoid_gate
-
-        tl.store(output_ptr + safe_offs, result, mask=mask)
-
-    @triton.jit
     def layernorm_kernel(
         x_ptr,
         output_ptr,
@@ -117,85 +88,6 @@ if TRITON_AVAILABLE:
 
                     out = (x_vals - mean) * rstd * w_vals + b_vals
                     tl.store(out_row_ptr + safe_offs, out, mask=mask)
-
-    @triton.jit
-    def linear_kernel(
-        x_ptr,
-        w_ptr,
-        bias_ptr,
-        output_ptr,
-        M,
-        K,
-        N,
-        stride_xm,
-        stride_xk,
-        stride_wn,
-        stride_wk,
-        stride_om,
-        stride_on,
-        HAS_BIAS: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """
-        Linear layer: output = x @ weight.T + bias
-        x: [M, K], weight: [N, K] (PyTorch layout), bias: [N], output: [M, N]
-        """
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-
-        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-        m_mask = rm < M
-        n_mask = rn < N
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k_start in range(0, K, BLOCK_K):
-            rk = k_start + tl.arange(0, BLOCK_K)
-            k_mask = rk < K
-
-            x_offsets = (
-                rm[:, None].to(tl.int64) * stride_xm
-                + rk[None, :].to(tl.int64) * stride_xk
-            )
-
-            w_offsets = (
-                rn[None, :].to(tl.int64) * stride_wn
-                + rk[:, None].to(tl.int64) * stride_wk
-            )
-
-            x = tl.load(
-                x_ptr + x_offsets,
-                mask=m_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
-
-            w = tl.load(
-                w_ptr + w_offsets,
-                mask=k_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-
-            acc = tl.dot(x, w, acc)
-
-        if HAS_BIAS:
-            bias_offsets = rn.to(tl.int64)
-            bias = tl.load(bias_ptr + bias_offsets, mask=n_mask, other=0.0)
-            acc += bias[None, :]
-
-        out_offsets = (
-            rm[:, None].to(tl.int64) * stride_om + rn[None, :].to(tl.int64) * stride_on
-        )
-
-        out_mask = m_mask[:, None] & n_mask[None, :]
-        tl.store(
-            output_ptr + out_offsets,
-            acc,
-            mask=out_mask,
-        )
 
     @triton.jit
     def linear_fused_kernel(
@@ -332,36 +224,6 @@ if TRITON_AVAILABLE:
         )
 
 
-def triton_sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """
-    Fused sigmoid + elementwise multiply: x * sigmoid(gate)
-    Supports broadcasting like PyTorch's native operations.
-
-    Args:
-        x: Input tensor
-        gate: Gate tensor (broadcastable with x)
-
-    Returns:
-        x * sigmoid(gate)
-    """
-    broadcasted_shape = torch.broadcast_shapes(x.shape, gate.shape)
-    x_expanded = x.expand(broadcasted_shape)
-    gate_expanded = gate.expand(broadcasted_shape)
-
-    x_flat = x_expanded.contiguous().reshape(-1)
-    gate_flat = gate_expanded.contiguous().reshape(-1)
-    N = x_flat.numel()
-
-    output_flat = torch.empty_like(x_flat)
-
-    BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
-
-    sigmoid_mul_kernel[grid](x_flat, gate_flat, output_flat, N, BLOCK_SIZE=BLOCK_SIZE)
-
-    return output_flat.reshape(broadcasted_shape)
-
-
 def triton_layernorm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5
 ) -> torch.Tensor:
@@ -401,60 +263,6 @@ def triton_layernorm(
     )
 
     return output_2d.reshape(input_shape)
-
-
-def triton_linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
-) -> torch.Tensor:
-    """
-    Triton Linear: output = x @ weight.T + bias
-
-    Args:
-        x: Input tensor [..., K]
-        weight: Weight tensor [N, K] (same layout as nn.Linear.weight)
-        bias: Optional bias tensor [N]
-
-    Returns:
-        Output tensor [..., N]
-    """
-    input_shape = x.shape
-    K = input_shape[-1]
-    M = x.numel() // K
-    N = weight.shape[0]
-
-    x_2d = x.reshape(M, K).contiguous()
-    output_2d = torch.empty((M, N), dtype=x.dtype, device=x.device)
-
-    BLOCK_M = min(128, triton.next_power_of_2(M))
-    BLOCK_N = min(64, triton.next_power_of_2(N))
-    BLOCK_K = min(64, triton.next_power_of_2(K))
-
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
-    bias_ptr = bias if bias is not None else weight  # guarded by HAS_BIAS constexpr
-
-    linear_kernel[grid](
-        x_2d,
-        weight,
-        bias_ptr,
-        output_2d,
-        M,
-        K,
-        N,
-        x_2d.stride(0),
-        x_2d.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        output_2d.stride(0),
-        output_2d.stride(1),
-        HAS_BIAS=(bias is not None),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    output_shape = input_shape[:-1] + (N,)
-    return output_2d.reshape(output_shape)
 
 
 def triton_linear_fused(

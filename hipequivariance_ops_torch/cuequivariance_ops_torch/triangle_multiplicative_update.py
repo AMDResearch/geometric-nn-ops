@@ -5,6 +5,10 @@
 
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update as _tmu
 
+# Provided to match cuEquivariance's documented API. We don't actually use this
+# to determine when to fall back. The value here is chosen somewhat arbitrarily.
+CUEQ_TRIMUL_FALLBACK_THRESHOLD = 16
+
 
 def triangle_multiplicative_update(
     x,

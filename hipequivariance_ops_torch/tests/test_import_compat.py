@@ -32,10 +32,14 @@ def test_shim_paths_resolve():
     from cuequivariance_ops_torch.attention_pair_bias_torch import (
         CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD,
     )
+    from cuequivariance_ops_torch.triangle_multiplicative_update import (
+        CUEQ_TRIMUL_FALLBACK_THRESHOLD,
+    )
 
     assert callable(triangle_attention)
     assert callable(triangle_multiplicative_update)
     assert callable(attention_pair_bias)
     assert isinstance(CUEQ_TRIATTN_FALLBACK_THRESHOLD, int)
     assert isinstance(CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD, int)
+    assert isinstance(CUEQ_TRIMUL_FALLBACK_THRESHOLD, int)
     assert int(TriMulPrecision.IEEE) == 3
