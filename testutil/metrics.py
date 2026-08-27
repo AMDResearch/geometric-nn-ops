@@ -96,3 +96,9 @@ TRIANGLE_ATTENTION_TOL = {
     torch.float16: Tolerance(1.0 - 1e-4, 2e-2),
     torch.bfloat16: Tolerance(1.0 - 1e-4, 5e-2),
 }
+
+ATTENTION_PAIR_BIAS_TOL = {
+    torch.float32: Tolerance(1.0 - 1e-5, 2e-3),
+    torch.float16: Tolerance(1.0 - 1e-4, 5e-3),
+    torch.bfloat16: Tolerance(1.0 - 1e-4, 2e-2),
+}

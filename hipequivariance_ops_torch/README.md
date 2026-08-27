@@ -14,11 +14,14 @@ API instead where possible.
 `cuequivariance_ops_torch` kernels package and exposes the symbols the open
 `cuequivariance_torch` frontend imports:
 
-- `triangle_attention` — routed to `geometric-nn-ops` (Triton fwd+bwd)
+- `triangle_attention` — routed to `geometric-nn-ops`
 - `triangle_multiplicative_update` — routed to `geometric-nn-ops`
-- `attention_pair_bias` — stub (`NotImplementedError`)
+- `attention_pair_bias` — routed to `geometric-nn-ops`
 - `TriMulPrecision`
-- `CUEQ_TRIATTN_FALLBACK_THRESHOLD`
+- `CUEQ_TRIATTN_FALLBACK_THRESHOLD` (deep import from
+  `cuequivariance_ops_torch.triangle_attention`)
+- `CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD` (deep import from
+  `cuequivariance_ops_torch.attention_pair_bias_torch`)
 
 Unmodified code calling
 `from cuequivariance_torch.primitives.triangle import triangle_attention` then
@@ -45,7 +48,7 @@ from the version it was modeled after.
 | -------------------------------- | ------------- | ----------------------------------------------- |
 | `triangle_attention`             | yes           | yes                                             |
 | `triangle_multiplicative_update` | yes           | yes (torch fallback; native Triton bwd pending) |
-| `attention_pair_bias`            | stub (raises) | stub                                            |
+| `attention_pair_bias`            | yes           | yes (pure torch; no Triton kernel yet)          |
 
 ## License
 

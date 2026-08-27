@@ -18,7 +18,7 @@ import warnings
 
 import torch
 
-from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
+from geometric_nn_ops_torch.triangle._masking import (
     masked_key_bias,
 )
 

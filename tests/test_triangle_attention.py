@@ -18,8 +18,8 @@ from geometric_nn_ops_torch.triangle import triangle_attention
 from geometric_nn_ops_torch.triangle._kernels.triangle_attention import (
     triangle_attention_triton,
 )
+from geometric_nn_ops_torch.triangle._masking import mask_val
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
-    mask_val,
     triangle_attention_torch,
 )
 from testutil import cast_tree, generator, masked_noise, seeded_randn

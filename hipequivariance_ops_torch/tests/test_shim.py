@@ -20,7 +20,7 @@ requires_gpu = pytest.mark.skipif(
 
 
 @requires_gpu
-def test_upstream_frontend_routes_through_shim():
+def test_tri_attn_routes_through_shim():
     from cuequivariance_torch.primitives.triangle import triangle_attention
 
     # cuequivariance layout: (B, N_seq, H, N_res, D)
@@ -36,9 +36,8 @@ def test_upstream_frontend_routes_through_shim():
     assert out.shape == (B, N_seq, H, N_res, D)
     assert out.dtype == dtype
 
-
 @requires_gpu
-def test_batchless_call_matches_explicit_batch():
+def test_tri_attn_batchless_call_matches_explicit_batch():
     """The batch axis being dropped must not change the result.
 
     cuequivariance documents that ``B == 1`` may be left out of q/k/v, the bias
@@ -62,3 +61,36 @@ def test_batchless_call_matches_explicit_batch():
 
     assert batchless.shape == q.shape
     torch.testing.assert_close(batchless[None], batched, rtol=0, atol=0)
+
+
+@requires_gpu
+def test_attention_pair_bias_routes_through_shim():
+    from cuequivariance_torch.primitives.triangle import attention_pair_bias
+
+    # cuequivariance layout: s (BM, S, D), q/k/v (BM, H, U/V, DH), z (B, U, V, Zc).
+    B, M, H, U, V, DH, Zc = 2, 3, 4, 32, 32, 16, 16
+    D, BM = H * DH, B * M
+    device, dtype = "cuda", torch.bfloat16
+
+    def rn(*shape, scale=1.0):
+        return torch.randn(*shape, device=device, dtype=dtype) * scale
+
+    out, proj_z = attention_pair_bias(
+        rn(BM, U, D),
+        rn(BM, H, U, DH),
+        rn(BM, H, V, DH),
+        rn(BM, H, V, DH),
+        rn(B, U, V, Zc),
+        (torch.rand(B, V, device=device) > 0.1).to(dtype),
+        H,
+        w_proj_z=rn(H, Zc, scale=Zc**-0.5),
+        w_proj_g=rn(D, D, scale=D**-0.5),
+        w_proj_o=rn(D, D, scale=D**-0.5),
+        w_ln_z=torch.ones(Zc, device=device, dtype=dtype),
+        b_ln_z=torch.zeros(Zc, device=device, dtype=dtype),
+        attn_scale=DH**-0.5,
+    )
+
+    assert out.shape == (BM, U, D)
+    assert out.dtype == dtype
+    assert proj_z is not None and proj_z.shape == (B, H, U, V)

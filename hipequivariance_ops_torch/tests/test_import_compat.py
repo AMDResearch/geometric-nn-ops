@@ -3,11 +3,12 @@
 
 """Import-compatibility checks for the shim -- no GPU required.
 
-Asserts that every dotted path cuequivariance_torch (v0.9.1) deep-imports from
-the ops layer actually resolves against our shim.
+Asserts that every dotted path cuequivariance_torch deep-import from the ops
+layer actually resolves against our shim.
 """
 
-import pytest
+# The whole point of this test is to test imports, so disable I001 (unsorted-imports).
+# ruff: noqa: I001
 
 
 def test_shim_paths_resolve():
@@ -26,15 +27,15 @@ def test_shim_paths_resolve():
         CUEQ_TRIATTN_FALLBACK_THRESHOLD,
     )
 
+    # Other constants are also presumably deep-imported although no one seems to
+    # ever actually import them
+    from cuequivariance_ops_torch.attention_pair_bias_torch import (
+        CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD,
+    )
+
     assert callable(triangle_attention)
     assert callable(triangle_multiplicative_update)
     assert callable(attention_pair_bias)
     assert isinstance(CUEQ_TRIATTN_FALLBACK_THRESHOLD, int)
+    assert isinstance(CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD, int)
     assert int(TriMulPrecision.IEEE) == 3
-
-
-def test_attention_pair_bias_stub_raises():
-    from cuequivariance_ops_torch.attention_pair_bias_torch import attention_pair_bias
-
-    with pytest.raises(NotImplementedError, match="hipequivariance"):
-        attention_pair_bias()
