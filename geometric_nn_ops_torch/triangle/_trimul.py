@@ -5,7 +5,7 @@
 
 Two backends with identical math:
   * A Triton fast path (forward-only) using the fused kernels in
-    ``_kernels.triangular_multiplicative_update``.
+    ``_kernels.trimul``.
   * A pure-torch fallback that is fully general and autograd-differentiable.
 
 Dispatch picks the torch path when a backward could run, when the tensor is not
@@ -19,7 +19,7 @@ the numerical correctness oracle.
 
 import torch
 
-from ._kernels.triangular_multiplicative_update import TRITON_AVAILABLE, trimul_triton
+from ._kernels.trimul import TRITON_AVAILABLE, trimul_triton
 from ._reference.trimul import trimul_torch
 
 __all__ = ["triangle_multiplicative_update"]

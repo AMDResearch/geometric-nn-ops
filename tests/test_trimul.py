@@ -20,9 +20,7 @@ triton = pytest.importorskip("triton")
 
 
 from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
-from geometric_nn_ops_torch.triangle._kernels.triangular_multiplicative_update import (
-    trimul_triton,
-)
+from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
 from testutil.metrics import (
