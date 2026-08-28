@@ -837,6 +837,55 @@ def triton_triangular_mult_forward(
     return output_flat.reshape(B, N, N, D)
 
 
+class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
+    """Differentiable wrapper around the Triton TMU.
+
+    The forward runs the fused Triton kernels. Weight convention (fused,
+    bias-free):
+    ``p_in_weight`` / ``g_in_weight`` are ``[2D, D]`` (rows ``0:D`` -> ``a``,
+    ``D:2D`` -> ``b``); ``p_out_weight`` (= ``linear_z``) and ``g_out_weight``
+    (= ``linear_g``) are ``[D, D]``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        z,
+        mask,
+        outgoing,
+        norm_in_weight,
+        norm_in_bias,
+        p_in_weight,
+        g_in_weight,
+        norm_out_weight,
+        norm_out_bias,
+        p_out_weight,
+        g_out_weight,
+        eps,
+    ):
+        return triton_triangular_mult_forward(
+            z,
+            mask,
+            outgoing,
+            norm_in_weight,
+            norm_in_bias,
+            p_in_weight,
+            g_in_weight,
+            norm_out_weight,
+            norm_out_bias,
+            p_out_weight,
+            g_out_weight,
+            eps,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        raise NotImplementedError(
+            "Triton triangular multiplicative update backward is not implemented "
+            "yet; gradients currently route through the pure-torch reference."
+        )
+
+
 def trimul_triton(
     x,
     direction="outgoing",
@@ -893,7 +942,7 @@ def trimul_triton(
     else:
         mask_flat = mask.expand(x.shape[:-1]).reshape(-1, n, n).contiguous()
 
-    out = triton_triangular_mult_forward(
+    out = _TriangleMultiplicativeUpdateFn.apply(
         x_flat,
         mask_flat,
         is_outgoing(direction),
