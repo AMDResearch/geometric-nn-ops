@@ -4,14 +4,13 @@
 """Functional triangle_multiplicative_update.
 
 Two backends with identical math:
-  * A Triton fast path (forward-only) using the fused kernels in
-    ``_kernels.trimul``.
-  * A pure-torch fallback that is fully general and autograd-differentiable.
+  * A differentiable Triton path using the fused kernels in ``_kernels.trimul``.
+  * A pure-torch fallback that is fully general.
 
-Dispatch picks the torch path when a backward could run, when the tensor is not
-on CUDA, when its dtype has no kernel, when Triton is unavailable, or when the
-config is outside what the fused kernels implement. The torch path doubles as
-the numerical correctness oracle.
+Dispatch picks the torch path when the tensor is not on CUDA, when its dtype
+has no kernel, when Triton is unavailable, or when the config is outside what
+the fused kernels implement. The torch path doubles as the numerical
+correctness oracle.
 
 ``p_in_weight`` / ``g_in_weight`` are the concatenated ``[a; b]`` projections
 (shape ``[2 * C_hidden, C_z]``), matching cuequivariance / Boltz fusion.
@@ -32,13 +31,12 @@ _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 BIAS_KEYS = ("p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias")
 
 
-def _needs_torch_path(x: torch.Tensor, weights: dict) -> bool:
+def _needs_torch_path(x: torch.Tensor, mask, weights: dict) -> bool:
     """Whether the fused kernels can serve this call.
 
     They implement the standard config, so a hidden dim that is not square with
-    the channel dim, or any projection bias, goes to the general torch path.
-    The kernels are forward-only, so a call that will be differentiated does
-    too.
+    the channel dim, any projection bias, and a mask needing a gradient (they
+    treat it as a constant and return none for it) go to the torch path.
     """
     if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
         return True
@@ -46,10 +44,7 @@ def _needs_torch_path(x: torch.Tensor, weights: dict) -> bool:
         return True
     if any(weights[key] is not None for key in BIAS_KEYS):
         return True
-    return torch.is_grad_enabled() and (
-        x.requires_grad
-        or any(w is not None and w.requires_grad for w in weights.values())
-    )
+    return mask is not None and mask.requires_grad
 
 
 def triangle_multiplicative_update(
@@ -100,5 +95,5 @@ def triangle_multiplicative_update(
         g_out_bias=g_out_bias,
     )
 
-    impl = trimul_torch if _needs_torch_path(x, weights) else trimul_triton
+    impl = trimul_torch if _needs_torch_path(x, mask, weights) else trimul_triton
     return impl(x, direction, mask, eps=eps, **weights)

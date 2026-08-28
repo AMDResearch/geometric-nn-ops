@@ -1,12 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for triangle_multiplicative_update.
-
-The Triton path is forward-only, so it is compared to the reference on the
-forward alone. The reference carries the backward, and the public op routes to
-it whenever gradients are needed.
-"""
+"""Tests for triangle_multiplicative_update."""
 
 import contextlib
 from types import SimpleNamespace
@@ -214,15 +209,12 @@ def test_tf32_changes_the_result():
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 @DTYPE_PRECISION_PARAM
 def test_triton_accuracy(direction, dtype, precision):
-    """The kernel at ``dtype`` and ``precision`` against the reference in fp64.
-
-    Forward only since the Triton implementation is currently forward only.
-    """
+    """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
     N, C = 32, 32
-    weights = make_weights(C, C, "cuda", dtype, seed=3)
-    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
+    weights = make_weights(C, C, "cuda", dtype, seed=3, requires_grad=True)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4, requires_grad=True)
     with torch_matmul_precision(precision):
-        assert_forward_agrees_with_the_oracle(
+        assert_agrees_with_the_oracle(
             x0,
             mask,
             weights,
@@ -235,11 +227,30 @@ def test_triton_accuracy(direction, dtype, precision):
 
 @requires_gpu
 @DTYPE_PRECISION_PARAM
+def test_triton_accuracy_under_inference_mode(dtype, precision):
+    """Serving runs the forward inside ``inference_mode``, where the tensors
+    carry no version counter and no graph is recorded."""
+    N, C = 32, 32
+    weights = make_weights(C, C, "cuda", dtype, seed=3)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
+    with torch_matmul_precision(precision), torch.inference_mode():
+        assert_forward_agrees_with_the_oracle(
+            x0,
+            mask,
+            weights,
+            "outgoing",
+            impl=trimul_triton,
+            precision=precision,
+            label=f"inference/{dtype}/{precision}",
+        )
+
+
+@requires_gpu
+@DTYPE_PRECISION_PARAM
 def test_reference_precision(dtype, precision):
     """How much the reference loses at ``dtype``, both sides being the
     reference. The reference is the op's fallback for inputs the kernel cannot
-    serve, and carries the backward for both paths, so this covers gradients as
-    well as the forward."""
+    serve."""
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", dtype, seed=3, requires_grad=True)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4, requires_grad=True)
@@ -264,9 +275,9 @@ def test_batched(direction, shape):
     """Bflat > 1, and more than one leading dim."""
     *batch, N, _, C = shape
     dtype = torch.bfloat16
-    weights = make_weights(C, C, "cuda", dtype, seed=7)
-    x, mask = make_pair_input(batch, N, C, "cuda", dtype, seed=11)
-    assert_forward_agrees_with_the_oracle(
+    weights = make_weights(C, C, "cuda", dtype, seed=7, requires_grad=True)
+    x, mask = make_pair_input(batch, N, C, "cuda", dtype, seed=11, requires_grad=True)
+    assert_agrees_with_the_oracle(
         x,
         mask,
         weights,
@@ -285,8 +296,8 @@ def test_block_padded(direction, true_length):
     rest is masked, with the live block itself partly masked."""
     N, C, batch = 64, 128, 2
     dtype = torch.bfloat16
-    weights = make_weights(C, C, "cuda", dtype, seed=11)
-    x, _ = make_pair_input(batch, N, C, "cuda", dtype, seed=13)
+    weights = make_weights(C, C, "cuda", dtype, seed=11, requires_grad=True)
+    x, _ = make_pair_input(batch, N, C, "cuda", dtype, seed=13, requires_grad=True)
 
     generator = torch.Generator(device="cuda").manual_seed(13)
     mask = torch.zeros(batch, N, N, device="cuda", dtype=dtype)
@@ -296,7 +307,7 @@ def test_block_padded(direction, true_length):
         live = max(1, true_length - 8 * index)
         inner = torch.rand(live, live, device="cuda", generator=generator) < 0.9
         mask[index, :live, :live] = inner.to(dtype)
-    assert_forward_agrees_with_the_oracle(
+    assert_agrees_with_the_oracle(
         x,
         mask,
         weights,
@@ -314,9 +325,13 @@ def test_channel_widths(direction, channels):
     """Non-standard channel widths."""
     N = 24
     dtype = torch.bfloat16
-    weights = make_weights(channels, channels, "cuda", dtype, seed=17)
-    x0, mask = make_pair_input(1, N, channels, "cuda", dtype, seed=18)
-    assert_forward_agrees_with_the_oracle(
+    weights = make_weights(
+        channels, channels, "cuda", dtype, seed=17, requires_grad=True
+    )
+    x0, mask = make_pair_input(
+        1, N, channels, "cuda", dtype, seed=18, requires_grad=True
+    )
+    assert_agrees_with_the_oracle(
         x0,
         mask,
         weights,
@@ -334,7 +349,7 @@ def test_layernorm_affine(direction, gamma):
     """Nontrivial LayerNorm affine, including zero/near-zero gamma."""
     N, C = 24, 128
     dtype = torch.bfloat16
-    weights = make_weights(C, C, "cuda", dtype, seed=19)
+    weights = make_weights(C, C, "cuda", dtype, seed=19, requires_grad=True)
     generator = torch.Generator(device="cuda").manual_seed(23)
 
     def randn(*shape):
@@ -351,13 +366,14 @@ def test_layernorm_affine(direction, gamma):
     else:
         gamma_in = randn(C) * 0.5 + 1.0
         gamma_out = randn(C) * 0.5 + 1.0
-    weights["norm_in_weight"] = gamma_in
-    weights["norm_out_weight"] = gamma_out
-    weights["norm_in_bias"] = randn(C) * 0.1
-    weights["norm_out_bias"] = randn(C) * 0.1
+    # Set after the in-place edits above, so these stay leaves.
+    weights["norm_in_weight"] = gamma_in.requires_grad_(True)
+    weights["norm_out_weight"] = gamma_out.requires_grad_(True)
+    weights["norm_in_bias"] = (randn(C) * 0.1).requires_grad_(True)
+    weights["norm_out_bias"] = (randn(C) * 0.1).requires_grad_(True)
 
-    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=20)
-    assert_forward_agrees_with_the_oracle(
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=20, requires_grad=True)
+    assert_agrees_with_the_oracle(
         x0,
         mask,
         weights,
@@ -374,11 +390,13 @@ def test_layernorm_affine(direction, gamma):
 def test_large(direction):
     """N=1024, where the reductions are far deeper than the small shapes. bf16
     only to keep memory down."""
+    # The fp64 oracle's backward dominates: ~17 GiB against the kernel's ~4.
+    require_device_memory(gib=24)
     N, C = 1024, 128
     dtype = torch.bfloat16
-    weights = make_weights(C, C, "cuda", dtype, seed=5)
-    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=6)
-    assert_forward_agrees_with_the_oracle(
+    weights = make_weights(C, C, "cuda", dtype, seed=5, requires_grad=True)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=6, requires_grad=True)
+    assert_agrees_with_the_oracle(
         x0,
         mask,
         weights,
@@ -425,13 +443,14 @@ def test_large_n_no_int32_overflow(direction):
 # which is the signal to move the case to a full Triton test.
 
 
+# Configs the fused kernels do not implement, which the public op has to route
+# to the torch path.
 UNSUPPORTED_CONFIGS = {
     "cpu": {"device": "cpu"},
     "float64": {"dtype": torch.float64},
     "non_square_hidden": {"channels": 64, "hidden": 32},
     "projection_biases": {"biases": True},
-    "input_requires_grad": {"input_requires_grad": True},
-    "weights_require_grad": {"weights_require_grad": True},
+    "differentiable_mask": {"mask_requires_grad": True},
 }
 
 
@@ -444,17 +463,20 @@ def build_config(
     biases=False,
     input_requires_grad=False,
     weights_require_grad=False,
+    mask_requires_grad=False,
 ):
     hidden = channels if hidden is None else hidden
     weights = make_weights(
         channels, hidden, device, dtype, seed=1, requires_grad=weights_require_grad
     )
     if biases:
-        weights |= make_projection_biases(channels, hidden, device, dtype, seed=2)
+        weights |= make_projection_biases(
+            channels, hidden, device, dtype, seed=2, requires_grad=False
+        )
     x, mask = make_pair_input(
         1, 12, channels, device, dtype, seed=3, requires_grad=input_requires_grad
     )
-    return x, mask, weights
+    return x, mask.requires_grad_(mask_requires_grad), weights
 
 
 @contextlib.contextmanager
@@ -480,22 +502,6 @@ def test_unsupported_configs_use_the_reference(config):
 
     assert spy.reference.called
     assert not spy.kernel.called
-
-
-@requires_gpu
-@pytest.mark.parametrize(
-    "no_backward", [torch.no_grad, torch.inference_mode], ids=["no_grad", "inference"]
-)
-def test_no_grad_modes_use_triton(no_backward):
-    """Inputs keep ``requires_grad`` inside ``no_grad`` and ``inference_mode``, but no
-    graph is recorded there, so the forward-only kernel is safe."""
-    x, mask, weights = build_config(input_requires_grad=True, weights_require_grad=True)
-
-    with no_backward(), dispatch_spy() as spy:
-        triangle_multiplicative_update(x, "outgoing", mask, **weights)
-
-    assert spy.kernel.called
-    assert not spy.reference.called
 
 
 def test_cpu_is_differentiable():
