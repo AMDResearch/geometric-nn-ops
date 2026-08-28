@@ -4,13 +4,12 @@
 """Functional triangle_multiplicative_update.
 
 Two backends with identical math:
-  * A differentiable Triton path using the fused kernels in ``_kernels.trimul``.
+  * A Triton path using the fused kernels in ``_kernels.trimul``.
   * A pure-torch fallback that is fully general.
 
-Dispatch picks the torch path when the tensor is not on CUDA, when its dtype
-has no kernel, when Triton is unavailable, or when the config is outside what
-the fused kernels implement. The torch path doubles as the numerical
-correctness oracle.
+The fused kernels implement the standard config only, so dispatch picks the
+torch path for anything outside it, when Triton isn't available, or for a dtype
+that has no kernel. The torch path doubles as the numerical correctness oracle.
 
 ``p_in_weight`` / ``g_in_weight`` are the concatenated ``[a; b]`` projections
 (shape ``[2 * C_hidden, C_z]``), matching cuequivariance / Boltz fusion.
@@ -28,19 +27,26 @@ __all__ = ["triangle_multiplicative_update"]
 # accumulators would throw its precision away, so it takes the torch path.
 _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
+# Widest hidden dim the forward LayerNorm covers, which reads one BLOCK_C block.
+_MAX_TRITON_HIDDEN = 128
+
 BIAS_KEYS = ("p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias")
 
 
 def _needs_torch_path(x: torch.Tensor, mask, weights: dict) -> bool:
     """Whether the fused kernels can serve this call.
 
-    They implement the standard config, so a hidden dim that is not square with
-    the channel dim, any projection bias, and a mask needing a gradient (they
-    treat it as a constant and return none for it) go to the torch path.
+    They implement the standard config, so everything else goes to the general
+    torch path: a hidden dim that is not square with the channel dim or is
+    wider than one LayerNorm block, a projection bias (the fused GEMMs carry
+    none), and a mask needing a gradient (the kernels treat it as a constant
+    and return none for it).
     """
     if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
         return True
     if weights["p_in_weight"].shape[0] // 2 != x.shape[-1]:
+        return True
+    if x.shape[-1] > _MAX_TRITON_HIDDEN:
         return True
     if any(weights[key] is not None for key in BIAS_KEYS):
         return True

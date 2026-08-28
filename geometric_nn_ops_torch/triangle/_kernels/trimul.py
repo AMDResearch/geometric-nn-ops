@@ -605,9 +605,25 @@ if TRITON_AVAILABLE:
         BLOCK_ROWS: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """Row-wise LayerNorm over the last dim (C). Optionally saves mean/rstd."""
+        """Row-wise LayerNorm over the last dim (C). Optionally saves mean/rstd.
+
+        Requires ``BLOCK_C >= C`` so each row is covered by a single block: x is
+        loaded once into registers and reused for the stats reduction, the
+        variance pass, and the normalize/affine step.
+        Mean/var use a plain two-pass reduction in fp32 (mean = sum(x)/C, then
+        var = sum((x-mean)^2)/C over the register-resident x); this is
+        numerically robust (no catastrophic cancellation) and avoids Welford's
+        per-block delta-correction ALU, which only pays off across many blocks.
+        """
+        # Caller guarantees BLOCK_C >= C, so a row is covered by a single block.
         pid = tl.program_id(0)
         row_start = pid * BLOCK_ROWS
+
+        c_offsets = tl.arange(0, BLOCK_C)
+        cmask = c_offsets < C
+        C_f = C.to(tl.float32)
+        w = tl.load(W + c_offsets, mask=cmask)
+        b = tl.load(B + c_offsets, mask=cmask)
 
         for row_offset in range(BLOCK_ROWS):
             row = row_start + row_offset
@@ -617,42 +633,22 @@ if TRITON_AVAILABLE:
             Y_row = Y + row_i64 * stride
 
             if row_valid:
-                mean = 0.0
-                M2 = 0.0
-                count = 0
-                for c_start in range(0, C, BLOCK_C):
-                    c_offsets = c_start + tl.arange(0, BLOCK_C)
-                    cmask = c_offsets < C
-                    x = tl.load(X_row + c_offsets, mask=cmask, other=0.0).to(tl.float32)
-                    n_valid = tl.sum(cmask.to(tl.int32))
-                    if n_valid > 0:
-                        local_sum = tl.sum(tl.where(cmask, x, 0.0))
-                        local_mean = local_sum / n_valid
-                        new_count = count + n_valid
-                        delta = local_mean - mean
-                        mean = mean + delta * n_valid / new_count
-                        local_m2 = tl.sum(
-                            tl.where(cmask, (x - local_mean) * (x - local_mean), 0.0)
-                        )
-                        M2 = M2 + local_m2 + delta * delta * count * n_valid / new_count
-                        count = new_count
-
-                var = M2 / C
+                x = tl.load(X_row + c_offsets, mask=cmask, other=0.0).to(tl.float32)
+                mean = tl.sum(x) / C_f
+                # Second pass over the register-resident x (no HBM re-read).
+                # Masked-out lanes hold 0 (from the load's other=0.0); force
+                # their centered contribution to 0 so they don't bias var.
+                x_centered = tl.where(cmask, x - mean, 0.0)
+                var = tl.sum(x_centered * x_centered) / C_f
                 rstd = 1.0 / tl.sqrt(var + eps)
 
                 if SAVE_STATS:
                     tl.store(Mean + row_i64, mean)
                     tl.store(Rstd + row_i64, rstd)
 
-                for c_start in range(0, C, BLOCK_C):
-                    c_offsets = c_start + tl.arange(0, BLOCK_C)
-                    cmask = c_offsets < C
-                    w = tl.load(W + c_offsets, mask=cmask)
-                    b = tl.load(B + c_offsets, mask=cmask)
-                    x = tl.load(X_row + c_offsets, mask=cmask, other=0.0).to(tl.float32)
-                    x_hat = (x - mean) * rstd
-                    y = x_hat * w + b
-                    tl.store(Y_row + c_offsets, y, mask=cmask & row_valid)
+                x_hat = x_centered * rstd
+                y = x_hat * w + b
+                tl.store(Y_row + c_offsets, y, mask=cmask)
 
     @triton.jit
     def _layer_norm_2d_bwd(

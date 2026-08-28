@@ -320,9 +320,9 @@ def test_block_padded(direction, true_length):
 
 @requires_gpu
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
-@pytest.mark.parametrize("channels", [96, 128, 256], ids=["c96", "c128", "c256"])
+@pytest.mark.parametrize("channels", [96, 128], ids=["c96", "c128"])
 def test_channel_widths(direction, channels):
-    """Non-standard channel widths."""
+    """Non-standard channel widths, up to the widest the kernels serve."""
     N = 24
     dtype = torch.bfloat16
     weights = make_weights(
@@ -448,6 +448,7 @@ def test_large_n_no_int32_overflow(direction):
 UNSUPPORTED_CONFIGS = {
     "cpu": {"device": "cpu"},
     "float64": {"dtype": torch.float64},
+    "wide_hidden": {"channels": 256},
     "non_square_hidden": {"channels": 64, "hidden": 32},
     "projection_biases": {"biases": True},
     "differentiable_mask": {"mask_requires_grad": True},
