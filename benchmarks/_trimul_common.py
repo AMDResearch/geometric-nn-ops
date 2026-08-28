@@ -36,8 +36,8 @@ def add_shape_arguments(parser, *, sizes, directions=("outgoing", "incoming")):
         "--biases",
         action="store_true",
         help="give the projections biases. Off by default because the callers "
-        "we serve run without them, but the Triton path compiles a separate "
-        "kernel for each case, so one says nothing about the other",
+        "we serve run without them. The Triton kernels are bias-free, so the "
+        "triton backend rejects this and public takes the torch path",
     )
     return parser
 

@@ -4,12 +4,13 @@
 """Functional triangle_multiplicative_update.
 
 Two backends with identical math:
-  * Triton fast path (forward-only) using the fused kernels in ``_kernels.trimul``.
-  * Pure-torch fallback that is fully autograd-differentiable.
+  * A Triton fast path (forward-only) using the fused kernels in
+    ``_kernels.triangular_multiplicative_update``.
+  * A pure-torch fallback that is fully general and autograd-differentiable.
 
-Dispatch picks the torch path when a backward could run (grad is enabled and
-some input requires it), the tensor is not on CUDA, its dtype has no kernel, or
-Triton is unavailable; otherwise the Triton path runs. The torch path doubles as
+Dispatch picks the torch path when a backward could run, when the tensor is not
+on CUDA, when its dtype has no kernel, when Triton is unavailable, or when the
+config is outside what the fused kernels implement. The torch path doubles as
 the numerical correctness oracle.
 
 ``p_in_weight`` / ``g_in_weight`` are the concatenated ``[a; b]`` projections
@@ -18,21 +19,36 @@ the numerical correctness oracle.
 
 import torch
 
-from ._kernels.trimul import TRITON_AVAILABLE, trimul_triton
+from ._kernels.triangular_multiplicative_update import TRITON_AVAILABLE, trimul_triton
 from ._reference.trimul import trimul_torch
 
 __all__ = ["triangle_multiplicative_update"]
 
 
-# Dtypes the Triton kernels compile for. Anything else takes the torch path.
+# Dtypes the Triton kernels compile for. fp64 has no MFMA path and the fp32
+# accumulators would throw its precision away, so it takes the torch path.
 _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
+BIAS_KEYS = ("p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias")
 
-def _needs_torch_path(x: torch.Tensor, weights) -> bool:
+
+def _needs_torch_path(x: torch.Tensor, weights: dict) -> bool:
+    """Whether the fused kernels can serve this call.
+
+    They implement the standard config, so a hidden dim that is not square with
+    the channel dim, or any projection bias, goes to the general torch path.
+    The kernels are forward-only, so a call that will be differentiated does
+    too.
+    """
     if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
         return True
+    if weights["p_in_weight"].shape[0] // 2 != x.shape[-1]:
+        return True
+    if any(weights[key] is not None for key in BIAS_KEYS):
+        return True
     return torch.is_grad_enabled() and (
-        x.requires_grad or any(w is not None and w.requires_grad for w in weights)
+        x.requires_grad
+        or any(w is not None and w.requires_grad for w in weights.values())
     )
 
 
@@ -84,5 +100,5 @@ def triangle_multiplicative_update(
         g_out_bias=g_out_bias,
     )
 
-    impl = trimul_torch if _needs_torch_path(x, weights.values()) else trimul_triton
+    impl = trimul_torch if _needs_torch_path(x, weights) else trimul_triton
     return impl(x, direction, mask, eps=eps, **weights)

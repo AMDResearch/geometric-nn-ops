@@ -20,7 +20,9 @@ triton = pytest.importorskip("triton")
 
 
 from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
-from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
+from geometric_nn_ops_torch.triangle._kernels.triangular_multiplicative_update import (
+    trimul_triton,
+)
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
 from testutil.metrics import (
@@ -68,8 +70,11 @@ def make_masked_weights(c_z, c_hidden, *, biased):
 
 
 @requires_gpu
-@IMPLEMENTATION_PARAM
-@pytest.mark.parametrize("biased", [False, True], ids=["bias_free", "biased"])
+@pytest.mark.parametrize(
+    "impl,biased",
+    [(trimul_torch, False), (trimul_torch, True), (trimul_triton, False)],
+    ids=["reference_bias_free", "reference_biased", "triton_bias_free"],
+)
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 def test_fully_masked_input(impl, biased, direction):
     """An all-zero mask zeroes the combine and a zeroed ``g_out_weight`` fixes
@@ -91,13 +96,15 @@ def test_fully_masked_input(impl, biased, direction):
 
 
 @requires_gpu
-@IMPLEMENTATION_PARAM
 @pytest.mark.parametrize(
     "which", ["p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias"]
 )
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
-def test_each_projection_bias_contributes(impl, which, direction):
-    """Zeroing any one bias changes the output, so none is silently dropped."""
+def test_each_projection_bias_contributes(which, direction):
+    """Zeroing any one bias changes the output, so none is silently dropped.
+
+    The kernels are bias-free, so this only tests the reference.
+    """
     N, C = 16, 32
     weights = make_weights(C, C, "cuda", torch.float32, seed=47) | (
         make_projection_biases(C, C, "cuda", torch.float32, seed=48)
@@ -105,8 +112,8 @@ def test_each_projection_bias_contributes(impl, which, direction):
     x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=49)
 
     with torch.no_grad():
-        out = impl(x, direction, mask, **weights)
-        zeroed = impl(
+        out = trimul_torch(x, direction, mask, **weights)
+        zeroed = trimul_torch(
             x, direction, mask, **{**weights, which: torch.zeros_like(weights[which])}
         )
 
@@ -324,25 +331,6 @@ def test_channel_widths(direction, channels):
 
 @requires_gpu
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
-def test_hidden_differs_from_channels(direction):
-    """``c_hidden`` narrower than ``c_z``, so the projections are not square."""
-    N, C_z, C_hidden = 24, 64, 32
-    dtype = torch.bfloat16
-    weights = make_weights(C_z, C_hidden, "cuda", dtype, seed=19)
-    x0, mask = make_pair_input(1, N, C_z, "cuda", dtype, seed=20)
-    assert_forward_agrees_with_the_oracle(
-        x0,
-        mask,
-        weights,
-        direction,
-        impl=trimul_triton,
-        tol=Tolerance(1.0 - 1e-4, 2e-2),
-        label=f"C{C_z}->{C_hidden}/{direction}",
-    )
-
-
-@requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 @pytest.mark.parametrize("gamma", ["zero", "tiny", "learned"])
 def test_layernorm_affine(direction, gamma):
     """Nontrivial LayerNorm affine, including zero/near-zero gamma."""
@@ -442,6 +430,8 @@ def test_large_n_no_int32_overflow(direction):
 UNSUPPORTED_CONFIGS = {
     "cpu": {"device": "cpu"},
     "float64": {"dtype": torch.float64},
+    "non_square_hidden": {"channels": 64, "hidden": 32},
+    "projection_biases": {"biases": True},
     "input_requires_grad": {"input_requires_grad": True},
     "weights_require_grad": {"weights_require_grad": True},
 }
@@ -451,14 +441,20 @@ def build_config(
     *,
     device="cuda",
     dtype=torch.float32,
+    channels=32,
+    hidden=None,
+    biases=False,
     input_requires_grad=False,
     weights_require_grad=False,
 ):
+    hidden = channels if hidden is None else hidden
     weights = make_weights(
-        32, 32, device, dtype, seed=1, requires_grad=weights_require_grad
+        channels, hidden, device, dtype, seed=1, requires_grad=weights_require_grad
     )
+    if biases:
+        weights |= make_projection_biases(channels, hidden, device, dtype, seed=2)
     x, mask = make_pair_input(
-        1, 12, 32, device, dtype, seed=3, requires_grad=input_requires_grad
+        1, 12, channels, device, dtype, seed=3, requires_grad=input_requires_grad
     )
     return x, mask, weights
 

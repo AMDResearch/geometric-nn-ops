@@ -12,10 +12,14 @@ import torch
 import triton
 import triton.language as tl
 
+from geometric_nn_ops_torch.triangle._reference.trimul import is_outgoing
+
 # Note: The limit for the number of tiles along grid.x is `2^32` whereas for the
 # other dimensions it's `2^16`. Dimensions that grows with sequence length
 # squared (e.g. M = B*N*N) can exceed the smaller limit and need to go on
 # grid.x.
+
+TRITON_AVAILABLE = True
 
 
 def _cfg_fused_gemm(*, N):
@@ -618,6 +622,7 @@ def triton_triangular_mult_forward(
     norm_out_bias: torch.Tensor,
     p_out_weight: torch.Tensor,
     g_out_weight: torch.Tensor,
+    eps: float = 1e-5,
 ) -> torch.Tensor:
     """Run triangular multiplicative update forward pass using Triton kernels.
 
@@ -664,7 +669,7 @@ def triton_triangular_mult_forward(
         z_flat.stride(0),
         N_rows,
         D,
-        1e-5,
+        eps,
         **ln_cfg,
     )
 
@@ -782,7 +787,7 @@ def triton_triangular_mult_forward(
         x_flat.stride(0),
         N_rows_out,
         c_hidden,
-        1e-5,
+        eps,
         **ln_out_cfg,
     )
 
@@ -830,3 +835,76 @@ def triton_triangular_mult_forward(
     )
 
     return output_flat.reshape(B, N, N, D)
+
+
+def trimul_triton(
+    x,
+    direction="outgoing",
+    mask=None,
+    *,
+    eps=1e-5,
+    norm_in_weight=None,
+    norm_in_bias=None,
+    p_in_weight=None,
+    p_in_bias=None,
+    g_in_weight=None,
+    g_in_bias=None,
+    norm_out_weight=None,
+    norm_out_bias=None,
+    p_out_weight=None,
+    p_out_bias=None,
+    g_out_weight=None,
+    g_out_bias=None,
+):
+    """Triangle multiplicative update on the fused Triton kernels. Forward only.
+
+    Takes the same arguments as ``trimul_torch``; see it for the layouts.
+
+    The kernels implement the standard config, and the configs outside it are
+    rejected here rather than ignored so that calling this directly cannot
+    silently produce something else. The public op routes them to the torch
+    path instead.
+    """
+    named = [
+        name
+        for name, value in (
+            ("p_in_bias", p_in_bias),
+            ("g_in_bias", g_in_bias),
+            ("p_out_bias", p_out_bias),
+            ("g_out_bias", g_out_bias),
+        )
+        if value is not None
+    ]
+    if named:
+        raise ValueError(
+            f"the Triton kernels have bias-free projections, got {', '.join(named)}"
+        )
+    c_hidden, c_z = p_in_weight.shape[0] // 2, x.shape[-1]
+    if c_hidden != c_z:
+        raise ValueError(
+            f"the Triton kernels need a square hidden dim, got "
+            f"c_hidden={c_hidden} against c_z={c_z}"
+        )
+
+    *batch_dims, n, _, d = x.shape
+    x_flat = x.reshape(-1, n, n, d)
+    if mask is None:
+        mask_flat = x_flat.new_ones(x_flat.shape[:-1])
+    else:
+        mask_flat = mask.expand(x.shape[:-1]).reshape(-1, n, n).contiguous()
+
+    out = triton_triangular_mult_forward(
+        x_flat,
+        mask_flat,
+        is_outgoing(direction),
+        norm_in_weight,
+        norm_in_bias,
+        p_in_weight,
+        g_in_weight,
+        norm_out_weight,
+        norm_out_bias,
+        p_out_weight,
+        g_out_weight,
+        eps,
+    )
+    return out.reshape(*batch_dims, n, n, d)
