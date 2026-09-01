@@ -1,10 +1,10 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shadow of NVIDIA's closed ``cuequivariance_ops_torch``, backed by Triton.
+"""Implements the API of ``cuequivariance_ops_torch``, backed by geometric-nn-ops.
 
 Installing this package makes ``from cuequivariance_ops_torch import ...``
-resolve to the geometric-nn-ops kernels, so unmodified code using
+resolve and delegate to the geometric-nn-ops kernels, so unmodified code using
 ``cuequivariance_torch.primitives.triangle`` runs on AMD ROCm with zero source
 changes.
 

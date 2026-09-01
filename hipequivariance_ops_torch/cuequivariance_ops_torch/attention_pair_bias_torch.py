@@ -1,14 +1,11 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shadow of cuequivariance_ops_torch.attention_pair_bias_torch.
+"""Implements the API of cuequivariance_ops_torch.attention_pair_bias_torch, backed by geometric-nn-ops.
 
 cuequivariance_torch deep-imports ``attention_pair_bias`` from this exact module
-path, so the module name must match upstream. This is a thin adapter: it maps
-cuEquivariance's signature onto the geometric-nn-ops primary surface
-(``geometric_nn_ops_torch.triangle.attention_pair_bias``), which owns the
-semantics.
-"""
+path, so the file name must match.
+"""  # noqa: E501
 
 import sys
 

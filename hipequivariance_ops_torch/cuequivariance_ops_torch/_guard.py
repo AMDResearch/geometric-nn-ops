@@ -3,26 +3,27 @@
 
 """Import-time safety checks for the cuequivariance_ops_torch shim.
 
-This package shadows NVIDIA's closed binary ``cuequivariance_ops_torch``. Two
-hazards we guard against:
+This package shadows the ``cuequivariance_ops_torch`` module. Two hazards we
+guard against:
 
-1. The real closed ops wheel is also installed -> two packages claim the same
-   import name; whichever wins is nondeterministic. Fail loudly instead.
+1. A real ``cuequivariance-ops-torch-*`` wheel is also installed. If two packages
+   claim the same import name, whichever wins is nondeterministic. Fail loudly
+   instead.
 2. The installed ``cuequivariance-torch`` frontend is a version we are not pinned
-   to -> its private import contract may have drifted. Warn (don't fail).
+   to because the contract may have drifted. Warn (don't fail).
 """
 
 import warnings
 from importlib import metadata
 
-# Closed binary ops wheels we must NOT coexist with.
+# Wheels we must NOT coexist with.
 _REAL_OPS_DISTS = (
     "cuequivariance-ops-torch",
     "cuequivariance-ops-torch-cu12",
     "cuequivariance-ops-torch-cu13",
 )
 
-# The cuequivariance-torch frontend version this shim's layout is pinned to.
+# The cuequivariance-torch frontend version this shim's API is designed for.
 _PINNED_CUEQ_TORCH = "0.9.1"
 
 
@@ -41,11 +42,10 @@ def check() -> None:
     clashes = [d for d in _REAL_OPS_DISTS if d in installed]
     if clashes:
         raise RuntimeError(
-            "hipequivariance_ops_torch: both the real closed cuequivariance ops "
-            f"wheel ({', '.join(clashes)}) and the hipequivariance_ops_torch shim "
-            "are installed. "
-            "They both provide the import package 'cuequivariance_ops_torch', so "
-            "which one loads is nondeterministic. Uninstall the closed wheel "
+            "hipequivariance_ops_torch: both the real cuequivariance ops wheel "
+            f" ({', '.join(clashes)}) and the hipequivariance_ops_torch shim are "
+            "installed. They both provide the 'cuequivariance_ops_torch' module "
+            "and conflict. Uninstall the conflicting wheels "
             "(`pip uninstall " + " ".join(clashes) + "`) to use the AMD shim."
         )
 
@@ -55,10 +55,9 @@ def check() -> None:
         cueq_torch_version = None
     if cueq_torch_version is not None and cueq_torch_version != _PINNED_CUEQ_TORCH:
         warnings.warn(
-            "hipequivariance_ops_torch: the cuequivariance_ops_torch shim is pinned to "
+            "hipequivariance_ops_torch: the shim is pinned to "
             f"cuequivariance-torch=={_PINNED_CUEQ_TORCH}, but "
-            f"{cueq_torch_version} is installed. The frontend's private import "
-            "contract may have drifted; routing may break.",
+            f"{cueq_torch_version} is installed. The API may have drifted.",
             RuntimeWarning,
             stacklevel=2,
         )

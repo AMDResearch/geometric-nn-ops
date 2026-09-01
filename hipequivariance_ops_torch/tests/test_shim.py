@@ -1,10 +1,8 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU: NVIDIA's open cuequivariance_torch frontend routes through our shim.
+"""GPU: cuequivariance_torch frontend smoke tests through our shim.
 
-Proves the zero-code-change path: with the shim installed (and the closed ops
-wheel absent), unmodified `cuequivariance_torch` calls run our Triton kernels.
 Skips when cuequivariance_torch isn't installed.
 """
 

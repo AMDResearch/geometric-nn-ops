@@ -3,8 +3,8 @@
 
 """Import-compatibility checks for the shim -- no GPU required.
 
-Asserts that every dotted path cuequivariance_torch deep-import from the ops
-layer actually resolves against our shim.
+Asserts that every dotted path cuequivariance_torch (v0.9.1) imports from the
+ops layer resolves.
 """
 
 # The whole point of this test is to test imports, so disable I001 (unsorted-imports).

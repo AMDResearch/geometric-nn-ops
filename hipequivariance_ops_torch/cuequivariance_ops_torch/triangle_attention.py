@@ -1,24 +1,21 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shadow of cuequivariance_ops_torch.triangle_attention, backed by geometric-nn-ops.
+"""Implements the API of cuequivariance_ops_torch.triangle_attention, backed by geometric-nn-ops.
 
-Matches the contract that cuequivariance_torch calls:
-    triangle_attention(q, k, v, bias, mask, scale, return_aux)   # positional
-where q/k/v are (B, N, H, S, D) (B=1 may be dropped to 4D).
-
-geometric-nn-ops expects q/k/v in (B, N, S, H, D). This shim is the compatibility
-boundary, so it transposes the H and S axes on the way in and transposes the
-output back to the cueq layout. bias (B, 1, H, S, S) and mask (B, N, 1, 1, S) are
-already layout-compatible and pass through unchanged.
-"""
+geometric-nn-ops expects q/k/v in (B, N, S, H, D), so this shim transposes the H
+and S axes on the way in and transposes the output back to the cueq layout. bias
+(B, 1, H, S, S) and mask (B, N, 1, 1, S) are already layout-compatible and pass
+through unchanged.
+"""  # noqa: E501
 
 import torch
 
 from geometric_nn_ops_torch.triangle import triangle_attention as _ta
 
-# Our kernel handles short sequences fine, so expose a low threshold to prefer
-# it.
+# Provided to match cuEquivariance's documented API. Our kernel handles short
+# sequences fine, so indicate a low threshold to prefer it. We do not actually
+# use this value to trigger a fallback.
 CUEQ_TRIATTN_FALLBACK_THRESHOLD = 16
 
 
