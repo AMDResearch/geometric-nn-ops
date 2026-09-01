@@ -34,6 +34,7 @@ def test_tri_attn_routes_through_shim():
     assert out.shape == (B, N_seq, H, N_res, D)
     assert out.dtype == dtype
 
+
 @requires_gpu
 def test_tri_attn_batchless_call_matches_explicit_batch():
     """The batch axis being dropped must not change the result.
