@@ -48,5 +48,5 @@ def triangle_attention(
     # returns the rank it was given.
     if o.dim() < 5:
         pad = 5 - o.dim()
-        o = o.reshape((1,)*pad + tuple(o.shape))
+        o = o.reshape((1,) * pad + tuple(o.shape))
     return o
