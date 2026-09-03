@@ -41,6 +41,9 @@ def test_tri_attn_batchless_call_matches_explicit_batch():
 
     cuequivariance documents that ``B == 1`` may be left out of q/k/v, the bias
     and the mask. Adding the axis back by hand should be a no-op.
+
+    The result carries the batch axis either way: cueq pads the input up to rank
+    5 and returns it at that rank.
     """
     from cuequivariance_torch.primitives.triangle import triangle_attention
 
@@ -58,8 +61,8 @@ def test_tri_attn_batchless_call_matches_explicit_batch():
         q[None], k[None], v[None], bias[None], mask=mask[None], scale=D**-0.5
     )
 
-    assert batchless.shape == q.shape
-    torch.testing.assert_close(batchless[None], batched, rtol=0, atol=0)
+    assert batchless.shape == (1, *q.shape)
+    torch.testing.assert_close(batchless, batched, rtol=0, atol=0)
 
 
 @requires_gpu

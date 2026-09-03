@@ -7,6 +7,9 @@ geometric-nn-ops expects q/k/v in (B, N, S, H, D), so this shim transposes the H
 and S axes on the way in and transposes the output back to the cueq layout. bias
 (B, 1, H, S, S) and mask (B, N, 1, 1, S) are already layout-compatible and pass
 through unchanged.
+
+The result is always rank 5, matching cueq. geometric-nn-ops preserves the input
+rank, so the dropped axis is restored here.
 """  # noqa: E501
 
 import torch
@@ -40,5 +43,10 @@ def triangle_attention(
     # cueq documents the mask as "cast to bool internally"; our op requires bool.
     if mask is not None:
         mask = mask.bool()
-    o = _ta(q, k, v, bias, mask, scale)
-    return o.transpose(-2, -3)
+    o = _ta(q, k, v, bias, mask, scale).transpose(-2, -3)
+    # cueq pads a sub-rank-5 input up to rank 5 and returns it that way; our op
+    # returns the rank it was given.
+    if o.dim() < 5:
+        pad = 5 - o.dim()
+        o = o.reshape((1,)*pad + tuple(o.shape))
+    return o
