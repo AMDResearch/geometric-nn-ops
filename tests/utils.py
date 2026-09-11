@@ -7,20 +7,40 @@ The metrics, tolerances and the oracle assertion live in ``testutil.metrics``,
 which benchmarks can import too. Only things that depend on pytest belong here.
 """
 
+import math
+
 import pytest
 import torch
 
 
-def skip_without_device_memory(gib: float) -> None:
-    """Skip unless the device reports ``need_gib`` free.
+def require_device_memory(gib: float) -> None:
+    """Fail unless ``gib`` of device memory is available.
 
-    Pairs with the ``large`` marker: the marker keeps big shapes out of a
-    default run, and this keeps an opted-in run on a smaller device from OOMing.
+    This is a failure rather than skip to avoid silent skips based on dynamic
+    behavior. Tests using this should generally be gated behind the 'large'
+    marker, so if they're getting run it's because they've been specifically
+    requested. We could just let the OOM happen, but the tests are slow to run
+    and OOMs can take down unified memory systems.
+
+    Counts blocks the caching allocator holds but is not using: torch reuses or
+    releases those as it needs them, so they are available even though
+    `mem_get_info` reports them as used. Without that a mid-suite call
+    under-reports by however much the suite has churned through. Free rather
+    than total, because torch cannot reclaim what another process holds.
     """
+    # Report the calling test's location rather than this helper's.
+    __tracebackhide__ = True
     free, _ = torch.cuda.mem_get_info()
-    free_gib = free / 1024**3
-    if free_gib < gib:
-        pytest.skip(f"needs ~{gib:.0f} GiB free, device reports {free_gib:.0f}")
+    cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    available_gib = (free + cached) / 1024**3
+    if available_gib < gib:
+        diff = gib - available_gib
+        first_diff_digit = math.floor(math.log10(diff))
+        precision = 0 if first_diff_digit >= 0 else abs(first_diff_digit)
+        pytest.fail(
+            f"requires {gib} GiB of device memory, only "
+            f"{available_gib:.{precision}f} GiB available"
+        )
 
 
 DTYPES_PARAM = pytest.mark.parametrize(

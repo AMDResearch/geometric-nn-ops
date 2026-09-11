@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  # Not push+pull_request because then it runs twice for PRs from branches
+  # within the repo.
+  pull_request:
+  push:
+    branches: [main]
+
+# head_ref is set only for pull requests, so a new push to a PR cancels the
+# previous run. Pushes to main fall back to the unique run_id and so never
+# cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest-cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            hipequivariance_ops_torch/pyproject.toml
+
+      # CPU torch: the runners have no GPU and the default wheel pulls in CUDA.
+      # The shim is a second distribution, so it installs separately.
+      - name: Install
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[test]" -e ./hipequivariance_ops_torch
+
+      # Runners have no GPU, so most tests skip and this is mainly a check that
+      # every module still imports and collects.
+      - name: Run CPU-only tests
+        run: python -m pytest tests hipequivariance_ops_torch/tests
+
+
+  pytest-gpu:
+    # Requires a self-hosted ROCm GPU runner. Set the GPU_RUNNER_LABEL
+    # repository variable to that runner's label to enable this job.
+    if: ${{ vars.GPU_RUNNER_LABEL != '' }}
+    runs-on: ${{ vars.GPU_RUNNER_LABEL }}
+    container:
+      # rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0
+      image: rocm/pytorch@sha256:cc9b00f90b85c97b015b040fa55c8d1b404b7cacc6ad57d74ee3451c97508da1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No setup-python: the image ships 3.12 with torch in a venv on PATH.
+      # torch and triton are deliberately left alone here.
+      - name: Install
+        run: python -m pip install -e ".[test]" -e "./hipequivariance_ops_torch[test]"
+
+      - name: Show torch build
+        run: python -c 'import torch; print(f"{torch.__version__=}, {torch.cuda.is_available()=}, {torch.cuda.device_count()=}, {torch.version.hip=}, {torch.cuda.get_arch_list()=}")'
+
+      - name: Run GPU tests
+        # -m "" includes the large tests that are excluded by default
+        run: python -m pytest -m "" -rxs tests hipequivariance_ops_torch/tests

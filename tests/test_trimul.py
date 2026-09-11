@@ -37,7 +37,7 @@ from testutil.trimul import (
     make_projection_biases,
     make_weights,
 )
-from utils import DTYPES_PARAM, skip_without_device_memory
+from utils import DTYPES_PARAM, require_device_memory
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
@@ -382,7 +382,7 @@ def test_large_n_no_int32_overflow(direction):
     with fp32 metrics calculations to reduce memory usage. Overflow would create
     huge differences."""
     N, C = 4096, 128
-    skip_without_device_memory(gib=48)
+    require_device_memory(gib=48)
     dtype = torch.bfloat16
     weights = cast_tree(
         make_weights(C, C, "cuda", dtype, seed=13), dtype, requires_grad=False

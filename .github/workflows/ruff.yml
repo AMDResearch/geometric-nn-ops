@@ -7,6 +7,13 @@ on:
   push:
     branches: [main]
 
+# head_ref is set only for pull requests, so a new push to a PR cancels the
+# previous run. Pushes to main fall back to the unique run_id and so never
+# cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
