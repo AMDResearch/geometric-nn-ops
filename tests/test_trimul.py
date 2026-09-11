@@ -353,6 +353,7 @@ def test_layernorm_affine(direction, gamma):
     )
 
 
+@pytest.mark.large
 @requires_gpu
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 def test_large(direction):
