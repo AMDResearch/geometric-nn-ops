@@ -29,7 +29,7 @@ from testutil.metrics import (
     assert_matches_oracle,
 )
 from testutil.triangle_attention import make_inputs, make_key_mask
-from utils import DTYPES_PARAM
+from utils import DTYPES_PARAM, gpu_arch
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
@@ -193,18 +193,23 @@ def test_masked_keys_are_ignored(request, impl, dtype):
         unmasked = impl(**tensors, mask=None, scale=D**-0.5)
         unmasked_perturbed = impl(**perturbed, mask=None, scale=D**-0.5)
 
-    # FP16 Triton is off by one ULP. Do a close test first and then xfail FP16
-    # Triton before doing the exact test.
+    # fp16 Triton on gfx1151 is off by one ULP. Do a close test first and then
+    # xfail that combination before doing the exact test.
     # TODO(gmngeoffrey): root cause this issue
     torch.testing.assert_close(out, out_perturbed, rtol=0, atol=1e-6)
     assert not torch.allclose(unmasked, unmasked_perturbed), (
         "the perturbation does not change the result even unmasked"
     )
 
-    if impl is triangle_attention_triton and dtype is torch.float16:
+    if (
+        impl is triangle_attention_triton
+        and dtype is torch.float16
+        and gpu_arch() == "gfx1151"
+    ):
         request.node.add_marker(
             pytest.mark.xfail(
-                strict=True, reason="fp16: masked v perturbs the output by one ulp"
+                strict=True,
+                reason="gfx1151 fp16: masked v perturbs the output by one ulp",
             )
         )
 

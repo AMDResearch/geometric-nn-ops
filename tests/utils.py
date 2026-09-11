@@ -43,6 +43,18 @@ def require_device_memory(gib: float) -> None:
         )
 
 
+def gpu_arch() -> str:
+    """The architecture name of the current device.
+
+    e.g. ``gfx1151`` on ROCm, ``sm_90`` on CUDA.
+    """
+    props = torch.cuda.get_device_properties(0)
+    if torch.version.hip:
+        # The name carries feature flags on some parts: ``gfx90a:sramecc+:xnack-``.
+        return props.gcnArchName.split(":")[0]
+    return f"sm_{props.major}{props.minor}"
+
+
 DTYPES_PARAM = pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
