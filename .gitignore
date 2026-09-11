@@ -5,6 +5,11 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
 .venv/
 .vscode/
 .idea/

@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-cov>=6"]
 # Keep the ruff pin in sync with `rev` in .pre-commit-config.yaml so the hook
 # and manual runs format identically (ruff is pre-1.0; output can shift).
 dev = ["ruff==0.16.3", "pre-commit"]
@@ -41,6 +41,31 @@ markers = [
 # deselected by default; opt in with `-m large` or `-m ""`. Tests with specific
 # memory requirements also skip if the GPU has insufficient memory.
 addopts = "-m 'not large'"
+
+[tool.coverage.run]
+source_pkgs = ["geometric_nn_ops_torch"]
+# PEP 669 monitoring. Torch runs autograd backward on C++-owned threads that
+# `threading.settrace` never reaches, so the default tracer reports every
+# `autograd.Function.backward` as dead code even though the tests exercise it
+# thoroughly. `sysmon` is interpreter-global and sees them.
+core = "sysmon"
+# No `branch = true`: `sysmon` cannot measure branches before Python 3.14, and
+# setting both makes coverage.py fall back to the default core, losing the
+# above.
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+precision = 1
+exclude_also = [
+    # We measure host code only. `@triton.jit` bodies are parsed to an AST and
+    # compiled to GPU code, so they never run as CPython bytecode and the tracer
+    # records nothing for them.
+    "@triton\\.jit",
+    # Reachable only with Triton absent, which the test environment cannot
+    # arrange while also running any of the kernels.
+    "except ImportError:",
+]
 
 [project.urls]
 "Source" = "https://github.com/AMDResearch/geometric-nn-ops"
