@@ -19,7 +19,13 @@ def spellings(*members):
     return [
         spelling
         for member in members
-        for spelling in (member, int(member), member.name, member.name.lower())
+        for spelling in (
+            member,
+            int(member),
+            member.name,
+            member.name.lower(),
+            member.name.upper(),
+        )
     ]
 
 
@@ -28,6 +34,10 @@ NEEDS_FULL_PRECISION = spellings(TriMulPrecision.IEEE, TriMulPrecision.TF32x3)
 PERMITS_REDUCED = spellings(TriMulPrecision.TF32)
 
 
+# Requests that torch's "ieee" over-satisfies warn about the speedup they don't
+# get. That is asserted by test_warns_when_torch_gives_more_precision_than_requested;
+# this test only cares that nothing raises.
+@pytest.mark.filterwarnings("ignore:requested triangle_multiplicative_update")
 @pytest.mark.parametrize("precision", [None, *spellings(*TriMulPrecision)], ids=str)
 def test_accepts_every_request_when_torch_is_ieee(precision):
     """Full precision satisfies every request, including those that would have
