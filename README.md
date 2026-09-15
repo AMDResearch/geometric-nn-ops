@@ -33,6 +33,15 @@ z = triangle_multiplicative_update(x, direction="outgoing", mask=mask, **weights
 for inference and auto-falls back to a pure-torch differentiable implementation
 when gradients are needed or no GPU/Triton is available.
 
+## fp32 matmul precision
+
+For fp32 inputs, these ops read `torch.backends.cuda.matmul.fp32_precision`. In
+the Triton kernels, `"tf32"` resolves in the same way as
+`torch.set_float32_matmul_precision("high")` to whatever reduced-precision fp32
+matmul the target has with at least TF32 precision — TF32 tensor cores on NVIDIA
+Ampere and above, XF32 MFMA on AMD CDNA3, bf16 emulation elsewhere — and to full
+fp32 where there is none.
+
 ## Packages in this repo
 
 This repo ships two separately-installable packages:

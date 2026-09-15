@@ -53,7 +53,6 @@ def triangle_multiplicative_update(
     g_out_weight: torch.Tensor | None = None,
     g_out_bias: torch.Tensor | None = None,
     eps: float = 1e-5,
-    precision=None,
 ) -> torch.Tensor:
     """Triangle multiplicative update over a pair representation.
 
@@ -64,11 +63,11 @@ def triangle_multiplicative_update(
         *_weight / *_bias: layernorm/projection/gate parameters. ``p_in_weight`` and
             ``g_in_weight`` are concatenated ``[a; b]`` (``[2 * C_hidden, C_z]``).
         eps: layernorm epsilon.
-        precision: accepted for cueq compatibility; currently ignored (kernels
-            accumulate in fp32).
 
     Returns:
         ``[*, N, N, C_z]`` updated pair representation.
+
+    fp32 matmuls follow ``torch.backends.cuda.matmul.fp32_precision``.
     """
     weights = dict(
         norm_in_weight=norm_in_weight,

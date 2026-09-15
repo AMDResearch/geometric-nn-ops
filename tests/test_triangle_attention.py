@@ -28,11 +28,14 @@ from testutil.metrics import (
     Tolerance,
     assert_matches_oracle,
 )
+from testutil.precision import torch_matmul_precision
 from testutil.triangle_attention import make_inputs, make_key_mask
-from utils import DTYPES_PARAM, gpu_arch
-
-requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs GPU + Triton"
+from utils import (
+    DTYPE_PRECISION_PARAM,
+    DTYPES_PARAM,
+    gpu_arch,
+    requires_gpu,
+    skip_without_reduced_precision_dot,
 )
 
 SHAPES = [
@@ -69,9 +72,15 @@ def comparisons(out, grads, out_oracle, grads_oracle):
     return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
 
 
-def assert_agrees_with_the_oracle(tensors, mask, scale, *, impl, tol=None, label=""):
+def assert_agrees_with_the_oracle(
+    tensors, mask, scale, *, impl, precision="ieee", tol=None, label=""
+):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
-    compare the output and every input gradient."""
+    compare the output and every input gradient.
+
+    ``precision`` only selects the tolerance; the caller sets it on torch. The
+    fp64 oracle is unaffected by it.
+    """
     dtype = tensors["q"].dtype
     grad_out = seeded_randn(
         *tensors["q"].shape, device=tensors["q"].device, dtype=dtype, seed=31
@@ -88,7 +97,7 @@ def assert_agrees_with_the_oracle(tensors, mask, scale, *, impl, tol=None, label
 
     assert_matches_oracle(
         comparisons(out, grads, out_oracle, grads_oracle),
-        tol or TRIANGLE_ATTENTION_TOL[dtype],
+        tol or TRIANGLE_ATTENTION_TOL[dtype, precision],
         label=label,
     )
 
@@ -474,23 +483,66 @@ def test_dynamic_entry_point():
     torch.testing.assert_close(specialized, dynamic, rtol=0, atol=0)
 
 
+# We don't test the reference here because it's torch's own behavior, and
+# whether it honors the setting is inconsistent and not really our busines to
+# test.
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "impl",
+    [
+        triangle_attention_triton,
+        functools.partial(triangle_attention_triton, dynamic=True),
+    ],
+    ids=["triton", "triton_dynamic"],
+)
+def test_tf32_changes_the_result(impl):
+    """Make sure the reduced precision actually affects the output."""
+    skip_without_reduced_precision_dot()
+    B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
+    mask = make_key_mask(B, N_seq, N_res, "cuda", seed=5)
+
+    results = {}
+    for precision in ("ieee", "tf32"):
+        tensors = make_inputs(
+            B, N_seq, N_res, H, D, "cuda", torch.float32, seed=3, requires_grad=True
+        )
+        grad_out = seeded_randn(
+            *tensors["q"].shape, device="cuda", dtype=torch.float32, seed=31
+        )
+        with torch_matmul_precision(precision):
+            results[precision] = fwd_bwd(impl, tensors, mask, D**-0.5, grad_out)
+
+    for name, full, reduced in comparisons(*results["ieee"], *results["tf32"]):
+        assert not torch.allclose(full, reduced, rtol=0, atol=0), (
+            f"{name} is bit-identical for ieee and tf32"
+        )
+
+
 # Reference tests: these compare the Triton kernel to the pure Torch reference
 # in fp64.
 
 
 @requires_gpu
 @pytest.mark.parametrize("shape", SHAPES)
-@DTYPES_PARAM
-def test_triton_accuracy(shape, dtype):
-    """The kernel at ``dtype`` against the reference in fp64."""
+@DTYPE_PRECISION_PARAM
+def test_triton_accuracy(shape, dtype, precision):
+    """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
     B, N_seq, N_res, H, D = shape
     tensors = make_inputs(
         B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True
     )
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
-    assert_agrees_with_the_oracle(
-        tensors, mask, D**-0.5, impl=triangle_attention_triton, label=f"{shape}/{dtype}"
-    )
+    with torch_matmul_precision(precision):
+        assert_agrees_with_the_oracle(
+            tensors,
+            mask,
+            D**-0.5,
+            impl=triangle_attention_triton,
+            precision=precision,
+            label=f"{shape}/{dtype}/{precision}",
+        )
 
 
 @requires_gpu

@@ -23,6 +23,7 @@ from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_upd
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
+from testutil.precision import torch_matmul_precision
 from testutil.metrics import (
     TRIMUL_TOL,
     Tolerance,
@@ -37,10 +38,11 @@ from testutil.trimul import (
     make_projection_biases,
     make_weights,
 )
-from utils import DTYPES_PARAM, require_device_memory
-
-requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs GPU + Triton"
+from utils import (
+    DTYPE_PRECISION_PARAM,
+    requires_gpu,
+    require_device_memory,
+    skip_without_reduced_precision_dot,
 )
 
 DIRECTIONS_PARAM = ["outgoing", "incoming"]
@@ -180,45 +182,68 @@ def test_broadcast_mask(impl, direction):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@requires_gpu
+def test_tf32_changes_the_result():
+    """Make sure the reduced precision actually affects the output."""
+
+    skip_without_reduced_precision_dot()
+    N, C = 32, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=3)
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=4)
+
+    outputs = {}
+    for precision in ("ieee", "tf32"):
+        with torch_matmul_precision(precision), torch.no_grad():
+            outputs[precision] = trimul_triton(x, "outgoing", mask, **weights)
+
+    assert not torch.allclose(outputs["ieee"], outputs["tf32"], rtol=0, atol=0), (
+        "bit-identical output for ieee and tf32"
+    )
+
+
 # Reference tests: these compare the Triton kernel to the pure Torch reference
 # in fp64.
 
 
 @requires_gpu
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
-@DTYPES_PARAM
-def test_triton_accuracy(direction, dtype):
-    """The kernel at ``dtype`` against the reference in fp64."""
+@DTYPE_PRECISION_PARAM
+def test_triton_accuracy(direction, dtype, precision):
+    """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
-    assert_forward_agrees_with_the_oracle(
-        x0,
-        mask,
-        weights,
-        direction,
-        impl=trimul_triton,
-        label=f"{direction}/{dtype}",
-    )
+    with torch_matmul_precision(precision):
+        assert_forward_agrees_with_the_oracle(
+            x0,
+            mask,
+            weights,
+            direction,
+            impl=trimul_triton,
+            precision=precision,
+            label=f"{direction}/{dtype}/{precision}",
+        )
 
 
 @requires_gpu
-@DTYPES_PARAM
-def test_reference_precision(dtype):
+@DTYPE_PRECISION_PARAM
+def test_reference_precision(dtype, precision):
     """How much the reference loses at ``dtype``, both sides being the
     reference. The reference is the op's fallback for inputs the kernel cannot
     serve. This is mostly just a sanity check."""
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
-    assert_forward_agrees_with_the_oracle(
-        x0,
-        mask,
-        weights,
-        "outgoing",
-        impl=trimul_torch,
-        label=f"reference/{dtype}",
-    )
+    with torch_matmul_precision(precision):
+        assert_forward_agrees_with_the_oracle(
+            x0,
+            mask,
+            weights,
+            "outgoing",
+            impl=trimul_torch,
+            precision=precision,
+            label=f"reference/{dtype}/{precision}",
+        )
 
 
 @requires_gpu

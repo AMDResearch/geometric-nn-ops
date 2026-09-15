@@ -52,6 +52,8 @@ def triangle_attention(
 
     Returns:
         Tensor of the same shape and dtype as ``q``.
+
+    fp32 matmuls follow ``torch.backends.cuda.matmul.fp32_precision``.
     """
     if mask is not None and mask.dtype != torch.bool:
         raise ValueError(f"mask must be bool (keep=True/mask=False), got {mask.dtype}")

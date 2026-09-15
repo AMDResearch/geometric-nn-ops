@@ -83,22 +83,33 @@ def assert_matches_oracle(comparisons, tol: Tolerance, *, label: str = "") -> No
 # different order than a LayerNorm does over channels, so it drifts further for
 # the same input.
 #
+# Keyed by (dtype, fp32 matmul precision). Only fp32 has both precisions: for
+# fp16/bf16 the dots are already reduced precision and the setting cannot change
+# them, so those combinations are absent and a lookup for one is a KeyError.
+#
+# The fp32/tf32 bound covers 10-mantissa-bits, since this is what the mode
+# guarantees, so the tolerance is slack for more accurate emulations such as
+# bf16x3.
+#
 # TODO(gmngeoffrey): re-calibrate the bounds here.
 
 TRIMUL_TOL = {
-    torch.float32: Tolerance(1.0 - 1e-6, 1.5e-3),
-    torch.float16: Tolerance(1.0 - 1e-6, 2e-3),
-    torch.bfloat16: Tolerance(1.0 - 1e-4, 1.5e-2),
+    (torch.float32, "ieee"): Tolerance(1.0 - 1e-6, 1.5e-3),
+    (torch.float32, "tf32"): Tolerance(1.0 - 1e-6, 2e-3),
+    (torch.float16, "ieee"): Tolerance(1.0 - 1e-6, 2e-3),
+    (torch.bfloat16, "ieee"): Tolerance(1.0 - 1e-4, 1.5e-2),
 }
 
 TRIANGLE_ATTENTION_TOL = {
-    torch.float32: Tolerance(1.0 - 1e-5, 3e-3),
-    torch.float16: Tolerance(1.0 - 1e-4, 2e-2),
-    torch.bfloat16: Tolerance(1.0 - 1e-4, 5e-2),
+    (torch.float32, "ieee"): Tolerance(1.0 - 1e-5, 1.5e-3),
+    (torch.float32, "tf32"): Tolerance(1.0 - 1e-5, 2e-3),
+    (torch.float16, "ieee"): Tolerance(1.0 - 1e-4, 2e-2),
+    (torch.bfloat16, "ieee"): Tolerance(1.0 - 1e-4, 5e-2),
 }
 
 ATTENTION_PAIR_BIAS_TOL = {
-    torch.float32: Tolerance(1.0 - 1e-5, 2e-3),
-    torch.float16: Tolerance(1.0 - 1e-4, 5e-3),
-    torch.bfloat16: Tolerance(1.0 - 1e-4, 2e-2),
+    (torch.float32, "ieee"): Tolerance(1.0 - 1e-5, 2e-3),
+    (torch.float32, "tf32"): Tolerance(1.0 - 1e-5, 3e-3),
+    (torch.float16, "ieee"): Tolerance(1.0 - 1e-4, 5e-3),
+    (torch.bfloat16, "ieee"): Tolerance(1.0 - 1e-4, 2e-2),
 }

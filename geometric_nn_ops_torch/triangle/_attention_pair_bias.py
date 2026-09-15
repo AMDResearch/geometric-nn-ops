@@ -79,6 +79,8 @@ def attention_pair_bias(
                 else ``None``. Can be reused for future calls with ``z_is_projected``.
                 Note that this does not carry the mask, which must be passed in again on
                 future calls.
+
+    fp32 matmuls follow ``torch.backends.cuda.matmul.fp32_precision``.
     """
     return attention_pair_bias_torch(
         s,

@@ -23,10 +23,8 @@ from testutil.metrics import (
     ATTENTION_PAIR_BIAS_TOL,
     assert_matches_oracle,
 )
-from utils import DTYPES_PARAM
-
-requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
-
+from testutil.precision import torch_matmul_precision
+from utils import DTYPE_PRECISION_PARAM, DTYPES_PARAM, requires_gpu
 
 ACTIVATIONS = ("s", "q", "k", "v", "z")
 PARAMETERS = (
@@ -76,10 +74,14 @@ UNLEARNABLE = ("ln_z_bias", "proj_z_bias")
 
 
 def assert_agrees_with_the_oracle(
-    tensors, dtype, *, impl, label, grad_seed=11, **options
+    tensors, dtype, *, impl, label, precision="ieee", grad_seed=11, **options
 ):
     """Run the ``impl`` at ``dtype`` and the reference in fp64, compare the
-    output and every gradient."""
+    output and every gradient.
+
+    ``precision`` only selects the tolerance; the caller sets it on torch. The
+    fp64 oracle is unaffected by it.
+    """
     BM, _, U, DH = tensors["q"].shape
     D = tensors["s"].shape[-1]
     grad_out = seeded_randn(BM, U, D, device="cuda", dtype=dtype, seed=grad_seed)
@@ -104,7 +106,7 @@ def assert_agrees_with_the_oracle(
 
     assert_matches_oracle(
         comparisons(out, keys, grads, out_oracle, grads_oracle),
-        ATTENTION_PAIR_BIAS_TOL[dtype],
+        ATTENTION_PAIR_BIAS_TOL[dtype, precision],
         label=f"{label}/{dtype}",
     )
 
@@ -388,15 +390,17 @@ def test_pair_bias_is_shared_across_the_multiplicity_axis():
 
 
 @requires_gpu
-@DTYPES_PARAM
-def test_reference_precision(dtype):
-    """The reference at ``dtype`` against the same math in fp64."""
+@DTYPE_PRECISION_PARAM
+def test_reference_precision(dtype, precision):
+    """The reference at ``dtype`` and ``precision`` against the same math in fp64."""
     B, M, H, U, V, DH, Zc = 1, 1, 4, 32, 32, 16, 16
     tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cuda", torch.float32, seed=3)
-    assert_agrees_with_the_oracle(
-        tensors,
-        dtype,
-        impl=attention_pair_bias_torch,
-        mask=make_key_mask(B, V, "cuda", seed=9),
-        label="base",
-    )
+    with torch_matmul_precision(precision):
+        assert_agrees_with_the_oracle(
+            tensors,
+            dtype,
+            precision=precision,
+            impl=attention_pair_bias_torch,
+            mask=make_key_mask(B, V, "cuda", seed=9),
+            label="base",
+        )

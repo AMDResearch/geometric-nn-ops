@@ -180,10 +180,14 @@ class TrimulStack(torch.nn.Module):
 
 
 def assert_forward_agrees_with_the_oracle(
-    x, mask, weights, direction, *, impl, tol=None, label=""
+    x, mask, weights, direction, *, impl, precision="ieee", tol=None, label=""
 ):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
-    compare the forward output."""
+    compare the forward output.
+
+    ``precision`` only selects the tolerance; the caller sets it on torch. The
+    fp64 oracle is unaffected by it.
+    """
     dtype = x.dtype
     with torch.no_grad():
         out = impl(x, direction, mask, **weights)
@@ -195,5 +199,7 @@ def assert_forward_agrees_with_the_oracle(
         )
 
     assert_matches_oracle(
-        [("out", out, out_oracle)], tol or TRIMUL_TOL[dtype], label=label
+        [("out", out, out_oracle)],
+        tol or TRIMUL_TOL[dtype, precision],
+        label=label,
     )

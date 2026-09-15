@@ -27,6 +27,27 @@ Unmodified code calling e.g.
 runs on AMD GPUs with no source changes. The shim attempts to be zero-cost but
 may incur a performance penalty.
 
+### Precision
+
+The underlying ops take their fp32 matmul precision from
+`torch.backends.cuda.matmul.fp32_precision` and have no per-call override. The
+ops sometimes make use of torch operations or fallbacks where such a setting
+cannot be honored because it relies on a Torch global with no scoped option (a
+custom context manager toggling the global would not be thread safe). This
+conflicts with the cuequivariance `triangle_multiplicative_update`'s `precision`
+argument, which presents an API indicating that the user can select their
+desired precision. The actual behavior there is inconsistent however, with the
+operation sometimes not honoring the setting: likely for the same reason that
+some paths use Torch directly. Rather than providing an inconsistent API or
+making guarantees we cannot honor, the shim checks the precision setting for
+compatibility with the Torch global. A request for more precision than the torch
+setting (i.e. `precision="ieee"` when the torch global is "tf32") raises, as the
+required precision cannot be satisifed, creating a correctness issue. A request
+for less precision (i.e. `precision="tf32"` when the Torch global is "ieee")
+warns, as falling back to full precision is a performance issue but not a
+correctness one (and matches the behavior on hardware with no reduced-precision
+fast path).
+
 ## Install
 
 Packages are not yet published on PyPI. Installing the shim is deliberately
