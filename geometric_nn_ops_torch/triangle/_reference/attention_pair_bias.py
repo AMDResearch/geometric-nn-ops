@@ -55,11 +55,6 @@ def attention_pair_bias_torch(
     M = BM // B
     if scale is None:
         scale = DH**-0.5
-    # The softmax reduces in at least fp32 whatever the inputs are.
-    acc_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
-    if inf is None:
-        # The mask only ever lands in the logits in the accumulator dtype.
-        inf = mask_val(acc_dtype)
 
     pz = z
     if not z_is_projected:
@@ -67,14 +62,13 @@ def attention_pair_bias_torch(
             z, ln_z_weight, ln_z_bias, proj_z_weight, proj_z_bias, eps
         )
 
-    # Masked attention, with the softmax accumulating in at least fp32.
     # q/k/v carry the multiplicity folded into their batch. Splitting them back
     # out explicitly to get natural broadcasting behavior.
-    qm = q.reshape(B, M, H, U, DH).to(acc_dtype)
-    km = k.reshape(B, M, H, V, DH).to(acc_dtype)
-    vm = v.reshape(B, M, H, V, DH).to(acc_dtype)
+    qm = q.reshape(B, M, H, U, DH)
+    km = k.reshape(B, M, H, V, DH)
+    vm = v.reshape(B, M, H, V, DH)
     logits = torch.einsum("bmhud,bmhvd->bmhuv", qm, km) * scale
-    logits = logits + pz.to(acc_dtype)[:, None]
+    logits = logits + pz[:, None]
     if mask is not None:
         mb = mask.shape[0]
         if mb == B:
@@ -83,7 +77,9 @@ def attention_pair_bias_torch(
             keep = mask.reshape(B, M, 1, 1, V)
         else:
             raise ValueError(f"mask batch {mb} must be B={B} or BM={BM}")
-        logits = logits + (keep.to(acc_dtype) - 1.0) * inf
+        if inf is None:
+            inf = mask_val(logits.dtype)
+        logits = logits + (keep.to(logits.dtype) - 1.0) * inf
     attn = torch.softmax(logits, dim=-1)
     o = torch.einsum("bmhuv,bmhvd->bmhud", attn, vm).reshape(BM, H, U, DH)
 
