@@ -39,6 +39,16 @@ except ImportError:
 # Sentinel: replaced with EvoformerAttention.apply when Triton is available.
 TritonEvoformer = None
 
+# Tile sizes were originally tuned for smaller head dims. At larger head dims
+# these use too much LDS, so we try to keep an estimate of LDS below 64KiB. This
+# is all an approximation: the limit and the estimates match closely on gfx942.
+# gfx950 actually has 160KiB, but the kernels also use more LDS there, so this
+# same estimate doesn't end up being too far off and we just use the same tiles.
+# Nvidia GPUs generally have more as well, but the kernels use *way* more, so
+# even with this lower limit some input dimensions still use too much on some GPUs.
+# Optimizing tile selection further awaits future tuning.
+_LDS_BYTES_BUDGET = 64 * 1024
+
 if _TRITON_AVAILABLE:
 
     def is_hip():
@@ -1184,7 +1194,11 @@ if _TRITON_AVAILABLE:
                 )
             # Forward tiles Q=64, KV=16: validated fastest on real (low_mem chunked)
             block_size_q = 64
-            _oss_bkv = 16
+            block_size_kv = 16
+            if BLOCK_DIM > 64:
+                # LDS is about BLOCK_SIZE_Q * row bytes
+                row_bytes = BLOCK_DIM * Q.element_size()
+                block_size_q = min(block_size_q, _LDS_BYTES_BUDGET // row_bytes)
 
             grid = lambda args: (  # noqa: E731
                 triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
@@ -1249,7 +1263,7 @@ if _TRITON_AVAILABLE:
                 BLOCK_DIM=BLOCK_DIM,
                 HAS_PAIR_BIAS=has_pair_bias,
                 BLOCK_SIZE_Q=block_size_q,
-                BLOCK_SIZE_KV=_oss_bkv,
+                BLOCK_SIZE_KV=block_size_kv,
                 USE_EXP2=use_exp2,
                 MATMUL_PRECISION=matmul_precision,
                 num_warps=4,
@@ -1339,6 +1353,12 @@ if _TRITON_AVAILABLE:
                 BATCH_SIZE * N_SEQ * HEAD,
                 1,
             )
+            _dkdv_bq, _dkdv_bkv = 64, 128
+            if BLOCK_DIM > 64:
+                # LDS is about BLOCK_SIZE_KV * row bytes
+                row_bytes = BLOCK_DIM * Q.element_size()
+                _dkdv_bkv = min(_dkdv_bkv, _LDS_BYTES_BUDGET // row_bytes)
+                _dkdv_bq = min(_dkdv_bq, _dkdv_bkv)
             _attn_bwd_dk_dv[bwd_dk_dv_grid](
                 Q=Q,
                 K=K,
@@ -1368,8 +1388,8 @@ if _TRITON_AVAILABLE:
                 SEQ_LEN=SEQ_LEN,
                 BLOCK_DIM=BLOCK_DIM,
                 DIM=ctx.DIM,
-                BLOCK_SIZE_Q=64,
-                BLOCK_SIZE_KV=128,
+                BLOCK_SIZE_Q=_dkdv_bq,
+                BLOCK_SIZE_KV=_dkdv_bkv,
                 num_warps=4,
                 num_stages=1,
                 **_hip_kernel_options(hip, waves_per_eu=2),
@@ -1380,12 +1400,28 @@ if _TRITON_AVAILABLE:
 
             dQ_acc = torch.zeros_like(Q, dtype=torch.float32)
             # Shape/dtype-adaptive dbias tile.
-            if Q.dtype == torch.float32:
+            _dbias_warps = 8
+            if BLOCK_DIM > 64:
+                # With one pipeline stage, LDS is empirically about
+                # `max(BLOCK_SIZE_Q, BLOCK_SIZE_KV) * BLOCK_DIM * 4` bytes
+                _side = _LDS_BYTES_BUDGET // (BLOCK_DIM * 4)
+                _BQ, _BKV = min(128, _side), min(64, _side)
+                if _BKV < 64:
+                    # A 32x32 tile has only four 16x16 MFMA tiles.
+                    _dbias_warps = 4
+            elif Q.dtype == torch.float32:
                 _BQ, _BKV = 128, 64
             elif HEAD >= 8 or SEQ_LEN >= 512:
                 _BQ, _BKV = 128, 128
             else:
                 _BQ, _BKV = 128, 64
+            # A second stage of the pipelined loop over N_SEQ adds about
+            # (BLOCK_SIZE_Q + 2 * BLOCK_SIZE_KV) * row bytes.
+            _two_stage_estimate = (
+                max(_BQ, _BKV) * BLOCK_DIM * 4
+                + (_BQ + 2 * _BKV) * BLOCK_DIM * Q.element_size()
+            )
+            _pipe_stages = 1 if _two_stage_estimate > _LDS_BYTES_BUDGET else 2
             bwd_dbias_dq_grid = lambda args: (  # noqa: E731
                 triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
                 triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]),
@@ -1425,8 +1461,8 @@ if _TRITON_AVAILABLE:
                 DIM=ctx.DIM,
                 BLOCK_SIZE_Q=_BQ,
                 BLOCK_SIZE_KV=_BKV,
-                PIPE_STAGES=2,
-                num_warps=8,
+                PIPE_STAGES=_pipe_stages,
+                num_warps=_dbias_warps,
                 num_stages=1,
                 **_hip_kernel_options(hip, waves_per_eu=2),
                 HAS_PAIR_BIAS=ctx.has_pair_bias,

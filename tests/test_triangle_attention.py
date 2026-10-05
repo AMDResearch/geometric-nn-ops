@@ -531,18 +531,8 @@ def test_triton_accuracy(shape, dtype, precision):
         pytest.param((1, 2, 32, 8, 64), torch.bfloat16, id="bf16-d64-h8"),
     ],
 )
-def test_wide_head_accuracy(request, shape, dtype):
+def test_wide_head_accuracy(shape, dtype):
     """Wider heads against the reference in fp64."""
-    # Heads wider than 64 overflow LDS everywhere; the pipelined dbias/dq at
-    # D=33-64 overflows only the 64 KiB of gfx942 and gfx11.
-    if shape[-1] > 64 or gpu_arch() == "gfx942" or gpu_arch().startswith("gfx11"):
-        request.node.add_marker(
-            pytest.mark.xfail(
-                raises=triton.runtime.errors.OutOfResources,
-                strict=True,
-                reason="tiles need more LDS than the device has",
-            )
-        )
     check_triton_accuracy(shape, dtype, precision="ieee")
 
 
