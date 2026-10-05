@@ -43,6 +43,7 @@ from utils import (
     skip_without_reduced_precision_dot,
 )
 
+# B, N_seq, N_res, H, D
 SHAPES = [
     pytest.param((1, 1, 32, 4, 32), id="pairformer_32"),
     pytest.param((1, 4, 32, 8, 8), id="msa_d8"),
@@ -488,10 +489,7 @@ def test_tf32_changes_the_result(impl):
 # in fp64.
 
 
-@requires_gpu
-@pytest.mark.parametrize("shape", SHAPES)
-@DTYPE_PRECISION_PARAM
-def test_triton_accuracy(shape, dtype, precision):
+def check_triton_accuracy(shape, dtype, precision):
     """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
     B, N_seq, N_res, H, D = shape
     tensors = make_inputs(
@@ -507,6 +505,45 @@ def test_triton_accuracy(shape, dtype, precision):
             precision=precision,
             label=f"{shape}/{dtype}/{precision}",
         )
+
+
+@requires_gpu
+@pytest.mark.parametrize("shape", SHAPES)
+@DTYPE_PRECISION_PARAM
+def test_triton_accuracy(shape, dtype, precision):
+    """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
+    check_triton_accuracy(shape, dtype, precision)
+
+
+# Cases where tiles have to shrink to fit in LDS. A deliberately limited set of
+# cases because these kernels are quite slow to compile.
+@requires_gpu
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [
+        # B, N_seq, N_res, H, D
+        pytest.param((1, 2, 40, 2, 96), torch.bfloat16, id="bf16-d96"),
+        pytest.param((1, 2, 40, 2, 256), torch.bfloat16, id="bf16-d256"),
+        pytest.param((1, 2, 40, 1, 512), torch.bfloat16, id="bf16-d512"),
+        pytest.param((1, 2, 40, 1, 512), torch.float32, id="fp32-d512"),
+        pytest.param((1, 2, 40, 1, 1024), torch.bfloat16, id="bf16-d1024"),
+        pytest.param((1, 2, 32, 4, 48), torch.float32, id="fp32-d48"),
+        pytest.param((1, 2, 32, 8, 64), torch.bfloat16, id="bf16-d64-h8"),
+    ],
+)
+def test_wide_head_accuracy(request, shape, dtype):
+    """Wider heads against the reference in fp64."""
+    # Heads wider than 64 overflow LDS everywhere; the pipelined dbias/dq at
+    # D=33-64 overflows only the 64 KiB of gfx942 and gfx11.
+    if shape[-1] > 64 or gpu_arch() == "gfx942" or gpu_arch().startswith("gfx11"):
+        request.node.add_marker(
+            pytest.mark.xfail(
+                raises=triton.runtime.errors.OutOfResources,
+                strict=True,
+                reason="tiles need more LDS than the device has",
+            )
+        )
+    check_triton_accuracy(shape, dtype, precision="ieee")
 
 
 @requires_gpu
