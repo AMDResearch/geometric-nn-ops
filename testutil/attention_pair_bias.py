@@ -1,22 +1,16 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Input builders for attention_pair_bias."""
+"""Input builders and oracle comparison for attention_pair_bias."""
 
 import torch
 
-from . import generator
-
-# Grad-bearing activations, in the order tests compare gradients.
-ACTIVATION_KEYS = ("s", "q", "k", "v", "z")
-
-# Standard-config parameters (LN affine present, projections bias-free).
-WEIGHT_KEYS = (
-    "proj_z_weight",
-    "ln_z_weight",
-    "proj_g_weight",
-    "proj_o_weight",
+from geometric_nn_ops_torch.triangle._reference.attention_pair_bias import (
+    attention_pair_bias_torch,
 )
+
+from . import cast_tree, generator, grad_targets, seeded_randn
+from .metrics import ATTENTION_PAIR_BIAS_TOL, assert_matches_oracle
 
 
 def make_op_tensors(
@@ -35,9 +29,8 @@ def make_op_tensors(
 ) -> dict:
     """Op-boundary tensors: pre-projected q/k/v, single ``s``, pair ``z``, weights.
 
-    One flat dict keyed by the op's argument names; ``ACTIVATION_KEYS`` and
-    ``WEIGHT_KEYS`` split it into activations and parameters. ``m`` is the
-    diffusion multiplicity, across which the pair rep ``z`` is shared.
+    One flat dict keyed by the op's argument names. ``m`` is the diffusion
+    multiplicity, across which the pair rep ``z`` is shared.
     """
     d = h * dh
     g = generator(device, seed)
@@ -88,3 +81,53 @@ def make_key_mask(
     mask = torch.rand(batch, v, device=device, generator=g) < frac_keep
     mask[:, 0] = True
     return mask.to(dtype)
+
+
+def fwd_bwd(implementation, tensors, grad_out, **options):
+    out, _ = implementation(**tensors, **options)
+    targets = grad_targets(tensors)
+    grads = torch.autograd.grad(out, list(targets.values()), grad_outputs=grad_out)
+    return out, list(targets), grads
+
+
+def comparisons(out, keys, grads, out_oracle, grads_oracle):
+    names = ["out", *(f"grad_{key}" for key in keys)]
+    return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
+
+
+def assert_agrees_with_the_oracle(
+    tensors, dtype, *, impl, label, precision="ieee", grad_seed=11, **options
+):
+    """Run the ``impl`` at ``dtype`` and the reference in fp64, compare the
+    output and every gradient.
+
+    ``precision`` only selects the tolerance; the caller sets it on torch. The
+    fp64 oracle is unaffected by it.
+    """
+    BM, _, U, DH = tensors["q"].shape
+    D = tensors["s"].shape[-1]
+    grad_out = seeded_randn(BM, U, D, device="cuda", dtype=dtype, seed=grad_seed)
+    mask = options.pop("mask", None)
+
+    out, keys, grads = fwd_bwd(
+        impl,
+        cast_tree(tensors, dtype),
+        grad_out,
+        mask=mask,
+        scale=DH**-0.5,
+        **options,
+    )
+    out_oracle, _, grads_oracle = fwd_bwd(
+        attention_pair_bias_torch,
+        cast_tree(tensors, torch.float64),
+        grad_out.double(),
+        mask=None if mask is None else mask.double(),
+        scale=DH**-0.5,
+        **options,
+    )
+
+    assert_matches_oracle(
+        comparisons(out, keys, grads, out_oracle, grads_oracle),
+        ATTENTION_PAIR_BIAS_TOL[dtype, precision],
+        label=f"{label}/{dtype}",
+    )

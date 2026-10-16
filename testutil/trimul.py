@@ -9,23 +9,8 @@ import torch
 
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 
-from . import cast_tree, generator
+from . import cast_tree, generator, grad_targets, seeded_randn
 from .metrics import TRIMUL_TOL, assert_matches_oracle
-
-# Bias-free weight names, in the order tests compare gradients.
-WEIGHT_KEYS = (
-    "norm_in_weight",
-    "norm_in_bias",
-    "p_in_weight",
-    "g_in_weight",
-    "norm_out_weight",
-    "norm_out_bias",
-    "p_out_weight",
-    "g_out_weight",
-)
-
-# Projection biases.
-BIAS_KEYS = ("p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias")
 
 
 def make_weights(
@@ -201,5 +186,46 @@ def assert_forward_agrees_with_the_oracle(
     assert_matches_oracle(
         [("out", out, out_oracle)],
         tol or TRIMUL_TOL[dtype, precision],
+        label=label,
+    )
+
+
+def fwd_bwd(impl, x, mask, weights, direction, grad_out):
+    """Forward plus gradients wrt ``x`` and every weight carrying one."""
+    out = impl(x, direction, mask, **weights)
+    targets = grad_targets(weights)
+    grads = torch.autograd.grad(out, [x, *targets.values()], grad_outputs=grad_out)
+    return out, ["x", *targets], grads
+
+
+def comparisons(out, keys, grads, out_oracle, grads_oracle):
+    """Name every (candidate, oracle) pair the accuracy assertion should cover."""
+    names = ["out", *(f"grad_{key}" for key in keys)]
+    return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
+
+
+def assert_agrees_with_the_oracle(
+    x, mask, weights, direction, *, impl, precision="ieee", label=""
+):
+    """Run the ``impl`` on the inputs as given and the reference in fp64,
+    compare the output and every gradient.
+
+    ``precision`` only selects the tolerance; the caller sets it on torch. The
+    fp64 oracle is unaffected by it.
+    """
+    grad_out = seeded_randn(*x.shape, device=x.device, dtype=x.dtype, seed=11)
+    out, keys, grads = fwd_bwd(impl, x, mask, weights, direction, grad_out)
+    out_oracle, _, grads_oracle = fwd_bwd(
+        trimul_torch,
+        x.detach().double().requires_grad_(),
+        mask.double(),
+        cast_tree(weights, torch.float64),
+        direction,
+        grad_out.double(),
+    )
+
+    assert_matches_oracle(
+        comparisons(out, keys, grads, out_oracle, grads_oracle),
+        TRIMUL_TOL[x.dtype, precision],
         label=label,
     )

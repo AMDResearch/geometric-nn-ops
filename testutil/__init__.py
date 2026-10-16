@@ -27,6 +27,15 @@ def masked_noise(t: torch.Tensor, mask: torch.Tensor, seed: int, size: float = 1
     return torch.where(mask, t + noise, t)
 
 
+def grad_targets(tensors: dict) -> dict:
+    """The entries of ``tensors`` that require a gradient."""
+    return {
+        key: val
+        for key, val in tensors.items()
+        if isinstance(val, torch.Tensor) and val.requires_grad
+    }
+
+
 def cast_tree(tensors: dict, dtype, *, requires_grad: bool = True) -> dict:
     """Cast a dict of tensors to fresh leaves, passing ``None`` through."""
     return {

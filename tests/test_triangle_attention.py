@@ -24,12 +24,17 @@ from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
 )
 from testutil import cast_tree, generator, masked_noise, seeded_randn
 from testutil.metrics import (
-    TRIANGLE_ATTENTION_TOL,
     Tolerance,
     assert_matches_oracle,
 )
 from testutil.precision import torch_matmul_precision
-from testutil.triangle_attention import make_inputs, make_key_mask
+from testutil.triangle_attention import (
+    assert_agrees_with_the_oracle,
+    comparisons,
+    fwd_bwd,
+    make_inputs,
+    make_key_mask,
+)
 from utils import (
     DTYPE_PRECISION_PARAM,
     DTYPES_PARAM,
@@ -55,51 +60,6 @@ IMPLEMENTATIONS = {
 IMPLEMENTATION_PARAM = pytest.mark.parametrize(
     "impl", list(IMPLEMENTATIONS.values()), ids=list(IMPLEMENTATIONS.keys())
 )
-
-
-def fwd_bwd(run, tensors, mask, scale, grad_out):
-    """Forward plus gradients wrt q, k, v and, when present, the bias."""
-    out = run(**tensors, mask=mask, scale=scale)
-    targets = [tensors[k] for k in ("q", "k", "v")]
-    if "bias" in tensors:
-        targets.append(tensors["bias"])
-    return out, torch.autograd.grad(out, targets, grad_outputs=grad_out)
-
-
-def comparisons(out, grads, out_oracle, grads_oracle):
-    """Name every (candidate, oracle) pair the accuracy assertion should cover."""
-    names = ["out", "grad_q", "grad_k", "grad_v", "grad_bias"][: 1 + len(grads)]
-    return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
-
-
-def assert_agrees_with_the_oracle(
-    tensors, mask, scale, *, impl, precision="ieee", tol=None, label=""
-):
-    """Run the ``impl`` on the inputs as given and the reference in fp64,
-    compare the output and every input gradient.
-
-    ``precision`` only selects the tolerance; the caller sets it on torch. The
-    fp64 oracle is unaffected by it.
-    """
-    dtype = tensors["q"].dtype
-    grad_out = seeded_randn(
-        *tensors["q"].shape, device=tensors["q"].device, dtype=dtype, seed=31
-    )
-
-    out, grads = fwd_bwd(impl, tensors, mask, scale, grad_out)
-    out_oracle, grads_oracle = fwd_bwd(
-        triangle_attention_torch,
-        cast_tree(tensors, torch.float64),
-        mask,
-        scale,
-        grad_out.double(),
-    )
-
-    assert_matches_oracle(
-        comparisons(out, grads, out_oracle, grads_oracle),
-        tol or TRIANGLE_ATTENTION_TOL[dtype, precision],
-        label=label,
-    )
 
 
 # Structural tests: These use contrived scenarios where we know the answer
@@ -514,7 +474,11 @@ def test_tf32_changes_the_result(impl):
         with torch_matmul_precision(precision):
             results[precision] = fwd_bwd(impl, tensors, mask, D**-0.5, grad_out)
 
-    for name, full, reduced in comparisons(*results["ieee"], *results["tf32"]):
+    out_ieee, keys, grads_ieee = results["ieee"]
+    out_tf32, _, grads_tf32 = results["tf32"]
+    for name, full, reduced in comparisons(
+        out_ieee, keys, grads_ieee, out_tf32, grads_tf32
+    ):
         assert not torch.allclose(full, reduced, rtol=0, atol=0), (
             f"{name} is bit-identical for ieee and tf32"
         )

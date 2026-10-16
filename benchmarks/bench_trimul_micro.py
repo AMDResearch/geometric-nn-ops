@@ -40,8 +40,8 @@ from _trimul_common import (
 )
 from triton.testing import do_bench
 
+from testutil import grad_targets
 from testutil.trimul import (
-    WEIGHT_KEYS,
     assert_forward_agrees_with_the_oracle,
     make_pair_input,
     make_projection_biases,
@@ -90,7 +90,7 @@ def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, bi
         # it, so there is no backward to time. Absent, not failed.
         if out.requires_grad:
             grad_out = torch.randn_like(out)
-            targets = [x] + [weights[k] for k in WEIGHT_KEYS]
+            targets = [x, *grad_targets(weights).values()]
             row["bwd_ms"] = timed(
                 lambda: torch.autograd.grad(
                     [out], targets, grad_outputs=[grad_out], retain_graph=True

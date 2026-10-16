@@ -13,90 +13,15 @@ import torch
 from geometric_nn_ops_torch.triangle._reference.attention_pair_bias import (
     attention_pair_bias_torch,
 )
-from testutil import cast_tree, masked_noise, seeded_randn
+from testutil import cast_tree, masked_noise
 from testutil.attention_pair_bias import (
+    assert_agrees_with_the_oracle,
     make_key_mask,
     make_op_tensors,
     make_projection_biases,
 )
-from testutil.metrics import (
-    ATTENTION_PAIR_BIAS_TOL,
-    assert_matches_oracle,
-)
 from testutil.precision import torch_matmul_precision
 from utils import DTYPE_PRECISION_PARAM, DTYPES_PARAM, requires_gpu
-
-ACTIVATIONS = ("s", "q", "k", "v", "z")
-PARAMETERS = (
-    "proj_g_weight",
-    "proj_o_weight",
-    "proj_z_weight",
-    "ln_z_weight",
-    "proj_g_bias",
-    "proj_o_bias",
-)
-
-
-def grad_targets(tensors):
-    """Every input that will receive a gradient, in a fixed order."""
-    return [
-        key
-        for key in ACTIVATIONS + PARAMETERS
-        if tensors.get(key) is not None and tensors[key].requires_grad
-    ]
-
-
-def fwd_bwd(implementation, tensors, grad_out, **options):
-    out, _ = implementation(**tensors, **options)
-    keys = grad_targets(tensors)
-    grads = torch.autograd.grad(
-        out, [tensors[key] for key in keys], grad_outputs=grad_out
-    )
-    return out, keys, grads
-
-
-def comparisons(out, keys, grads, out_oracle, grads_oracle):
-    names = ["out", *(f"grad_{key}" for key in keys)]
-    return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
-
-
-def assert_agrees_with_the_oracle(
-    tensors, dtype, *, impl, label, precision="ieee", grad_seed=11, **options
-):
-    """Run the ``impl`` at ``dtype`` and the reference in fp64, compare the
-    output and every gradient.
-
-    ``precision`` only selects the tolerance; the caller sets it on torch. The
-    fp64 oracle is unaffected by it.
-    """
-    BM, _, U, DH = tensors["q"].shape
-    D = tensors["s"].shape[-1]
-    grad_out = seeded_randn(BM, U, D, device="cuda", dtype=dtype, seed=grad_seed)
-    mask = options.pop("mask", None)
-
-    out, keys, grads = fwd_bwd(
-        impl,
-        cast_tree(tensors, dtype),
-        grad_out,
-        mask=mask,
-        scale=DH**-0.5,
-        **options,
-    )
-    out_oracle, _, grads_oracle = fwd_bwd(
-        attention_pair_bias_torch,
-        cast_tree(tensors, torch.float64),
-        grad_out.double(),
-        mask=None if mask is None else mask.double(),
-        scale=DH**-0.5,
-        **options,
-    )
-
-    assert_matches_oracle(
-        comparisons(out, keys, grads, out_oracle, grads_oracle),
-        ATTENTION_PAIR_BIAS_TOL[dtype, precision],
-        label=f"{label}/{dtype}",
-    )
-
 
 # Structural tests: These use contrived scenarios where we know the answer
 # analytically.

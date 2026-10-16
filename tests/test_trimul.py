@@ -16,23 +16,21 @@ import pytest
 import torch
 
 triton = pytest.importorskip("triton")
-# ruff: noqa E402
+# ruff: noqa: E402
 
 
 from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
-from testutil.precision import torch_matmul_precision
 from testutil.metrics import (
-    TRIMUL_TOL,
     Tolerance,
-    assert_matches_oracle,
     cos,
     rel_fro,
 )
+from testutil.precision import torch_matmul_precision
 from testutil.trimul import (
-    BIAS_KEYS,
+    assert_agrees_with_the_oracle,
     assert_forward_agrees_with_the_oracle,
     make_pair_input,
     make_projection_biases,
@@ -40,8 +38,8 @@ from testutil.trimul import (
 )
 from utils import (
     DTYPE_PRECISION_PARAM,
-    requires_gpu,
     require_device_memory,
+    requires_gpu,
     skip_without_reduced_precision_dot,
 )
 
@@ -94,7 +92,9 @@ def test_fully_masked_input(impl, biased, direction):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
-@pytest.mark.parametrize("which", BIAS_KEYS)
+@pytest.mark.parametrize(
+    "which", ["p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias"]
+)
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 def test_each_projection_bias_contributes(impl, which, direction):
     """Zeroing any one bias changes the output, so none is silently dropped."""
@@ -209,7 +209,10 @@ def test_tf32_changes_the_result():
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 @DTYPE_PRECISION_PARAM
 def test_triton_accuracy(direction, dtype, precision):
-    """The kernel at ``dtype`` and ``precision`` against the reference in fp64."""
+    """The kernel at ``dtype`` and ``precision`` against the reference in fp64.
+
+    Forward only since the Triton implementation is currently forward only.
+    """
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
@@ -230,12 +233,13 @@ def test_triton_accuracy(direction, dtype, precision):
 def test_reference_precision(dtype, precision):
     """How much the reference loses at ``dtype``, both sides being the
     reference. The reference is the op's fallback for inputs the kernel cannot
-    serve. This is mostly just a sanity check."""
+    serve, and carries the backward for both paths, so this covers gradients as
+    well as the forward."""
     N, C = 32, 32
-    weights = make_weights(C, C, "cuda", dtype, seed=3)
-    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
+    weights = make_weights(C, C, "cuda", dtype, seed=3, requires_grad=True)
+    x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4, requires_grad=True)
     with torch_matmul_precision(precision):
-        assert_forward_agrees_with_the_oracle(
+        assert_agrees_with_the_oracle(
             x0,
             mask,
             weights,

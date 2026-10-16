@@ -26,8 +26,8 @@ from _trimul_common import (
 )
 from torch.profiler import ProfilerActivity, profile
 
+from testutil import grad_targets
 from testutil.trimul import (
-    WEIGHT_KEYS,
     make_pair_input,
     make_weights,
 )
@@ -61,7 +61,7 @@ def make_step(backend, n, channels, direction, dtype, mode):
     if not probe.requires_grad:
         raise RuntimeError(f"backend '{backend}' has no backward to profile")
     grad_out = torch.randn_like(probe)
-    targets = [x] + [weights[k] for k in WEIGHT_KEYS]
+    targets = [x, *grad_targets(weights).values()]
 
     def forward_backward():
         out = impl(x, direction, mask, **weights)
