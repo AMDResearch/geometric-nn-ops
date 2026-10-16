@@ -5,9 +5,16 @@
 
 cuequivariance_torch deep-imports ``attention_pair_bias`` from this exact module
 path, so the file name must match.
+
+The shim warns about and ignores ``b_ln_z`` and ``b_proj_z`` which
+mathematically cannot affect the main output and just add noise. cuEquivariance
+folds them into its returned ``z_proj``, so with either set ours differs from
+theirs by a per-head constant, but is internally consistent for subsequent
+function calls.
 """  # noqa: E501
 
 import sys
+import warnings
 
 import torch
 
@@ -45,6 +52,17 @@ def attention_pair_bias(
         raise ValueError(
             f"num_heads={num_heads} does not match q head dim {q.shape[1]}"
         )
+    for name, bias in (("b_ln_z", b_ln_z), ("b_proj_z", b_proj_z)):
+        if bias is not None:
+            warnings.warn(
+                f"{name} is ignored: softmax cancels the per-head constant it "
+                "adds, so it mathematically cannot affect the output and its gradient "
+                "should be zero, but in low precision can diverge. Don't pass it in "
+                "to this function and we recommend not training it at all.",
+                stacklevel=2,
+            )
+    del b_ln_z, b_proj_z
+
     result = _apb(
         s,
         q,
@@ -54,9 +72,7 @@ def attention_pair_bias(
         proj_g_weight=w_proj_g,
         proj_o_weight=w_proj_o,
         proj_z_weight=w_proj_z,
-        proj_z_bias=b_proj_z,
         ln_z_weight=w_ln_z,
-        ln_z_bias=b_ln_z,
         proj_g_bias=b_proj_g,
         proj_o_bias=b_proj_o,
         mask=mask,

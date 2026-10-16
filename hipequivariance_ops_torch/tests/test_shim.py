@@ -89,13 +89,90 @@ def test_attention_pair_bias_routes_through_shim():
         w_proj_g=rn(D, D, scale=D**-0.5),
         w_proj_o=rn(D, D, scale=D**-0.5),
         w_ln_z=torch.ones(Zc, device=device, dtype=dtype),
-        b_ln_z=torch.zeros(Zc, device=device, dtype=dtype),
         attn_scale=DH**-0.5,
     )
 
     assert out.shape == (BM, U, D)
     assert out.dtype == dtype
     assert proj_z is not None and proj_z.shape == (B, H, U, V)
+
+
+def _apb_kwargs(B, M, H, U, V, DH, Zc, device, dtype, seed=0):
+    """Build a complete keyword argument set for an APB shim call."""
+    D, BM = H * DH, B * M
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def rn(*shape, scale=1.0):
+        return torch.randn(*shape, device=device, dtype=dtype, generator=g) * scale
+
+    return dict(
+        s=rn(BM, U, D),
+        q=rn(BM, H, U, DH),
+        k=rn(BM, H, V, DH),
+        v=rn(BM, H, V, DH),
+        z=rn(B, U, V, Zc),
+        mask=(torch.rand(B, V, device=device, generator=g) > 0.1).to(dtype),
+        num_heads=H,
+        w_proj_z=rn(H, Zc, scale=Zc**-0.5),
+        w_proj_g=rn(D, D, scale=D**-0.5),
+        w_proj_o=rn(D, D, scale=D**-0.5),
+        w_ln_z=torch.ones(Zc, device=device, dtype=dtype),
+        attn_scale=DH**-0.5,
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("bias_arg", ["b_ln_z", "b_proj_z"])
+@pytest.mark.parametrize("fill", [0.0, 1.0], ids=["zeros", "nonzero"])
+def test_inert_pair_bias_bias_warns(bias_arg, fill):
+    """Warns on any non-None value, including the zeros a stock nn.LayerNorm
+    starts with -- the point is that the parameter should not be carried."""
+    from cuequivariance_torch.primitives.triangle import attention_pair_bias
+
+    B, M, H, U, V, DH, Zc = 1, 1, 4, 16, 16, 8, 16
+    kwargs = _apb_kwargs(B, M, H, U, V, DH, Zc, "cuda", torch.float32)
+    size = Zc if bias_arg == "b_ln_z" else H
+    kwargs[bias_arg] = torch.full((size,), fill, device="cuda")
+
+    with pytest.warns(UserWarning, match=f"{bias_arg} is ignored"):
+        attention_pair_bias(**kwargs)
+
+
+@requires_gpu
+@pytest.mark.parametrize("bias_arg", ["b_ln_z", "b_proj_z"])
+def test_inert_pair_bias_bias_does_not_change_the_output(bias_arg):
+    """An ignored bias leaves the output and projected bias unchanged."""
+    from cuequivariance_torch.primitives.triangle import attention_pair_bias
+
+    B, M, H, U, V, DH, Zc = 1, 1, 4, 16, 16, 8, 16
+    kwargs = _apb_kwargs(B, M, H, U, V, DH, Zc, "cuda", torch.float64)
+    size = Zc if bias_arg == "b_ln_z" else H
+    baseline, baseline_z = attention_pair_bias(**kwargs)
+
+    with pytest.warns(UserWarning):
+        biased, biased_z = attention_pair_bias(
+            **kwargs, **{bias_arg: torch.full((size,), 1e3, device="cuda")}
+        )
+
+    torch.testing.assert_close(biased, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(biased_z, baseline_z, rtol=0, atol=0)
+
+
+@requires_gpu
+def test_returned_pair_bias_round_trips():
+    """A projected bias returned by the shim can be reused as cached input."""
+    from cuequivariance_torch.primitives.triangle import attention_pair_bias
+
+    B, M, H, U, V, DH, Zc = 1, 1, 4, 16, 16, 8, 16
+    kwargs = _apb_kwargs(B, M, H, U, V, DH, Zc, "cuda", torch.float64)
+    direct, proj_z = attention_pair_bias(**kwargs)
+
+    cached, _ = attention_pair_bias(
+        **{**kwargs, "z": proj_z, "w_proj_z": None, "w_ln_z": None},
+        is_cached_z_proj=True,
+    )
+
+    torch.testing.assert_close(cached, direct, rtol=0, atol=0)
 
 
 @requires_gpu

@@ -15,11 +15,11 @@ import torch.nn.functional as F
 from geometric_nn_ops_torch.triangle._masking import mask_val
 
 
-def _project_pair_bias(z, ln_z_weight, ln_z_bias, proj_z_weight, proj_z_bias, eps):
+def _project_pair_bias(z, ln_z_weight, proj_z_weight, eps):
     """z ``(B,U,V,Zc)`` -> per-head bias ``(B,H,U,V)``."""
     Zc = z.shape[-1]
-    zc = F.layer_norm(z, (Zc,), ln_z_weight, ln_z_bias, eps)  # (B,U,V,Zc)
-    pz = F.linear(zc, proj_z_weight, proj_z_bias)  # (B,U,V,H)
+    zc = F.layer_norm(z, (Zc,), ln_z_weight, None, eps)  # (B,U,V,Zc)
+    pz = F.linear(zc, proj_z_weight, None)  # (B,U,V,H)
     return pz.permute(0, 3, 1, 2).contiguous()  # (B,H,U,V)
 
 
@@ -33,9 +33,7 @@ def attention_pair_bias_torch(
     proj_g_weight,
     proj_o_weight,
     proj_z_weight=None,
-    proj_z_bias=None,
     ln_z_weight=None,
-    ln_z_bias=None,
     proj_g_bias=None,
     proj_o_bias=None,
     mask=None,
@@ -58,9 +56,7 @@ def attention_pair_bias_torch(
 
     pz = z
     if not z_is_projected:
-        pz = _project_pair_bias(
-            z, ln_z_weight, ln_z_bias, proj_z_weight, proj_z_bias, eps
-        )
+        pz = _project_pair_bias(z, ln_z_weight, proj_z_weight, eps)
 
     # q/k/v carry the multiplicity folded into their batch. Splitting them back
     # out explicitly to get natural broadcasting behavior.

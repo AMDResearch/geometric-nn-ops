@@ -18,9 +18,7 @@ def attention_pair_bias(
     proj_g_weight: torch.Tensor,
     proj_o_weight: torch.Tensor,
     proj_z_weight: torch.Tensor | None = None,
-    proj_z_bias: torch.Tensor | None = None,
     ln_z_weight: torch.Tensor | None = None,
-    ln_z_bias: torch.Tensor | None = None,
     proj_g_bias: torch.Tensor | None = None,
     proj_o_bias: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
@@ -38,6 +36,10 @@ def attention_pair_bias(
     the single rep. When return_z_proj is set, returns projected pair bias for
     reuse in subsequent calls with z_is_projected set.
 
+    The z LayerNorm and projection take no bias: softmax cancels the per-head
+    constant they would add, so they can't affect the output mathematically (in
+    low-precision they can perturb it, usually destructively).
+
     Args:
         s: ``(BM, S, D)`` single/token representation; the gate is projected from
             it and the output has this shape.
@@ -49,23 +51,16 @@ def attention_pair_bias(
         proj_o_weight: ``(D, D)`` output projection weight.
         proj_z_weight: ``(H, Zc)`` pair-bias projection weight. Required unless
             ``z_is_projected``.
-        proj_z_bias: ``(H,)`` optional pair-bias projection bias. Has no effect
-            on ``out``: it shifts every key's logit by the same amount and a
-            constant along the key axis cancels in the softmax. It does alter
-            the returned ``proj_z`` though not in a way that is meaningful if
-            that is just passed back in to this function. Accepted for API
-            self-consistency and consistency with cuEquivariance.
         ln_z_weight: ``(Zc,)`` LayerNorm affine param for ``z``.
-        ln_z_bias: ``(Zc,)`` LayerNorm affine param for ``z``. Inert for the same
-            reason as ``proj_z_bias``.
         proj_g_bias: ``(D,)`` optional gate projection bias.
         proj_o_bias: ``(D,)`` optional output projection bias.
         mask: ``(B, V)`` or ``(BM, V)`` key mask, ``1`` = keep, ``0`` = mask.
         scale: attention scale; ``None`` -> ``DH ** -0.5``.
         inf: magnitude used to push masked keys out of the softmax. This exists
-            primarily for compatibility with cuequivariance. We recommend using the
-            default ``None``, which selects a value suited to the accumulator
-            the softmax reduces in; a value given here is used as-is.
+            primarily for compatibility with cuequivariance. We recommend using
+            the default ``None``, which selects a value suited to the logits
+            dtype; a value given here is used as-is even when it would overflow
+            the dtype.
         eps: LayerNorm epsilon.
         z_is_projected: when ``True``, ``z`` is the cached ``(B,H,U,V)`` bias and
             the LayerNorm + projection are skipped.
@@ -91,9 +86,7 @@ def attention_pair_bias(
         proj_g_weight=proj_g_weight,
         proj_o_weight=proj_o_weight,
         proj_z_weight=proj_z_weight,
-        proj_z_bias=proj_z_bias,
         ln_z_weight=ln_z_weight,
-        ln_z_bias=ln_z_bias,
         proj_g_bias=proj_g_bias,
         proj_o_bias=proj_o_bias,
         mask=mask,

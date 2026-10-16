@@ -31,9 +31,7 @@ PARAMETERS = (
     "proj_g_weight",
     "proj_o_weight",
     "proj_z_weight",
-    "proj_z_bias",
     "ln_z_weight",
-    "ln_z_bias",
     "proj_g_bias",
     "proj_o_bias",
 )
@@ -44,9 +42,7 @@ def grad_targets(tensors):
     return [
         key
         for key in ACTIVATIONS + PARAMETERS
-        if key not in UNLEARNABLE
-        and tensors.get(key) is not None
-        and tensors[key].requires_grad
+        if tensors.get(key) is not None and tensors[key].requires_grad
     ]
 
 
@@ -62,15 +58,6 @@ def fwd_bwd(implementation, tensors, grad_out, **options):
 def comparisons(out, keys, grads, out_oracle, grads_oracle):
     names = ["out", *(f"grad_{key}" for key in keys)]
     return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
-
-
-# Parameters that cannot reach the output. Each shifts every key's logit by the
-# same amount, and a constant along the key axis cancels in the softmax, so the
-# output is independent of them and their gradient is identically zero. They do
-# reach the bias returned by return_z_proj, which is why they are not simply
-# dropped. Both are optional and default to absent.
-# See test_key_constant_parameters_cannot_reach_the_output.
-UNLEARNABLE = ("ln_z_bias", "proj_z_bias")
 
 
 def assert_agrees_with_the_oracle(
@@ -113,39 +100,6 @@ def assert_agrees_with_the_oracle(
 
 # Structural tests: These use contrived scenarios where we know the answer
 # analytically.
-
-
-@requires_gpu
-def test_key_constant_parameters_cannot_reach_the_output():
-    """``ln_z_bias`` and ``proj_z_bias`` shift every key's logit by the same
-    amount, and a constant along the key axis cancels in the softmax, so the
-    output does not depend on them at all: perturbing either leaves it
-    unchanged, and its gradient is zero. In fp64 a real gradient is order one.
-    """
-    B, M, H, U, V, DH, Zc = 1, 1, 4, 16, 16, 8, 16
-    tensors = make_op_tensors(
-        B, M, H, U, V, DH, Zc, "cuda", torch.float64, seed=3, requires_grad=True
-    )
-    tensors.update(
-        make_projection_biases(H, DH, "cuda", torch.float64, seed=5, requires_grad=True)
-    )
-
-    out, _ = attention_pair_bias_torch(**tensors, scale=DH**-0.5)
-    grads = torch.autograd.grad(out.sum(), [tensors[k] for k in UNLEARNABLE])
-
-    for name in UNLEARNABLE:
-        moved = {**tensors, name: tensors[name] + 1e3}
-        with torch.no_grad():
-            perturbed, _ = attention_pair_bias_torch(**moved, scale=DH**-0.5)
-        assert (out - perturbed).abs().max() < 1e-10, (
-            f"moving {name} by 1e3 changed the output by "
-            f"{(out - perturbed).abs().max():.2e}"
-        )
-
-    for name, grad in zip(UNLEARNABLE, grads, strict=True):
-        assert grad.abs().max() < 1e-12, (
-            f"{name} has a gradient of {grad.abs().max():.2e}"
-        )
 
 
 @requires_gpu
@@ -404,3 +358,17 @@ def test_reference_precision(dtype, precision):
             mask=make_key_mask(B, V, "cuda", seed=9),
             label="base",
         )
+
+
+@requires_gpu
+@DTYPES_PARAM
+def test_reference_precision_with_optional_projection_biases(dtype):
+    """The same fp64-vs-``dtype`` check with the gate and output biases present,
+    which are otherwise unexercised. Both sides are the reference."""
+    B, M, H, U, V, DH, Zc = 1, 1, 4, 32, 32, 16, 16
+    tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cuda", torch.float32, seed=3)
+    tensors |= make_projection_biases(H, DH, "cuda", torch.float32, seed=5)
+
+    assert_agrees_with_the_oracle(
+        tensors, dtype, impl=attention_pair_bias_torch, label="projection-biases"
+    )

@@ -14,7 +14,6 @@ ACTIVATION_KEYS = ("s", "q", "k", "v", "z")
 WEIGHT_KEYS = (
     "proj_z_weight",
     "ln_z_weight",
-    "ln_z_bias",
     "proj_g_weight",
     "proj_o_weight",
 )
@@ -59,7 +58,6 @@ def make_op_tensors(
         "z": rn(b, u, v, zc),
         "proj_z_weight": rn(h, zc, scale=zc**-0.5),
         "ln_z_weight": const(1.0, zc),
-        "ln_z_bias": const(0.0, zc),
         "proj_g_weight": rn(d, d, scale=d**-0.5),
         "proj_o_weight": rn(d, d, scale=d**-0.5),
     }
@@ -68,14 +66,14 @@ def make_op_tensors(
 def make_projection_biases(
     h: int, dh: int, device, dtype, *, seed: int = 0, requires_grad: bool = False
 ) -> dict:
-    """The three projection biases, to merge into ``make_op_tensors``."""
+    """Build optional gate and output projection biases."""
     g = generator(device, seed)
 
     def rn(*shape):
         t = torch.randn(*shape, device=device, dtype=dtype, generator=g) * 0.1
         return t.requires_grad_(requires_grad)
 
-    return {"proj_z_bias": rn(h), "proj_g_bias": rn(h * dh), "proj_o_bias": rn(h * dh)}
+    return {"proj_g_bias": rn(h * dh), "proj_o_bias": rn(h * dh)}
 
 
 def make_key_mask(
