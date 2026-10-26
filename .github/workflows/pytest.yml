@@ -7,11 +7,10 @@ on:
   push:
     branches: [main]
 
-# head_ref is set only for pull requests, so a new push to a PR cancels the
-# previous run. Pushes to main fall back to the unique run_id and so never
-# cancel each other.
+# A new push to a PR cancels the previous run. Pushes to main fall back to the
+# unique run_id and so never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -41,8 +40,7 @@ jobs:
       # Runners have no GPU, so most tests skip and this is mainly a check that
       # every module still imports and collects.
       - name: Run CPU-only tests
-        run: python -m pytest -m "" -vrxs tests hipequivariance_ops_torch/tests
-
+        run: python -m pytest -m "" -vrxs --durations=20 tests hipequivariance_ops_torch/tests
 
   pytest-gpu:
     # Requires a self-hosted ROCm GPU runner. Set the GPU_RUNNER_LABEL
@@ -64,4 +62,87 @@ jobs:
 
       - name: Run GPU tests
         # -m "" includes the large tests that are excluded by default
-        run: python -m pytest -m "" -vrxs tests hipequivariance_ops_torch/tests
+        run: python -m pytest -m "" -vrxs --durations=20 tests hipequivariance_ops_torch/tests
+
+  pytest-emulated:
+    # Runs on an emulated AMD GPU (rocjitsu, via its `mirage` CLI) on a GPU-less
+    # hosted runner. Emulation is much slower than real hardware, so we do not
+    # run the "slow" tests.
+    name: pytest-emulated (${{ matrix.gfx }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every single-GPU config rocjitsu ships except gfx90a, where Triton
+        # kernels seem to hang. CDNA uses the *_kmd variants, which are the ones
+        # meant for running programs through emulated KFD.
+        include:
+          - gfx: gfx942
+            config: gfx942_cdna3_kmd.json
+          - gfx: gfx950
+            config: gfx950_mi355x_kmd.json
+          - gfx: gfx1100
+            config: gfx1100_w7900.json
+          - gfx: gfx1151
+            config: gfx1151.json
+          - gfx: gfx1201
+            config: gfx1201_r9700.json
+          - gfx: gfx1250
+            config: gfx1250_mi455x.json
+    env:
+      ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+      ROCM_VERSION: "10.1.0"
+      TORCH_VERSION: "2.14.0+rocm10.1.0"
+      # The stable releases' rocjitsu is too old for this suite, so take it from
+      # a pinned nightly. torch stays on the stable release above.
+      ROCJITSU_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
+      ROCJITSU_SDK_VERSION: "10.3.0a20261026"
+      ROCJITSU_DIR: ${{ github.workspace }}/../rocjitsu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install ROCm and Torch
+        env:
+          ROCM_SDK_TARGET_FAMILY: ${{ matrix.gfx }}
+        run: >-
+          python -m pip install --index-url "$ROCM_INDEX"
+          "rocm==$ROCM_VERSION"
+          "torch[device-${{ matrix.gfx }}]==$TORCH_VERSION"
+
+      - name: Install
+        run: >-
+          python -m pip install --only-binary=":all:"
+          -e ".[test]" -e "./hipequivariance_ops_torch[test]"
+
+      # rocjitsu ships in the ROCm devel wheel, which is a 3 GB tarball inside a
+      # wheel. `mirage` and `librocjitsu.so` only depend on the C/C++ runtime,
+      # so extract just them and the config instead of the whole SDK.
+      - name: Install rocjitsu
+        run: |
+          python -m pip download --no-deps --index-url "$ROCJITSU_INDEX" \
+            "rocm-sdk-devel==$ROCJITSU_SDK_VERSION" -d "$RUNNER_TEMP/devel"
+          mkdir -p "$ROCJITSU_DIR"
+          unzip -p "$RUNNER_TEMP"/devel/rocm_sdk_devel-*.whl rocm_sdk_devel/_devel.tar \
+            | tar x -C "$ROCJITSU_DIR" --strip-components=1 --wildcards \
+              '_rocm_sdk_devel/bin/mirage' \
+              '_rocm_sdk_devel/lib/librocjitsu.so*' \
+              '_rocm_sdk_devel/share/rocjitsu/configs/${{ matrix.config }}'
+          rm -r "$RUNNER_TEMP/devel"
+          "$ROCJITSU_DIR/bin/mirage" --version
+
+      - name: Show emulated device
+        run: >-
+          "$ROCJITSU_DIR/bin/mirage" run --in-process
+          --config "$ROCJITSU_DIR/share/rocjitsu/configs/${{ matrix.config }}" --
+          python -c 'import torch; p = torch.cuda.get_device_properties(0); print(f"{torch.version.hip=}, {p.name=}, {p.gcnArchName=}")'
+
+      - name: Run emulated GPU tests
+        run: >-
+          "$ROCJITSU_DIR/bin/mirage" run --in-process
+          --config "$ROCJITSU_DIR/share/rocjitsu/configs/${{ matrix.config }}" --
+          python -m pytest -vrxs --durations=20 tests hipequivariance_ops_torch/tests

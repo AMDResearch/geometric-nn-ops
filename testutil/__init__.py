@@ -12,8 +12,8 @@ import os
 import torch
 
 # rocjitsu emulates the GPU through an LD_PRELOAD interposer, under both its own
-# CLI and `mirage`. Emulation is orders of magnitude slower than hardware, and
-# fp64 especially so, so the fp64 oracles run on the CPU there instead.
+# CLI and `mirage`. Emulation is much slower than a real GPU, especially with
+# fp64, so the oracles run on the CPU there instead.
 EMULATED_GPU = "librocjitsu" in os.environ.get("LD_PRELOAD", "")
 ORACLE_DEVICE = "cpu" if EMULATED_GPU else None
 
@@ -45,7 +45,7 @@ def grad_targets(tensors: dict) -> dict:
 
 
 def cast_tree(tensors: dict, dtype, *, requires_grad: bool = True, device=None) -> dict:
-    """Cast a dict of tensors to fresh leaves, passing ``None`` through.
+    """Cast a dict of tensors to fresh leaves on ``device``, passing ``None`` through.
 
     ``device=None`` keeps each tensor on its own device.
     """
