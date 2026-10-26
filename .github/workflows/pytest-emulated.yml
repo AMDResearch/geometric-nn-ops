@@ -1,0 +1,74 @@
+name: Pytest Emulated
+
+on:
+  # On push for now for testing
+  push:
+
+# head_ref is set only for pull requests, so a new push to a PR cancels the
+# previous run. Pushes to main fall back to the unique run_id and so never
+# cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  pytest-emulated:
+    # Runs on an emulated AMD GPU (rocjitsu, via its `mirage` CLI) on a
+    # GPU-less hosted runner. Emulation is orders of magnitude slower than
+    # hardware, so only a selection of small tests runs here.
+    name: pytest-emulated (${{ matrix.gfx }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gfx: gfx1151
+            config: gfx1151.json
+    env:
+      ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+      ROCM_VERSION: "10.1.0"
+      TORCH_VERSION: "2.14.0+rocm10.1.0"
+      ROCJITSU_DIR: ${{ github.workspace }}/../rocjitsu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: >-
+          python -m pip install --only-binary=":all:"
+          --index-url "$ROCM_INDEX" --extra-index-url https://pypi.org/simple
+          "torch[device-${{ matrix.gfx }}]==$TORCH_VERSION"
+          -e ".[test]" -e "./hipequivariance_ops_torch[test]"
+
+      # rocjitsu ships in the ROCm devel wheel, which is a 3 GB tarball inside a
+      # wheel. `mirage` and `librocjitsu.so` only depend on the C/C++ runtime,
+      # so extract just them and the config instead of the whole SDK.
+      - name: Install rocjitsu
+        run: |
+          python -m pip download --no-deps --index-url "$ROCM_INDEX" \
+            "rocm-sdk-devel==$ROCM_VERSION" -d "$RUNNER_TEMP/devel"
+          mkdir -p "$ROCJITSU_DIR"
+          unzip -p "$RUNNER_TEMP"/devel/rocm_sdk_devel-*.whl rocm_sdk_devel/_devel.tar \
+            | tar x -C "$ROCJITSU_DIR" --strip-components=1 --wildcards \
+              '_rocm_sdk_devel/bin/mirage' \
+              '_rocm_sdk_devel/lib/librocjitsu.so*' \
+              '_rocm_sdk_devel/share/rocjitsu/configs/${{ matrix.config }}'
+          rm -r "$RUNNER_TEMP/devel"
+          "$ROCJITSU_DIR/bin/mirage" --version
+
+      - name: Show emulated device
+        run: >-
+          "$ROCJITSU_DIR/bin/mirage" run --in-process
+          --config "$ROCJITSU_DIR/share/rocjitsu/configs/${{ matrix.config }}" --
+          python -c 'import torch; p = torch.cuda.get_device_properties(0); print(f"{torch.version.hip=}, {p.name=}, {p.gcnArchName=}")'
+
+      - name: Run emulated GPU tests
+        run: >-
+          "$ROCJITSU_DIR/bin/mirage" run --in-process
+          --config "$ROCJITSU_DIR/share/rocjitsu/configs/${{ matrix.config }}" --
+          python -m pytest -vrxs --durations=20 tests/test_trimul.py
+          -k "test_mask_none or test_broadcast_mask or test_unknown_direction_is_rejected"
