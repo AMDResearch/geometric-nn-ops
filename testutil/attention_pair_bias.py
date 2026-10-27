@@ -9,7 +9,7 @@ from geometric_nn_ops_torch.triangle._reference.attention_pair_bias import (
     attention_pair_bias_torch,
 )
 
-from . import cast_tree, generator, grad_targets, seeded_randn
+from . import cast_tree, generator, grad_targets, oracle_tree, seeded_randn, to_oracle
 from .metrics import ATTENTION_PAIR_BIAS_TOL, assert_matches_oracle
 
 
@@ -119,9 +119,9 @@ def assert_agrees_with_the_oracle(
     )
     out_oracle, _, grads_oracle = fwd_bwd(
         attention_pair_bias_torch,
-        cast_tree(tensors, torch.float64),
-        grad_out.double(),
-        mask=None if mask is None else mask.double(),
+        oracle_tree(tensors),
+        to_oracle(grad_out),
+        mask=None if mask is None else to_oracle(mask),
         scale=DH**-0.5,
         **options,
     )
