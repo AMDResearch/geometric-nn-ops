@@ -22,7 +22,7 @@ from geometric_nn_ops_torch.triangle._masking import mask_val
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
     triangle_attention_torch,
 )
-from testutil import cast_tree, generator, masked_noise, seeded_randn
+from testutil import generator, masked_noise, oracle_tree, seeded_randn
 from testutil.metrics import (
     Tolerance,
     assert_matches_oracle,
@@ -598,7 +598,7 @@ def test_pairformer_shape():
     with torch.no_grad():
         out = triangle_attention(**tensors, scale=None)
         out_oracle = triangle_attention_torch(
-            **cast_tree(tensors, torch.float64, requires_grad=False), scale=None
+            **oracle_tree(tensors, requires_grad=False), scale=None
         )
 
     assert_matches_oracle(
