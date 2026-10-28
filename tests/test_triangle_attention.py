@@ -22,7 +22,7 @@ from geometric_nn_ops_torch.triangle._masking import mask_val
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
     triangle_attention_torch,
 )
-from testutil import generator, masked_noise, oracle_tree, seeded_randn
+from testutil import EMULATED_GPU, generator, masked_noise, oracle_tree, seeded_randn
 from testutil.metrics import (
     Tolerance,
     assert_matches_oracle,
@@ -161,6 +161,23 @@ def test_masked_keys_are_ignored(request, impl, dtype):
         out_perturbed = impl(**perturbed, mask=mask, scale=D**-0.5)
         unmasked = impl(**tensors, mask=None, scale=D**-0.5)
         unmasked_perturbed = impl(**perturbed, mask=None, scale=D**-0.5)
+
+    # rocjitsu before
+    # https://github.com/ROCm/rocm-systems/commit/e59f42c853e14df8718fd9dcadf6b406fd2efc08
+    # perturbs one bf16 element by an ULP here; gfx1151 hardware is exact.
+    # Remove this when the rocjitsu used in CI includes that commit.
+    if (
+        EMULATED_GPU
+        and impl is triangle_attention_triton
+        and dtype is torch.bfloat16
+        and gpu_arch() == "gfx1151"
+    ):
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="emulated gfx1151 bf16: masked v perturbs the output by one ulp",
+            )
+        )
 
     # fp16 Triton on gfx1151 is off by one ULP. Do a close test first and then
     # xfail that combination before doing the exact test.
