@@ -80,5 +80,5 @@ jobs:
         run: >-
           "$ROCJITSU_DIR/bin/mirage" run --in-process
           --config "$ROCJITSU_DIR/share/rocjitsu/configs/${{ matrix.config }}" --
-          python -m pytest -vrxs --durations=20 tests/test_trimul.py
-          -k "test_mask_none or test_broadcast_mask or test_unknown_direction_is_rejected"
+          python -m pytest -vrxs --durations=20 tests hipequivariance_ops_torch/tests
+
