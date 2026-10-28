@@ -29,6 +29,10 @@ jobs:
       ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
       ROCM_VERSION: "10.1.0"
       TORCH_VERSION: "2.14.0+rocm10.1.0"
+      # The stable releases' rocjitsu is too old for this suite, so take it
+      # from a pinned nightly. torch stays on the stable release above.
+      ROCJITSU_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
+      ROCJITSU_SDK_VERSION: "10.3.0a20261026"
       ROCJITSU_DIR: ${{ github.workspace }}/../rocjitsu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,8 +63,8 @@ jobs:
       # so extract just them and the config instead of the whole SDK.
       - name: Install rocjitsu
         run: |
-          python -m pip download --no-deps --index-url "$ROCM_INDEX" \
-            "rocm-sdk-devel==$ROCM_VERSION" -d "$RUNNER_TEMP/devel"
+          python -m pip download --no-deps --index-url "$ROCJITSU_INDEX" \
+            "rocm-sdk-devel==$ROCJITSU_SDK_VERSION" -d "$RUNNER_TEMP/devel"
           mkdir -p "$ROCJITSU_DIR"
           unzip -p "$RUNNER_TEMP"/devel/rocm_sdk_devel-*.whl rocm_sdk_devel/_devel.tar \
             | tar x -C "$ROCJITSU_DIR" --strip-components=1 --wildcards \
