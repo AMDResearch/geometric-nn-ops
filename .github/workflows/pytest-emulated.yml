@@ -22,9 +22,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every single-GPU config rocjitsu ships except gfx90a, where Triton
+        # kernels seem to hang. CDNA uses the *_kmd variants, which are the ones
+        # meant for running programs through emulated KFD.
         include:
+          - gfx: gfx942
+            config: gfx942_cdna3_kmd.json
+          - gfx: gfx950
+            config: gfx950_mi355x_kmd.json
+          - gfx: gfx1100
+            config: gfx1100_w7900.json
           - gfx: gfx1151
             config: gfx1151.json
+          - gfx: gfx1201
+            config: gfx1201_r9700.json
+          - gfx: gfx1250
+            config: gfx1250_mi455x.json
     env:
       ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
       ROCM_VERSION: "10.1.0"
