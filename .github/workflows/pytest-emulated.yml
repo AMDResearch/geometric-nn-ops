@@ -41,11 +41,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # torch depends on the `rocm` meta-package, which is published only as an
-      # sdist: its build inspects the machine to pick device dependencies.
-      # Install it first with the target pinned so the install below stays
-      # binary-only.
-      - name: Install rocm
+      - name: Install ROCm and Torch
         env:
           ROCM_SDK_TARGET_FAMILY: ${{ matrix.gfx }}
         run: >-
