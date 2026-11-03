@@ -10,13 +10,8 @@ least the required precision.
 """
 
 import torch
-
-try:
-    import triton
-
-    _TRITON_AVAILABLE = True
-except ImportError:
-    _TRITON_AVAILABLE = False
+import triton
+import triton.language as tl
 
 IEEE = "ieee"
 TF32 = "tf32"
@@ -63,8 +58,6 @@ def resolve(precision: str, allowed: tuple[str, ...]) -> str:
 
 def _allowed_dot_precisions() -> tuple[str, ...]:
     """Dot input precisions the active Triton target supports, cached per target."""
-    if not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required to query dot input precisions")
     target = triton.runtime.driver.active.get_current_target()
     if target not in _ALLOWED_BY_TARGET:
         options = triton.compiler.make_backend(target).parse_options({})
@@ -73,7 +66,7 @@ def _allowed_dot_precisions() -> tuple[str, ...]:
 
 
 def current_dot_precision(*, fp32_operands: bool) -> str:
-    """``input_precision`` to pass to ``tl.dot`` under torch's current setting.
+    """``input_precision`` to pass to ``tl_dot`` under torch's current setting.
 
     Triton ignores the mode unless the operands are fp32, so
     ``fp32_operands=False`` pins to ieee to avoid compiling a second,
@@ -82,3 +75,16 @@ def current_dot_precision(*, fp32_operands: bool) -> str:
     if not fp32_operands:
         return IEEE
     return resolve(torch_fp32_precision(), _allowed_dot_precisions())
+
+
+@triton.jit
+def tl_dot(a, b, input_precision: tl.constexpr, acc=None):
+    """``tl.dot`` but with ``input_precision`` as a required argument.
+
+    This exists so we can ban ``tl.dot`` calls without an explicit
+    ``input_precision`` using a lint rule. Note that because ``triton.jit``
+    doesn't support required keyword-only arguments (``, *, ...``) this swaps
+    the order of ``input_precision`` and ``acc``. Both should be passed as
+    keyword arguments.
+    """
+    return tl.dot(a, b, acc=acc, input_precision=input_precision)

@@ -9,8 +9,6 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 
 import torch
 
-from geometric_nn_ops_torch.triangle._kernels.dot_precision import current_dot_precision
-
 # For now we reuse this from the pure torch implementation.
 from geometric_nn_ops_torch.triangle._reference.trimul import (
     _combine_projections,
@@ -20,6 +18,10 @@ from geometric_nn_ops_torch.triangle._reference.trimul import (
 try:
     import triton
     import triton.language as tl
+
+    from geometric_nn_ops_torch.triangle._kernels.dot_precision import (
+        current_dot_precision,
+    )
 
     TRITON_AVAILABLE = True
 except ImportError:

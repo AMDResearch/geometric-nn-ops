@@ -18,7 +18,6 @@ import warnings
 
 import torch
 
-from geometric_nn_ops_torch.triangle._kernels.dot_precision import current_dot_precision
 from geometric_nn_ops_torch.triangle._masking import (
     masked_key_bias,
 )
@@ -26,6 +25,10 @@ from geometric_nn_ops_torch.triangle._masking import (
 try:
     import triton
     import triton.language as tl
+
+    from geometric_nn_ops_torch.triangle._kernels.dot_precision import (
+        current_dot_precision,
+    )
 
     _TRITON_AVAILABLE = True
 except ImportError:
