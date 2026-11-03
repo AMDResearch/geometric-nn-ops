@@ -21,8 +21,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+# For now, the shim and the kernels are released together at the same version.
 dependencies = [
-    "geometric-nn-ops-torch",
+    "geometric-nn-ops-torch==0.1.0",
     "torch>=2.4",
 ]
 
