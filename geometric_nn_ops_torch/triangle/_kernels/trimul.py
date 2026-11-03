@@ -21,6 +21,7 @@ try:
 
     from geometric_nn_ops_torch.triangle._kernels.dot_precision import (
         current_dot_precision,
+        tl_dot,
     )
 
     TRITON_AVAILABLE = True
@@ -171,7 +172,7 @@ if TRITON_AVAILABLE:
                 other=0.0,
             )
 
-            acc = tl.dot(x, w, acc, input_precision=DOT_PRECISION)
+            acc = tl_dot(x, w, acc=acc, input_precision=DOT_PRECISION)
 
         if HAS_BIAS:
             bias_offsets = rn.to(tl.int64)

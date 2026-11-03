@@ -7,6 +7,11 @@
 ``"tf32"``, but there are other reduced precision dots as well (which Torch
 itself uses in its "high" precision mode), so we use the supported mode with at
 least the required precision.
+
+Left unset, ``tl.dot`` picks tf32 where available (which on AMD is only gfx942)
+and doesn't use other reduced-precision modes (e.g. bf16x3) or respect the Torch
+precision setting. So the kernels call ``tl_dot`` instead and pass the mode from
+``current_dot_precision``. Ruff bans ``tl.dot`` everywhere else (TID251).
 """
 
 import torch
@@ -87,4 +92,4 @@ def tl_dot(a, b, input_precision: tl.constexpr, acc=None):
     the order of ``input_precision`` and ``acc``. Both should be passed as
     keyword arguments.
     """
-    return tl.dot(a, b, acc=acc, input_precision=input_precision)
+    return tl.dot(a, b, acc=acc, input_precision=input_precision)  # noqa: TID251

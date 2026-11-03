@@ -1,17 +1,8 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for fp32 matmul precision: resolution, reading it from torch, and the
-setting reaching the kernels.
+"""Tests for choosing the Triton ``tl.dot`` precision from torch's setting."""
 
-The per-op tolerances are sized for the loosest hardware, so they would pass
-even if the setting were ignored. These close that gap.
-"""
-
-import ast
-import importlib.util
-import pathlib
-import pkgutil
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,7 +16,6 @@ triton = pytest.importorskip("triton")
 import torch
 import triton.language as tl
 
-import geometric_nn_ops_torch
 from geometric_nn_ops_torch.triangle._kernels import dot_precision
 from geometric_nn_ops_torch.triangle._kernels.dot_precision import tl_dot
 from testutil.precision import torch_matmul_precision
@@ -214,48 +204,3 @@ def test_reduced_precision_is_less_accurate():
         errors[precision] = (out.double() - reference).abs().max().item()
 
     assert errors["ieee"] < errors["tf32"], errors
-
-
-# Make sure every tl.dot passes an explicit precision argument. Checking the
-# source is blunt, but it is the thing most likely to catch an oversight.
-
-
-def package_sources(package):
-    """``(module name, source path)`` for every module in ``package``.
-
-    Enumerated through the import system, so this covers exactly what the
-    package imports and avoids e.g. gitignored .py files.
-    """
-    names = [package.__name__] + [
-        info.name
-        for info in pkgutil.walk_packages(package.__path__, f"{package.__name__}.")
-    ]
-    for name in names:
-        origin = importlib.util.find_spec(name).origin
-        if origin and origin.endswith(".py"):
-            yield name, pathlib.Path(origin)
-
-
-def tl_dot_calls(path):
-    """Every ``tl.dot(...)`` call in a source file."""
-    for node in ast.walk(ast.parse(path.read_text())):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "dot"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "tl"
-        ):
-            yield node
-
-
-def test_every_tl_dot_is_given_a_precision():
-    found, missing = 0, []
-    for name, path in package_sources(geometric_nn_ops_torch):
-        for call in tl_dot_calls(path):
-            found += 1
-            if not any(kw.arg == "input_precision" for kw in call.keywords):
-                missing.append(f"{name}:{call.lineno}")
-
-    assert found, "found no tl.dot calls at all; the scan is broken"
-    assert not missing, "tl.dot without input_precision at " + ", ".join(missing)

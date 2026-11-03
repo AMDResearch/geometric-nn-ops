@@ -28,6 +28,7 @@ try:
 
     from geometric_nn_ops_torch.triangle._kernels.dot_precision import (
         current_dot_precision,
+        tl_dot,
     )
 
     _TRITON_AVAILABLE = True
@@ -140,7 +141,7 @@ if _TRITON_AVAILABLE:
                     )
 
             QK_block = (
-                tl.dot(Q_block, K_block, input_precision=DOT_PRECISION) + res_mask_block
+                tl_dot(Q_block, K_block, input_precision=DOT_PRECISION) + res_mask_block
             )
             if HAS_PAIR_BIAS:
                 QK_block += pair_bias_block
@@ -168,7 +169,9 @@ if _TRITON_AVAILABLE:
 
             P_block = P_block.to(V_block.dtype)
             O_block = O_block * alpha[:, None]
-            O_block = tl.dot(P_block, V_block, O_block, input_precision=DOT_PRECISION)
+            O_block = tl_dot(
+                P_block, V_block, acc=O_block, input_precision=DOT_PRECISION
+            )
 
             m_i = m_ij
 
@@ -737,7 +740,7 @@ if _TRITON_AVAILABLE:
 
             Q_scaled = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
             QK_block = (
-                tl.dot(Q_scaled, K_T_block, input_precision=DOT_PRECISION)
+                tl_dot(Q_scaled, K_T_block, input_precision=DOT_PRECISION)
                 + res_mask_block
             )
             if HAS_PAIR_BIAS:
@@ -765,7 +768,7 @@ if _TRITON_AVAILABLE:
             # TODO(gmnngeoffrey): rework how we do masking and avoid the need
             # for this workaround
             P_block = tl.where(res_mask_block <= -1e3, P_block / SEQ_LEN, P_block)
-            dP_block = tl.dot(dO_block, V_T_block, input_precision=DOT_PRECISION).to(
+            dP_block = tl_dot(dO_block, V_T_block, input_precision=DOT_PRECISION).to(
                 tl.float32
             )
             dS_block = P_block * (dP_block - Di[:, None])
@@ -774,7 +777,7 @@ if _TRITON_AVAILABLE:
                 dbias_block += dS_block
 
             dS_cast = dS_block.to(K_T_block.dtype)
-            dQ_block = softmax_scale * tl.dot(
+            dQ_block = softmax_scale * tl_dot(
                 dS_cast, tl.trans(K_T_block), input_precision=DOT_PRECISION
             )
             tl.atomic_add(
@@ -1011,7 +1014,7 @@ if _TRITON_AVAILABLE:
             # Compute P^T = K (scale*Q)^T. Scale qT (not K) so the recompute matches the
             # forward's M rounding; dK below keeps its scale on the fp32 dot result.
             QK_T_block = (
-                tl.dot(
+                tl_dot(
                     K_block,
                     qT_block * tl.full((1,), softmax_scale, dtype=qT_block.dtype),
                     input_precision=DOT_PRECISION,
@@ -1037,19 +1040,19 @@ if _TRITON_AVAILABLE:
                 res_mask_T_block <= -1e3, P_T_block / SEQ_LEN, P_T_block
             )
 
-            dV_block += tl.dot(
+            dV_block += tl_dot(
                 P_T_block.to(K_block.dtype),
                 dO_block,
                 input_precision=DOT_PRECISION,
             )
 
-            dpT_block = tl.dot(
+            dpT_block = tl_dot(
                 V_block, tl.trans(dO_block), input_precision=DOT_PRECISION
             ).to(tl.float32)
             dS_T_block = P_T_block * (dpT_block - Di[None, :])
             dS_T_block = dS_T_block.to(K_block.dtype)
 
-            dK_block += softmax_scale * tl.dot(
+            dK_block += softmax_scale * tl_dot(
                 dS_T_block, tl.trans(qT_block), input_precision=DOT_PRECISION
             )
 

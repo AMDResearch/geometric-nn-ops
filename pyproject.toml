@@ -121,6 +121,8 @@ notice-rgx = '(?im)^# Copyright.*Advanced Micro Devices.*\n# SPDX-License-Identi
 # unnecessary, it is on a deprecation path, and it breaks runtime annotation
 # introspection (dataclasses / typing.get_type_hints).
 "__future__.annotations".msg = "`from __future__ import annotations` is no longer recommended and is on a deprecation path; PEP 649/749 (Python 3.14) supersede it."
+# Without an explicit setting, tl.dot silently uses tf32 where supported.
+"triton.language.dot".msg = "use `tl_dot` from `geometric_nn_ops_torch.triangle._kernels.dot_precision`, which requires `input_precision`."
 
 [tool.ruff.lint.isort]
 # `utils` is `tests/utils.py`, which pytest makes importable by putting the test
