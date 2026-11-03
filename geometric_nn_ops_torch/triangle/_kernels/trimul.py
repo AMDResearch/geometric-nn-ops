@@ -9,7 +9,7 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 
 import torch
 
-from geometric_nn_ops_torch import _precision
+from geometric_nn_ops_torch.triangle._kernels import dot_precision
 
 # For now we reuse this from the pure torch implementation.
 from geometric_nn_ops_torch.triangle._reference.trimul import (
@@ -431,7 +431,7 @@ def trimul_triton(
         # The kernels index one entry per pair row, so we need to make the
         # broadcast explicit.
         m = mask.unsqueeze(-1).expand(*x.shape[:-1], 1)
-    precision = _precision.matmul_precision(fp32_operands=x.dtype == torch.float32)
+    precision = dot_precision.matmul_precision(fp32_operands=x.dtype == torch.float32)
     z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
     pg = triton_linear_fused(
         z, g_in_weight, precision, bias=g_in_bias, apply_sigmoid=True

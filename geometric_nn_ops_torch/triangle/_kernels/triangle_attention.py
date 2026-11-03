@@ -18,7 +18,7 @@ import warnings
 
 import torch
 
-from geometric_nn_ops_torch import _precision
+from geometric_nn_ops_torch.triangle._kernels import dot_precision
 from geometric_nn_ops_torch.triangle._masking import (
     masked_key_bias,
 )
@@ -1469,7 +1469,7 @@ def triangle_attention_triton(
     else:
         res_mask = masked_key_bias(mask, q.dtype).to(q.dtype)
 
-    precision = _precision.matmul_precision(fp32_operands=q.dtype == torch.float32)
+    precision = dot_precision.matmul_precision(fp32_operands=q.dtype == torch.float32)
     return TritonEvoformer(
         q,
         k,
