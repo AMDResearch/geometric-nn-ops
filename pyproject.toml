@@ -78,6 +78,10 @@ exclude_also = [
 [tool.hatch.build.targets.wheel]
 packages = ["geometric_nn_ops_torch"]
 
+# The shim is a separate distribution built from its own directory.
+[tool.hatch.build.targets.sdist]
+exclude = ["/hipequivariance_ops_torch"]
+
 [tool.ruff]
 line-length = 88  # Black/ruff default
 # Lowest supported interpreter (matches requires-python). Keeps pyupgrade (UP)
