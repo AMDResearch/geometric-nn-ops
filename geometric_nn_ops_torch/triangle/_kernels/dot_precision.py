@@ -31,14 +31,38 @@ _MODES = {
 _ALLOWED_BY_TARGET: dict[object, tuple[str, ...]] = {}
 
 
+def has_fast_reduced_precision_fp32_dot() -> bool:
+    """Whether the current device has a reduced-precision fp32 dot that is faster
+    than full fp32.
+
+    Since bf16x3 is a software emulation, Triton reports it available on many
+    targets where it's not actually faster than ieee. This mirrors
+    ``torch.cuda.is_tf32_supported``. We implement it ourselves because that
+    function's behavior varies across torch versions: it does not exist before
+    2.7, and in 2.7 it returns False for all ROCm devices. If we drop support
+    for torch<2.7, we could consider using Torch's function directly.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return arch.gcnArchName.startswith(("gfx94", "gfx95"))
+    return torch.cuda.get_device_capability() >= (8, 0)
+
+
 def torch_fp32_precision() -> str:
     """torch's current fp32 matmul precision, as ``IEEE`` or ``TF32``.
+
+    Returns ``IEEE`` on devices without a fast reduced-precision dot, whatever
+    the setting; see ``has_fast_reduced_precision_fp32_dot``.
 
     Uses ``matmul.fp32_precision`` where available. The older
     ``get_float32_matmul_precision()`` or ``matmul.allow_tf32`` raise if a
     process has mixed torch's precision APIs whereas this works no matter how
     the precision was set.
     """
+    if not has_fast_reduced_precision_fp32_dot():
+        return IEEE
     matmul = torch.backends.cuda.matmul
     if hasattr(matmul, "fp32_precision"):
         return TF32 if matmul.fp32_precision == TF32 else IEEE

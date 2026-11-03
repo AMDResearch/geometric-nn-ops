@@ -18,8 +18,8 @@ import triton.language as tl
 
 from geometric_nn_ops_torch.triangle._kernels import dot_precision
 from geometric_nn_ops_torch.triangle._kernels.dot_precision import tl_dot
-from testutil.precision import torch_matmul_precision
-from utils import requires_gpu, skip_without_reduced_precision_dot
+from testutil.precision import fast_reduced_precision_dot, torch_matmul_precision
+from utils import require_reduced_precision_dot, requires_gpu
 
 # Allowed-precision sets as the Triton backends report them, so resolution can
 # be tested without the hardware.
@@ -64,17 +64,40 @@ def test_resolve_fails_when_no_mode_is_available():
         dot_precision.resolve("tf32", ("bf16x6",))
 
 
+# Which devices have a fast reduced-precision dot.
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="needs no GPU")
+def test_reads_ieee_without_a_gpu():
+    """Make sure we don't break CPU-only environments."""
+    with torch_matmul_precision("tf32"):
+        assert not dot_precision.has_fast_reduced_precision_fp32_dot()
+        assert dot_precision.torch_fp32_precision() == "ieee"
+
+
 # Reading the precision from torch.
 
 
+@pytest.fixture
+def fast_dot():
+    with fast_reduced_precision_dot(True):
+        yield
+
+
 @pytest.mark.parametrize("precision", ["ieee", "tf32"])
-def test_follows_the_torch_setting(precision):
-    """torch's setting is the only input."""
+def test_follows_the_torch_setting(fast_dot, precision):
     with torch_matmul_precision(precision):
         assert dot_precision.torch_fp32_precision() == precision
 
 
-def test_reads_ieee_when_torch_has_no_setting():
+@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+def test_reads_ieee_without_a_fast_reduced_precision_dot(precision):
+    """Reduced precision is only used where it is faster."""
+    with fast_reduced_precision_dot(False), torch_matmul_precision(precision):
+        assert dot_precision.torch_fp32_precision() == "ieee"
+
+
+def test_reads_ieee_when_torch_has_no_setting(fast_dot):
     """torch reports "none" until something is set, which is full precision."""
     unset = SimpleNamespace(
         backends=SimpleNamespace(
@@ -86,7 +109,9 @@ def test_reads_ieee_when_torch_has_no_setting():
 
 
 @pytest.mark.parametrize(("allow_tf32", "expected"), [(True, "tf32"), (False, "ieee")])
-def test_reads_allow_tf32_on_torch_without_fp32_precision(allow_tf32, expected):
+def test_reads_allow_tf32_on_torch_without_fp32_precision(
+    fast_dot, allow_tf32, expected
+):
     """torch before 2.9 has only ``matmul.allow_tf32``. Stubbing the module is
     the only way to reach that branch on a newer torch."""
     legacy = SimpleNamespace(
@@ -98,7 +123,7 @@ def test_reads_allow_tf32_on_torch_without_fp32_precision(allow_tf32, expected):
         assert dot_precision.torch_fp32_precision() == expected
 
 
-def test_reading_the_torch_setting_leaves_the_legacy_getters_working():
+def test_reading_the_torch_setting_leaves_the_legacy_getters_working(fast_dot):
     """Reading must not break a caller still using the legacy getters. Only
     writing trips torch's mixed-API check."""
     with torch_matmul_precision("ieee"):
@@ -194,13 +219,13 @@ def test_tl_dot_computes_the_product(precision, with_acc):
 
 @requires_gpu
 def test_reduced_precision_is_less_accurate():
-    skip_without_reduced_precision_dot()
     a, b, _ = matmul_inputs()
     reference = a.double() @ b.double()
     errors = {}
-    for precision in ("tf32", "ieee"):
-        with torch_matmul_precision(precision):
-            out = matmul(a, b)
-        errors[precision] = (out.double() - reference).abs().max().item()
+    with require_reduced_precision_dot():
+        for precision in ("tf32", "ieee"):
+            with torch_matmul_precision(precision):
+                out = matmul(a, b)
+            errors[precision] = (out.double() - reference).abs().max().item()
 
     assert errors["ieee"] < errors["tf32"], errors
