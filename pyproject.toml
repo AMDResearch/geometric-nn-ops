@@ -22,9 +22,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+# Triton is not listed and we get it transitively through torch. Until the
+# Python ecosystem sorts out environment specific dependency variants, this
+# appears to be the least bad way and common practice. The package providing
+# Triton is sometimes named like `pytorch-triton-rocm` and so a dep on triton
+# here would clobber it.
 dependencies = [
     "torch>=2.4",
-    "triton>=3.0",
 ]
 
 [project.optional-dependencies]
