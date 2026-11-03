@@ -80,13 +80,13 @@ def test_resolve_fails_when_no_mode_is_available():
 def test_follows_the_torch_setting(precision):
     """torch's setting is the only input."""
     with torch_matmul_precision(precision):
-        assert dot_precision.torch_precision() == precision
+        assert dot_precision.torch_fp32_precision() == precision
 
 
 def test_reads_ieee_when_torch_has_no_setting():
     """torch reports "none" until something is set, which is full precision.
     Nothing here sets it, so this also catches a test leaving it behind."""
-    assert dot_precision.torch_precision() == "ieee"
+    assert dot_precision.torch_fp32_precision() == "ieee"
 
 
 def test_reads_allow_tf32_on_torch_without_fp32_precision():
@@ -98,16 +98,16 @@ def test_reads_allow_tf32_on_torch_without_fp32_precision():
         )
     )
     with mock.patch.object(dot_precision, "torch", legacy):
-        assert dot_precision.torch_precision() == "tf32"
+        assert dot_precision.torch_fp32_precision() == "tf32"
         legacy.backends.cuda.matmul.allow_tf32 = False
-        assert dot_precision.torch_precision() == "ieee"
+        assert dot_precision.torch_fp32_precision() == "ieee"
 
 
 def test_reading_the_torch_setting_leaves_the_legacy_getters_working():
     """Reading must not break a caller still using the legacy getters. Only
     writing trips torch's mixed-API check."""
     with torch_matmul_precision("ieee"):
-        assert dot_precision.torch_precision() == "ieee"
+        assert dot_precision.torch_fp32_precision() == "ieee"
         assert torch.get_float32_matmul_precision() == "highest"
         assert torch.backends.cuda.matmul.allow_tf32 is False
 
@@ -117,7 +117,7 @@ def test_reduced_dtypes_pin_to_ieee(precision):
     """Triton ignores input_precision unless the operands are fp32, so the ops
     pin those dtypes to ieee and compile one kernel rather than two."""
     with torch_matmul_precision(precision):
-        assert dot_precision.matmul_precision(fp32_operands=False) == "ieee"
+        assert dot_precision.current_dot_precision(fp32_operands=False) == "ieee"
 
 
 # Make sure every tl.dot passes an explicit precision argument. Checking the

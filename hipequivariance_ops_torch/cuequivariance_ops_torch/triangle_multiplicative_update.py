@@ -48,7 +48,7 @@ def _check_precision(precision) -> None:
     if precision in _NO_REQUEST:
         return
 
-    torch_precision = dot_precision.torch_precision()
+    torch_precision = dot_precision.torch_fp32_precision()
 
     if precision != torch_precision:
         if torch_precision == dot_precision.IEEE:

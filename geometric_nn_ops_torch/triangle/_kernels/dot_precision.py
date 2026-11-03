@@ -31,7 +31,7 @@ _MODES = {
 _ALLOWED_BY_TARGET: dict[object, tuple[str, ...]] = {}
 
 
-def torch_precision() -> str:
+def torch_fp32_precision() -> str:
     """torch's current fp32 matmul precision.
 
     Uses ``matmul.fp32_precision`` rather than the older
@@ -71,7 +71,7 @@ def _allowed_dot_precisions() -> tuple[str, ...]:
     return _ALLOWED_BY_TARGET[target]
 
 
-def matmul_precision(*, fp32_operands: bool) -> str:
+def current_dot_precision(*, fp32_operands: bool) -> str:
     """Mode to use for ``tl.dot`` based on torch global.
 
     Triton ignores the setting unless the operands are fp32, so
@@ -80,4 +80,4 @@ def matmul_precision(*, fp32_operands: bool) -> str:
     """
     if not fp32_operands:
         return IEEE
-    return resolve(torch_precision(), _allowed_dot_precisions())
+    return resolve(torch_fp32_precision(), _allowed_dot_precisions())

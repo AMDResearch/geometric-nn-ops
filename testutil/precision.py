@@ -13,7 +13,7 @@ def torch_matmul_precision(precision: str):
     """Set torch's fp32 matmul precision for the duration.
 
     Falls back to ``allow_tf32`` on torch versions predating
-    ``matmul.fp32_precision``, matching ``dot_precision.torch_precision``.
+    ``matmul.fp32_precision``, matching ``dot_precision.torch_fp32_precision``.
 
     Swaps a process global, torch having no scoped API, so this is not thread
     safe (hence test only). Both the forward and the backward must be called

@@ -27,7 +27,10 @@ def skip_without_reduced_precision_dot() -> None:
     tell apart.
     """
     with torch_matmul_precision("tf32"):
-        if dot_precision.matmul_precision(fp32_operands=True) == dot_precision.IEEE:
+        if (
+            dot_precision.current_dot_precision(fp32_operands=True)
+            == dot_precision.IEEE
+        ):
             pytest.skip("no reduced-precision fp32 dot on this target")
 
 

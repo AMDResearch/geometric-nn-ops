@@ -18,7 +18,7 @@ import warnings
 
 import torch
 
-from geometric_nn_ops_torch.triangle._kernels import dot_precision
+from geometric_nn_ops_torch.triangle._kernels.dot_precision import current_dot_precision
 from geometric_nn_ops_torch.triangle._masking import (
     masked_key_bias,
 )
@@ -73,7 +73,7 @@ if _TRITON_AVAILABLE:
         offs_kv: tl.constexpr,
         offs_d: tl.constexpr,
         SEQ_LEN: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
         USE_EXP2: tl.constexpr = False,
     ):
         """Run the inner loop of the forward pass of the attention mechanism."""
@@ -137,8 +137,7 @@ if _TRITON_AVAILABLE:
                     )
 
             QK_block = (
-                tl.dot(Q_block, K_block, input_precision=MATMUL_PRECISION)
-                + res_mask_block
+                tl.dot(Q_block, K_block, input_precision=DOT_PRECISION) + res_mask_block
             )
             if HAS_PAIR_BIAS:
                 QK_block += pair_bias_block
@@ -166,9 +165,7 @@ if _TRITON_AVAILABLE:
 
             P_block = P_block.to(V_block.dtype)
             O_block = O_block * alpha[:, None]
-            O_block = tl.dot(
-                P_block, V_block, O_block, input_precision=MATMUL_PRECISION
-            )
+            O_block = tl.dot(P_block, V_block, O_block, input_precision=DOT_PRECISION)
 
             m_i = m_ij
 
@@ -236,7 +233,7 @@ if _TRITON_AVAILABLE:
         BLOCK_SIZE_Q: tl.constexpr,
         BLOCK_SIZE_KV: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
         USE_EXP2: tl.constexpr = False,
     ):
         """Run the forward pass of the attention mechanism."""
@@ -336,7 +333,7 @@ if _TRITON_AVAILABLE:
             offs_kv,
             offs_d,
             SEQ_LEN,
-            MATMUL_PRECISION,
+            DOT_PRECISION,
             USE_EXP2,
         )
 
@@ -413,7 +410,7 @@ if _TRITON_AVAILABLE:
         BLOCK_SIZE_Q: tl.constexpr,
         BLOCK_SIZE_KV: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
         USE_EXP2: tl.constexpr = False,
     ):
         """Dynamic-shape forward: N_SEQ & SEQ_LEN runtime, EVEN_* off.
@@ -517,7 +514,7 @@ if _TRITON_AVAILABLE:
             offs_kv,
             offs_d,
             SEQ_LEN,
-            MATMUL_PRECISION,
+            DOT_PRECISION,
             USE_EXP2,
         )
 
@@ -661,7 +658,7 @@ if _TRITON_AVAILABLE:
         BLOCK_SIZE_KV: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
         HAS_PAIR_BIAS: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
         USE_EXP2: tl.constexpr = False,
     ):
         """dbias accumulated in registers and stored once (no atomic); dQ via
@@ -737,7 +734,7 @@ if _TRITON_AVAILABLE:
 
             Q_scaled = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
             QK_block = (
-                tl.dot(Q_scaled, K_T_block, input_precision=MATMUL_PRECISION)
+                tl.dot(Q_scaled, K_T_block, input_precision=DOT_PRECISION)
                 + res_mask_block
             )
             if HAS_PAIR_BIAS:
@@ -765,7 +762,7 @@ if _TRITON_AVAILABLE:
             # TODO(gmnngeoffrey): rework how we do masking and avoid the need
             # for this workaround
             P_block = tl.where(res_mask_block <= -1e3, P_block / SEQ_LEN, P_block)
-            dP_block = tl.dot(dO_block, V_T_block, input_precision=MATMUL_PRECISION).to(
+            dP_block = tl.dot(dO_block, V_T_block, input_precision=DOT_PRECISION).to(
                 tl.float32
             )
             dS_block = P_block * (dP_block - Di[:, None])
@@ -775,7 +772,7 @@ if _TRITON_AVAILABLE:
 
             dS_cast = dS_block.to(K_T_block.dtype)
             dQ_block = softmax_scale * tl.dot(
-                dS_cast, tl.trans(K_T_block), input_precision=MATMUL_PRECISION
+                dS_cast, tl.trans(K_T_block), input_precision=DOT_PRECISION
             )
             tl.atomic_add(
                 dQ + msa_off + qd,
@@ -836,7 +833,7 @@ if _TRITON_AVAILABLE:
         EVEN_DIM: tl.constexpr,
         BLOCK_SIZE_Q: tl.constexpr,
         BLOCK_SIZE_KV: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
         WRITE_BLLHS: tl.constexpr = False,
         USE_EXP2: tl.constexpr = False,
     ):
@@ -1014,7 +1011,7 @@ if _TRITON_AVAILABLE:
                 tl.dot(
                     K_block,
                     qT_block * tl.full((1,), softmax_scale, dtype=qT_block.dtype),
-                    input_precision=MATMUL_PRECISION,
+                    input_precision=DOT_PRECISION,
                 )
                 + pair_bias_T_block
                 + res_mask_T_block
@@ -1040,17 +1037,17 @@ if _TRITON_AVAILABLE:
             dV_block += tl.dot(
                 P_T_block.to(K_block.dtype),
                 dO_block,
-                input_precision=MATMUL_PRECISION,
+                input_precision=DOT_PRECISION,
             )
 
             dpT_block = tl.dot(
-                V_block, tl.trans(dO_block), input_precision=MATMUL_PRECISION
+                V_block, tl.trans(dO_block), input_precision=DOT_PRECISION
             ).to(tl.float32)
             dS_T_block = P_T_block * (dpT_block - Di[None, :])
             dS_T_block = dS_T_block.to(K_block.dtype)
 
             dK_block += softmax_scale * tl.dot(
-                dS_T_block, tl.trans(qT_block), input_precision=MATMUL_PRECISION
+                dS_T_block, tl.trans(qT_block), input_precision=DOT_PRECISION
             )
 
             # Increment pointers
@@ -1095,7 +1092,7 @@ if _TRITON_AVAILABLE:
             V,
             res_mask,
             pair_bias,
-            matmul_precision,
+            dot_precision,
             has_pair_bias=True,
             dynamic=False,
             softmax_scale=None,
@@ -1116,7 +1113,7 @@ if _TRITON_AVAILABLE:
             backends. Mathematically identical, but not bit-identical. The value is
             saved on ctx so the backward matches the base the forward used.
 
-            matmul_precision is the Triton dot mode. Saved on ctx so the backward
+            dot_precision is the Triton dot mode. Saved on ctx so the backward
             runs at the precision the forward did.
             """
             # Q, K, V: [Batch, N_seq, N_res, Head, Dim]
@@ -1256,7 +1253,7 @@ if _TRITON_AVAILABLE:
                 BLOCK_SIZE_Q=block_size_q,
                 BLOCK_SIZE_KV=_oss_bkv,
                 USE_EXP2=use_exp2,
-                MATMUL_PRECISION=matmul_precision,
+                DOT_PRECISION=dot_precision,
                 num_warps=4,
                 num_stages=1,
                 **_extra_even,
@@ -1269,7 +1266,7 @@ if _TRITON_AVAILABLE:
             ctx.DIM = DIM
             ctx.has_pair_bias = has_pair_bias
             ctx.use_exp2 = use_exp2
-            ctx.matmul_precision = matmul_precision
+            ctx.dot_precision = dot_precision
 
             O = O.transpose(-2, -3).contiguous()
 
@@ -1375,7 +1372,7 @@ if _TRITON_AVAILABLE:
                 **({"waves_per_eu": 2, "matrix_instr_nonkdim": 16} if is_hip() else {}),
                 WRITE_BLLHS=True,
                 USE_EXP2=ctx.use_exp2,
-                MATMUL_PRECISION=ctx.matmul_precision,
+                DOT_PRECISION=ctx.dot_precision,
             )
 
             dQ_acc = torch.zeros_like(Q, dtype=torch.float32)
@@ -1431,13 +1428,13 @@ if _TRITON_AVAILABLE:
                 **({"waves_per_eu": 2, "matrix_instr_nonkdim": 16} if is_hip() else {}),
                 HAS_PAIR_BIAS=ctx.has_pair_bias,
                 USE_EXP2=ctx.use_exp2,
-                MATMUL_PRECISION=ctx.matmul_precision,
+                DOT_PRECISION=ctx.dot_precision,
             )
 
             dQ = dQ_acc.to(Q.dtype)
             dQ = dQ.transpose(-2, -3).contiguous()
             d_pb = d_pair_bias.to(dO.dtype) if ctx.has_pair_bias else None
-            # grads: Q, K, V, res_mask, pair_bias, matmul_precision,
+            # grads: Q, K, V, res_mask, pair_bias, dot_precision,
             # has_pair_bias, dynamic, softmax_scale, use_exp2
             return dQ, dK, dV, None, d_pb, None, None, None, None, None
 
@@ -1469,14 +1466,14 @@ def triangle_attention_triton(
     else:
         res_mask = masked_key_bias(mask, q.dtype).to(q.dtype)
 
-    precision = dot_precision.matmul_precision(fp32_operands=q.dtype == torch.float32)
+    dot_precision = current_dot_precision(fp32_operands=q.dtype == torch.float32)
     return TritonEvoformer(
         q,
         k,
         v,
         res_mask,
         pair_bias,
-        precision,
+        dot_precision,
         has_pair_bias,
         dynamic,
         scale,
