@@ -8,10 +8,6 @@ The per-op tolerances are sized for the loosest hardware, so they would pass
 even if the setting were ignored. These close that gap.
 """
 
-# The kernel imports run after `importorskip` so the module skips cleanly when
-# Triton is missing; E402 (import not at top of file) is disabled accordingly.
-# ruff: noqa: E402
-
 import ast
 import importlib.util
 import pathlib
@@ -20,9 +16,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-import torch
 
 triton = pytest.importorskip("triton")
+
+# Imports after the Triton skip
+# ruff: noqa: E402
+
+import torch
 
 import geometric_nn_ops_torch
 from geometric_nn_ops_torch.triangle._kernels import dot_precision
@@ -34,12 +34,10 @@ NVIDIA_ALLOWED = ("tf32", "tf32x3", "ieee", "bf16x3", "bf16x6")
 CDNA3_ALLOWED = ("bf16x3", "bf16x6", "ieee", "tf32")
 CDNA4_ALLOWED = ("ieee", "bf16x3", "bf16x6")
 IEEE_ONLY_ALLOWED = ("ieee",)
+ALL_ALLOWED = (NVIDIA_ALLOWED, CDNA3_ALLOWED, CDNA4_ALLOWED, IEEE_ONLY_ALLOWED)
 
 
 # The resolver, as a pure function. No device needed.
-
-
-ALL_ALLOWED = (NVIDIA_ALLOWED, CDNA3_ALLOWED, CDNA4_ALLOWED, IEEE_ONLY_ALLOWED)
 
 
 @pytest.mark.parametrize(
@@ -84,23 +82,21 @@ def test_follows_the_torch_setting(precision):
 
 
 def test_reads_ieee_when_torch_has_no_setting():
-    """torch reports "none" until something is set, which is full precision.
-    Nothing here sets it, so this also catches a test leaving it behind."""
+    """torch reports "none" until something is set, which is full precision."""
     assert dot_precision.torch_fp32_precision() == "ieee"
 
 
-def test_reads_allow_tf32_on_torch_without_fp32_precision():
-    """The package supports torch back to 2.4, before ``fp32_precision`` existed.
-    Stubbing the module is the only way to reach that branch on a modern torch."""
+@pytest.mark.parametrize(("allow_tf32", "expected"), [(True, "tf32"), (False, "ieee")])
+def test_reads_allow_tf32_on_torch_without_fp32_precision(allow_tf32, expected):
+    """torch before 2.9 has only ``matmul.allow_tf32``. Stubbing the module is
+    the only way to reach that branch on a newer torch."""
     legacy = SimpleNamespace(
         backends=SimpleNamespace(
-            cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=True))
+            cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=allow_tf32))
         )
     )
     with mock.patch.object(dot_precision, "torch", legacy):
-        assert dot_precision.torch_fp32_precision() == "tf32"
-        legacy.backends.cuda.matmul.allow_tf32 = False
-        assert dot_precision.torch_fp32_precision() == "ieee"
+        assert dot_precision.torch_fp32_precision() == expected
 
 
 def test_reading_the_torch_setting_leaves_the_legacy_getters_working():
@@ -114,8 +110,6 @@ def test_reading_the_torch_setting_leaves_the_legacy_getters_working():
 
 @pytest.mark.parametrize("precision", ["ieee", "tf32"])
 def test_reduced_dtypes_pin_to_ieee(precision):
-    """Triton ignores input_precision unless the operands are fp32, so the ops
-    pin those dtypes to ieee and compile one kernel rather than two."""
     with torch_matmul_precision(precision):
         assert dot_precision.current_dot_precision(fp32_operands=False) == "ieee"
 

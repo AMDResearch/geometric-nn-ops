@@ -3,9 +3,10 @@
 
 """Honors torch's fp32 matmul precision setting in the Triton kernels.
 
-``torch.backends.cuda.matmul.fp32_precision`` selects ``"ieee"`` or ``"tf32"``.
-Which reduced-precision dot a target actually has varies so this resolves to the
-fastest supported mode with at least the required precision.
+``torch.backends.cuda.matmul.fp32_precision`` has values ``"ieee"`` or
+``"tf32"``, but there are other reduced precision dots as well (which Torch
+itself uses in its "high" precision mode), so we use the supported mode with at
+least the required precision.
 """
 
 import torch
@@ -21,8 +22,7 @@ IEEE = "ieee"
 TF32 = "tf32"
 
 # Triton dot modes for each setting, fastest first. Every chain ends at "ieee",
-# which all backends support, so resolution always succeeds and never lands on
-# something less accurate than asked for.
+# which all backends support, so resolution should always succeed.
 _MODES = {
     TF32: ("tf32", "bf16x3", "ieee"),
     IEEE: ("ieee",),
@@ -32,16 +32,17 @@ _ALLOWED_BY_TARGET: dict[object, tuple[str, ...]] = {}
 
 
 def torch_fp32_precision() -> str:
-    """torch's current fp32 matmul precision.
+    """torch's current fp32 matmul precision, as ``IEEE`` or ``TF32``.
 
-    Uses ``matmul.fp32_precision`` rather than the older
-    ``get_float32_matmul_precision()`` or ``matmul.allow_tf32``: those raise if
-    a process has mixed torch's precision APIs whereas this works no matter how
+    Uses ``matmul.fp32_precision`` where available. The older
+    ``get_float32_matmul_precision()`` or ``matmul.allow_tf32`` raise if a
+    process has mixed torch's precision APIs whereas this works no matter how
     the precision was set.
     """
-    if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-        return TF32 if torch.backends.cuda.matmul.fp32_precision == TF32 else IEEE
-    return TF32 if torch.backends.cuda.matmul.allow_tf32 else IEEE
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        return TF32 if matmul.fp32_precision == TF32 else IEEE
+    return TF32 if matmul.allow_tf32 else IEEE
 
 
 def resolve(precision: str, allowed: tuple[str, ...]) -> str:
@@ -61,7 +62,7 @@ def resolve(precision: str, allowed: tuple[str, ...]) -> str:
 
 
 def _allowed_dot_precisions() -> tuple[str, ...]:
-    """Allowed tl.dot input precisions the active device supports, cached per target."""
+    """Dot input precisions the active Triton target supports, cached per target."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required to query dot input precisions")
     target = triton.runtime.driver.active.get_current_target()
@@ -72,10 +73,10 @@ def _allowed_dot_precisions() -> tuple[str, ...]:
 
 
 def current_dot_precision(*, fp32_operands: bool) -> str:
-    """Mode to use for ``tl.dot`` based on torch global.
+    """``input_precision`` to pass to ``tl.dot`` under torch's current setting.
 
-    Triton ignores the setting unless the operands are fp32, so
-    ``fp32_operands=False`` pins to ieee rather than compiling a second,
+    Triton ignores the mode unless the operands are fp32, so
+    ``fp32_operands=False`` pins to ieee to avoid compiling a second,
     identical kernel.
     """
     if not fp32_operands:
