@@ -18,6 +18,10 @@ name: release
 # requires updating all four publishers.
 
 on:
+  # TEMPORARY: For testing TestPyPI releases prior to merging. Remove before
+  # merging.
+  push:
+    tags: ["test-v*"]
   workflow_dispatch:
 
 permissions:
