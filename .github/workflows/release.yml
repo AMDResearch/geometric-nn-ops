@@ -5,15 +5,13 @@ name: release
 #
 #     git tag v0.1.0rc1 <commit> && git push <remote> v0.1.0rc1
 #
-# The tag must be vVERSION, with VERSION X.Y.Z or X.Y.Z{a,b,rc}N.
-#
-# `index` selects where to publish. Both run the same steps except that
-# `testpypi` publishes to TestPyPI, takes a test-vVERSION tag instead,
-# skips the GitHub release, and accepts tags that are not on main, so it can
-# rehearse a release of unmerged changes without using up release tags. With
-# `pypi`, the tag must be on main, and the workflow creates a GitHub release for
-# the tag with the sdists and wheels attached before publishing. a, b and rc
-# versions are marked as GitHub pre-releases and not as the latest release.
+# The tag selects where to publish. vVERSION publishes to PyPI and test-vVERSION
+# to TestPyPI, with VERSION X.Y.Z or X.Y.Z{a,b,rc}N. Both run the same steps
+# except that a test-v tag publishes to TestPyPI, skips the GitHub release, and
+# may be for a commit not on main. A v tag must be on main, and the workflow
+# creates a GitHub release for it with the sdists and wheels attached before
+# publishing to PyPI. a, b and rc versions are marked as GitHub pre-releases and
+# not as the latest release.
 #
 # PyPI and TestPyPI Trusted Publishing for both projects are bound to this
 # file's name and to the `pypi` and `testpypi` environments. Renaming the file
@@ -21,12 +19,6 @@ name: release
 
 on:
   workflow_dispatch:
-    inputs:
-      index:
-        description: Package index to publish to.
-        type: choice
-        options: [testpypi, pypi]
-        default: testpypi
 
 permissions:
   contents: read
@@ -43,33 +35,33 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     outputs:
+      # The environment and package index to publish to: pypi or testpypi.
+      index: ${{ steps.check.outputs.index }}
       prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - name: Check the tag
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
-          INDEX: ${{ inputs.index }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           if [[ "$GITHUB_REF_TYPE" != tag ]]; then
-            echo "::error::Dispatch this workflow on a release tag, not $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+            echo "::error::Run this workflow on a release tag, not $GITHUB_REF_TYPE $GITHUB_REF_NAME"
             exit 1
           fi
-          if [[ "$INDEX" == pypi ]]; then
-            tag="v$VERSION"
-          else
-            tag="test-v$VERSION"
-          fi
-          if [[ "$GITHUB_REF_NAME" != "$tag" ]]; then
-            echo "::error::Expected tag $tag for $INDEX at package version $VERSION, got $GITHUB_REF_NAME"
-            exit 1
-          fi
+          case "$GITHUB_REF_NAME" in
+            "v$VERSION") index=pypi ;;
+            "test-v$VERSION") index=testpypi ;;
+            *)
+              echo "::error::Tag $GITHUB_REF_NAME must be v$VERSION (PyPI) or test-v$VERSION (TestPyPI) for package version $VERSION"
+              exit 1
+              ;;
+          esac
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
             echo "::error::Release version $VERSION is not X.Y.Z or X.Y.Z{a,b,rc}N"
             exit 1
           fi
-          if [[ "$INDEX" == pypi ]]; then
+          if [[ "$index" == pypi ]]; then
             # "identical" or "ahead" means the tagged commit is an ancestor of main.
             status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)
             if [[ "$status" != identical && "$status" != ahead ]]; then
@@ -77,6 +69,7 @@ jobs:
               exit 1
             fi
           fi
+          echo "index=$index" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           else
@@ -101,7 +94,7 @@ jobs:
         # workflow as possible. It also allows us to avoid GitHub's weird
         # behavior with jobs that depend on skipped jobs
         # (https://github.com/orgs/community/discussions/45058)
-        if: inputs.index == 'pypi'
+        if: needs.check.outputs.index == 'pypi'
         env:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ needs.check.outputs.prerelease }}
@@ -121,9 +114,9 @@ jobs:
   # can create at most one new project. The shim goes second because it pins the
   # kernels' exact version and must not be published without them.
   publish-kernels:
-    needs: github-release
+    needs: [check, github-release]
     runs-on: ubuntu-24.04
-    environment: ${{ inputs.index }}
+    environment: ${{ needs.check.outputs.index }}
     permissions:
       id-token: write
     steps:
@@ -135,15 +128,15 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: >-
-            ${{ inputs.index == 'testpypi'
-                && 'https://test.pypi.org/legacy/'
-                || 'https://upload.pypi.org/legacy/' }}
+            ${{ needs.check.outputs.index == 'pypi'
+                && 'https://upload.pypi.org/legacy/'
+                || 'https://test.pypi.org/legacy/' }}
           print-hash: true
 
   publish-shim:
-    needs: publish-kernels
+    needs: [check, publish-kernels]
     runs-on: ubuntu-24.04
-    environment: ${{ inputs.index }}
+    environment: ${{ needs.check.outputs.index }}
     permissions:
       id-token: write
     steps:
@@ -155,7 +148,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: >-
-            ${{ inputs.index == 'testpypi'
-                && 'https://test.pypi.org/legacy/'
-                || 'https://upload.pypi.org/legacy/' }}
+            ${{ needs.check.outputs.index == 'pypi'
+                && 'https://upload.pypi.org/legacy/'
+                || 'https://test.pypi.org/legacy/' }}
           print-hash: true
