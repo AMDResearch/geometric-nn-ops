@@ -1175,6 +1175,7 @@ if _TRITON_AVAILABLE:
                 extra_kern_args = {
                     "waves_per_eu": waves_per_eu,
                     "allow_flush_denorm": True,
+                    "matrix_instr_nonkdim": 16,
                 }
             else:
                 # MFMA/waves_per_eu tunings are HIP-only; on other backends the
