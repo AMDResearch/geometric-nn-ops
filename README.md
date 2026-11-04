@@ -42,6 +42,10 @@ matmul the target has with at least TF32 precision — TF32 tensor cores on NVID
 Ampere and above, XF32 MFMA on AMD CDNA3, bf16 emulation elsewhere — and to full
 fp32 where there is none.
 
+On AMD/HIP, triangle attention's specialized and dynamic forward kernels use
+`matrix_instr_nonkdim=16`. This selects the MFMA tile size without changing the
+matmul precision policy. NVIDIA forward launches are unchanged.
+
 ## Packages in this repo
 
 This repo ships two separately-installable packages:
