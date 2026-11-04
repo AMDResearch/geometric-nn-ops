@@ -15,11 +15,10 @@ on:
         description: The version both packages are built at.
         value: ${{ jobs.build.outputs.version }}
 
-# head_ref is set only for pull requests, so a new push to a PR cancels the
-# previous run. Pushes to main and calls from release.yml fall back to the
+# A new push to a PR cancels the previous run. Pushes to main fall back to the
 # unique run_id and so never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -28,6 +27,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:

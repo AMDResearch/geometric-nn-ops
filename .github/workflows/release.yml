@@ -38,6 +38,7 @@ jobs:
   check:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     outputs:
       # The environment and package index to publish to: pypi or testpypi.
       index: ${{ steps.check.outputs.index }}
@@ -83,6 +84,7 @@ jobs:
   github-release:
     needs: check
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -120,6 +122,7 @@ jobs:
   publish-kernels:
     needs: [check, github-release]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: ${{ needs.check.outputs.index }}
     permissions:
       id-token: write
@@ -140,6 +143,7 @@ jobs:
   publish-shim:
     needs: [check, publish-kernels]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: ${{ needs.check.outputs.index }}
     permissions:
       id-token: write
