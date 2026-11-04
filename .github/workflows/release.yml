@@ -8,8 +8,9 @@ name: release
 # The tag must be vVERSION, with VERSION X.Y.Z or X.Y.Z{a,b,rc}N.
 #
 # `index` selects where to publish. Both run the same steps except that
-# `testpypi` publishes to TestPyPI, skips the GitHub release, and accepts tags
-# that are not on main, so it can rehearse a release of unmerged changes. With
+# `testpypi` publishes to TestPyPI, takes a test-vVERSION tag instead,
+# skips the GitHub release, and accepts tags that are not on main, so it can
+# rehearse a release of unmerged changes without using up release tags. With
 # `pypi`, the tag must be on main, and the workflow creates a GitHub release for
 # the tag with the sdists and wheels attached before publishing. a, b and rc
 # versions are marked as GitHub pre-releases and not as the latest release.
@@ -55,8 +56,13 @@ jobs:
             echo "::error::Dispatch this workflow on a release tag, not $GITHUB_REF_TYPE $GITHUB_REF_NAME"
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match the package version $VERSION"
+          if [[ "$INDEX" == pypi ]]; then
+            tag="v$VERSION"
+          else
+            tag="test-v$VERSION"
+          fi
+          if [[ "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "::error::Expected tag $tag for $INDEX at package version $VERSION, got $GITHUB_REF_NAME"
             exit 1
           fi
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
