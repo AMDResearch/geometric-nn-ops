@@ -33,6 +33,7 @@ c_z == D`` and no projection biases.
 
 import torch
 
+from geometric_nn_ops_torch import _precision
 from geometric_nn_ops_torch.triangle._reference.trimul import is_outgoing
 
 # Note: The limit for the number of tiles along grid.x is `2^32` whereas for the
@@ -212,6 +213,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        MATMUL_PRECISION: tl.constexpr,
     ):
         """gate = A @ W_g.T; proj = A @ W_p.T; out = sigmoid(gate)*proj*mask.
 
@@ -247,8 +249,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_g = tl.dot(A, W_g, acc_g)
-            acc_p = tl.dot(A, W_p, acc_p)
+            acc_g = tl.dot(A, W_g, acc_g, input_precision=MATMUL_PRECISION)
+            acc_p = tl.dot(A, W_p, acc_p, input_precision=MATMUL_PRECISION)
 
         gate_sigmoid = 1.0 / (1.0 + tl.exp(-acc_g))
         result = gate_sigmoid * acc_p
@@ -304,6 +306,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        MATMUL_PRECISION: tl.constexpr,
     ):
         """out = sigmoid(A @ W_g.T) * (A_p @ W_p.T), row-major [M, N].
 
@@ -346,8 +349,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_g = tl.dot(A, W_g, acc_g)
-            acc_p = tl.dot(A_p, W_p, acc_p)
+            acc_g = tl.dot(A, W_g, acc_g, input_precision=MATMUL_PRECISION)
+            acc_p = tl.dot(A_p, W_p, acc_p, input_precision=MATMUL_PRECISION)
 
         gate_sigmoid = 1.0 / (1.0 + tl.exp(-acc_g))
         result = gate_sigmoid * acc_p
@@ -396,6 +399,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        MATMUL_PRECISION: tl.constexpr,
     ):
         """Two fused input-projection backwards (a and b) in one launch.
 
@@ -477,8 +481,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_p = tl.dot(Z, W_p, acc_p)
-            acc_g = tl.dot(Z, W_g, acc_g)
+            acc_p = tl.dot(Z, W_p, acc_p, input_precision=MATMUL_PRECISION)
+            acc_g = tl.dot(Z, W_g, acc_g, input_precision=MATMUL_PRECISION)
 
         m = tl.load(mask_ptr + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
         d_out = tl.load(
@@ -526,6 +530,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        MATMUL_PRECISION: tl.constexpr,
     ):
         """Fused output-projection backward pointwise grads.
 
@@ -577,8 +582,8 @@ if TRITON_AVAILABLE:
                 mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
                 other=0.0,
             )
-            acc_p = tl.dot(X, W_p, acc_p)
-            acc_g = tl.dot(Z, W_g, acc_g)
+            acc_p = tl.dot(X, W_p, acc_p, input_precision=MATMUL_PRECISION)
+            acc_g = tl.dot(Z, W_g, acc_g, input_precision=MATMUL_PRECISION)
 
         d_out = tl.load(
             Dout_ptr + offs_m_i64[:, None] * stride_Di + offs_n[None, :] * stride_Dj,
@@ -922,11 +927,14 @@ def _transpose_channel_last_to_major(x_cl, Bflat, C, R):
 # ---------------------------------------------------------------------------
 
 
-def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_flat):
+def _proj_in_bwd_pointwise_dual(
+    z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_flat, matmul_precision
+):
     """Both input-projection backwards in one launch.
 
     z_n: [M, D]. Wp_t2/Wg_t2: [2, D, D] = stacked a/b W^T (K, N) contiguous.
     d_out_a/d_out_b: [M, D] (possibly strided views). mask_col_flat: [M], compute dtype.
+    matmul_precision: tl.dot mode for the recompute GEMMs.
     Returns d_all: [M, 4, D] in the compute dtype, proj axis ordered
     [d_ap_a, d_ag_a, d_ap_b, d_ag_b]. Reshaped to [M, 4D] the transpose-GEMM
     against z_n yields all four weight grads in one launch (see kernel docstring).
@@ -969,17 +977,19 @@ def _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_out_a, d_out_b, mask_col_fl
         BLOCK_M=fg["BLOCK_M"],
         BLOCK_N=fg["BLOCK_N"],
         BLOCK_K=fg["BLOCK_K"],
+        MATMUL_PRECISION=matmul_precision,
         num_warps=fg["num_warps"],
         num_stages=fg["num_stages"],
     )
     return d_all
 
 
-def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
+def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out, matmul_precision):
     """Fused recompute + sigmoid-derivative for the output-projection backward.
 
     z_n / x_n: [M, D] (compute dtype); gate input / proj input respectively.
     Wp_t/Wg_t: [D, D] = W^T (K, N) contiguous. d_out: [M, D] (compute dtype).
+    matmul_precision: tl.dot mode for the recompute GEMMs.
     Returns (d_proj, d_g_pre), each [M, D] in the compute dtype.
     """
     M, K = z_n.shape
@@ -1016,6 +1026,7 @@ def _proj_out_bwd_pointwise(z_n, x_n, Wp_t, Wg_t, d_out):
         BLOCK_M=fg["BLOCK_M"],
         BLOCK_N=fg["BLOCK_N"],
         BLOCK_K=fg["BLOCK_K"],
+        MATMUL_PRECISION=matmul_precision,
         num_warps=fg["num_warps"],
         num_stages=fg["num_stages"],
     )
@@ -1055,6 +1066,9 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         N = z.shape[-3]
         D = z.shape[-1]
         compute_dtype = z.dtype
+        matmul_precision = _precision.matmul_precision(
+            fp32_operands=compute_dtype == torch.float32
+        )
 
         # Cast weights to compute dtype.
         p_in_weight = p_in_weight.to(compute_dtype)
@@ -1109,6 +1123,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             False,
             a_cm,
             a_cm,
+            MATMUL_PRECISION=matmul_precision,
             **fg,
         )
         _fused_gemm_sigmoid_multiply_channel_major[proj_grid](
@@ -1133,6 +1148,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             False,
             b_cm,
             b_cm,
+            MATMUL_PRECISION=matmul_precision,
             **fg,
         )
 
@@ -1184,6 +1200,7 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
             D,
             False,  # SAVE_G
             None,  # G_ptr: unused when SAVE_G=False (constexpr branch compiled out)
+            MATMUL_PRECISION=matmul_precision,
             **fg,
         )
 
@@ -1210,6 +1227,9 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         )
         ctx.outgoing = outgoing
         ctx.eps = eps
+        # The backward recomputes the projections, so it has to use the
+        # forward's mode even if torch's setting changed in between.
+        ctx.matmul_precision = matmul_precision
         ctx.B = B
         ctx.N = N
         ctx.D = D
@@ -1264,7 +1284,12 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         Wz_t = Wz.T.contiguous()  # [K, N] = [D, D]
         Wg_out_t = Wg_out.T.contiguous()
         d_proj, d_g_pre = _proj_out_bwd_pointwise(
-            z_n, x_n, Wz_t, Wg_out_t, grad_out_flat.to(cdtype).contiguous()
+            z_n,
+            x_n,
+            Wz_t,
+            Wg_out_t,
+            grad_out_flat.to(cdtype).contiguous(),
+            ctx.matmul_precision,
         )
 
         d_p_out_weight = d_proj.T @ x_n  # [D, D]
@@ -1362,7 +1387,9 @@ class _TriangleMultiplicativeUpdateFn(torch.autograd.Function):
         # the channel-major combine grad; the kernel reads them via their own
         # strides, so no copy here. Output is [M, 4, D] interleaved along the
         # proj axis: [d_ap_a, d_ag_a, d_ap_b, d_ag_b].
-        d_all = _proj_in_bwd_pointwise_dual(z_n, Wp_t2, Wg_t2, d_a, d_b, mask_flat)
+        d_all = _proj_in_bwd_pointwise_dual(
+            z_n, Wp_t2, Wg_t2, d_a, d_b, mask_flat, ctx.matmul_precision
+        )
         del d_a, d_b
 
         Wap = Wp_in[:D]
