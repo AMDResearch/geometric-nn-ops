@@ -86,7 +86,7 @@ pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's f
 | -------------------------------- | -------------------------------------- | ----------------------------------------------- |
 | `triangle_attention`             | yes                                    | yes                                             |
 | `triangle_multiplicative_update` | yes                                    | yes (torch fallback; native Triton bwd pending) |
-| `attention_pair_bias`            | yes (pure torch; no Triton kernel yet) | yes (pure torch; no Triton kernel yet)          |
+| `attention_pair_bias`            | yes                                    | yes                                             |
 
 ## License
 

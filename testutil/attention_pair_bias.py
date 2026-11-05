@@ -83,6 +83,38 @@ def make_key_mask(
     return mask.to(dtype)
 
 
+def assert_forward_agrees_with_the_oracle(
+    tensors, dtype, *, impl, label, precision="ieee", tol=None, **options
+):
+    """Run the ``impl`` at ``dtype`` and the reference in fp64, compare the
+    forward output only.
+
+    Runs under ``torch.inference_mode``, as serving does. ``precision`` only
+    selects the tolerance; the caller sets it on torch.
+    """
+    DH = tensors["q"].shape[-1]
+    mask = options.pop("mask", None)
+    with torch.inference_mode():
+        out, _ = impl(
+            **cast_tree(tensors, dtype, requires_grad=False),
+            mask=mask,
+            scale=DH**-0.5,
+            **options,
+        )
+        out_oracle, _ = attention_pair_bias_torch(
+            **cast_tree(tensors, torch.float64, requires_grad=False),
+            mask=None if mask is None else mask.double(),
+            scale=DH**-0.5,
+            **options,
+        )
+
+    assert_matches_oracle(
+        [("out", out, out_oracle)],
+        tol or ATTENTION_PAIR_BIAS_TOL[dtype, precision],
+        label=f"{label}/{dtype}",
+    )
+
+
 def fwd_bwd(implementation, tensors, grad_out, **options):
     out, _ = implementation(**tensors, **options)
     targets = grad_targets(tensors)

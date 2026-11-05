@@ -1,11 +1,52 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Functional attention_pair_bias."""
+"""Functional attention_pair_bias.
+
+Two backends with identical math: the Triton path in
+``_kernels.attention_pair_bias`` and the pure-torch reference, which also serves
+as the numerical oracle in the tests. Dispatch picks the torch path off CUDA,
+without Triton, for fp64, for non-square attention, and below a size where the
+Triton path's fixed launch overhead outweighs its savings.
+"""
 
 import torch
 
+from ._kernels.attention_pair_bias import TRITON_AVAILABLE, attention_pair_bias_triton
 from ._reference.attention_pair_bias import attention_pair_bias_torch
+
+__all__ = ["attention_pair_bias"]
+
+# Dtypes the Triton kernels compile for. Their accumulators are fp32 and would
+# throw away fp64's precision, so fp64 takes the torch path.
+_TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+# Size gate. The Triton path has a roughly fixed launch-overhead floor, so at
+# small shapes the torch path, whose cost scales with the work, is faster. The
+# crossover is captured by an estimate of the N^2-scaling part of the work:
+#
+#     work = U * V * (Zc + M * H)
+#
+# i.e. the z LayerNorm (U*V*Zc) plus the attention (U*V*M*H). Zc drops out when
+# z is already projected. Training has a higher threshold because the backward
+# adds kernels. Calibrated on MI300X (H=16, DH=48, Zc=128) for U == V.
+_TRAIN_TRITON_MIN_WORK = 55_000_000
+_INFER_TRITON_MIN_WORK = 40_000_000
+
+
+def _use_torch_path(q, k, z, z_is_projected: bool, training: bool) -> bool:
+    """Whether to run the torch reference rather than the Triton path."""
+    if not TRITON_AVAILABLE or not q.is_cuda or q.dtype not in _TRITON_DTYPES:
+        return True
+    BM, H, U, _ = q.shape
+    V = k.shape[2]
+    if U != V:
+        return True
+    M = BM // z.shape[0]
+    Zc = 0 if z_is_projected else z.shape[-1]
+    work = U * V * (Zc + M * H)
+    threshold = _TRAIN_TRITON_MIN_WORK if training else _INFER_TRITON_MIN_WORK
+    return work < threshold
 
 
 def attention_pair_bias(
@@ -77,7 +118,25 @@ def attention_pair_bias(
 
     fp32 matmuls follow ``torch.backends.cuda.matmul.fp32_precision``.
     """
-    return attention_pair_bias_torch(
+    tensors = (
+        s,
+        q,
+        k,
+        v,
+        z,
+        proj_g_weight,
+        proj_o_weight,
+        proj_z_weight,
+        ln_z_weight,
+        proj_g_bias,
+        proj_o_bias,
+    )
+    training = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in tensors
+    )
+    use_torch = _use_torch_path(q, k, z, z_is_projected, training)
+    impl = attention_pair_bias_torch if use_torch else attention_pair_bias_triton
+    return impl(
         s,
         q,
         k,
