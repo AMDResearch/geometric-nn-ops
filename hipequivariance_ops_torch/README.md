@@ -65,8 +65,8 @@ GitHub.
 # Install PyTorch and Triton for your environment, e.g. following https://pytorch.org/get-started/locally/
 git clone https://github.com/AMDResearch/geometric-nn-ops.git
 cd geometric-nn-ops/
-pip install --no-deps -e .  # the kernels (required)
-pip install --no-deps -e hipequivariance_ops_torch  # this shim (provides cuequivariance_ops_torch module)
+pip install -e .  # the kernels (required)
+pip install -e hipequivariance_ops_torch  # this shim (provides cuequivariance_ops_torch module)
 pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's frontend python
 # do NOT install cuequivariance-ops-torch-cu12 / -cu13
 ```
