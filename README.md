@@ -5,12 +5,30 @@ written in Triton that run on both AMD/ROCm and NVIDIA.
 
 Kernels are namespaced by family:
 
-- `geometric_nn_ops_torch.triangle` — protein-folding (triangle) ops. **In
-  scope.**
+- `geometric_nn_ops_torch.triangle` — protein-folding (triangle) ops.
   - `triangle_attention` (forward + backward)
   - `triangle_multiplicative_update` (Triton forward; pure-torch differentiable
     fallback)
   - `attention_pair_bias` (pure torch; no Triton kernel yet)
+
+## Install
+
+Install PyTorch for your platform first, following
+[the PyTorch instructions](https://pytorch.org/get-started/locally/). Otherwise
+pip installs the default PyTorch build from PyPI, which on Linux targets NVIDIA
+CUDA rather than AMD ROCm.
+
+```bash
+pip install geometric-nn-ops-torch
+```
+
+For an editable install from source instead:
+
+```bash
+git clone https://github.com/AMDResearch/geometric-nn-ops.git
+cd geometric-nn-ops/
+pip install -e .  # the kernels
+```
 
 ## Usage
 
@@ -42,20 +60,22 @@ matmul the target has with at least TF32 precision — TF32 tensor cores on NVID
 Ampere and above, XF32 MFMA on AMD CDNA3, bf16 emulation elsewhere — and to full
 fp32 where there is none.
 
-## Packages in this repo
+## Packages
 
-This repo ships two separately-installable packages:
+The [geometric-nn-ops](https://github.com/AMDResearch/geometric-nn-ops)
+repository publishes two separately installable packages:
 
-- **`geometric-nn-ops-torch`**: the portable Triton kernels and their direct,
-  vendor-neutral API. This is the recommended dependency.
-- **`hipequivariance-ops-torch`**: an optional zero-code-change shim that
-  implements the API of NVIDIA's `cuequivariance_ops_torch` under the same
-  module name routes into these kernels. It translates any API differences. See
-  [hipequivariance_ops_torch/README.md](./hipequivariance_ops_torch/README.md).
-  This is provided as a convenience for codebases already integrated with
-  `cuequivariance`. For long term stability, we suggest using the direct
-  dependency where possible.
+- [`geometric-nn-ops-torch`](https://pypi.org/project/geometric-nn-ops-torch/):
+  the portable Triton kernels and their direct, vendor-neutral API. This is the
+  recommended dependency.
+- [`hipequivariance-ops-torch`](https://pypi.org/project/hipequivariance-ops-torch/):
+  an optional zero-code-change shim that implements the API of NVIDIA's
+  `cuequivariance_ops_torch` under the same module name and routes into these
+  kernels. It translates any API differences. This is provided as a convenience
+  for codebases already integrated with `cuequivariance`. For long term
+  stability, we suggest using the direct dependency where possible.
 
 ## License
 
-Apache-2.0. Copyright Advanced Micro Devices, Inc. See [LICENSE](./LICENSE).
+Apache-2.0. Copyright Advanced Micro Devices, Inc. See
+[LICENSE](https://github.com/AMDResearch/geometric-nn-ops/blob/main/LICENSE).
