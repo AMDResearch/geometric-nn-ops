@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hipequivariance-ops-torch"
-version = "0.1.0"
+version = "0.1.2"
 description = "Zero-code-change cuequivariance_ops_torch shim for AMD ROCm, backed by geometric-nn-ops Triton kernels."
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ classifiers = [
 # For now, the shim and the kernels are released together at the same version.
 # The build workflow checks that this pin matches both versions.
 dependencies = [
-    "geometric-nn-ops-torch==0.1.0",
+    "geometric-nn-ops-torch==0.1.2",
     "torch>=2.4",
 ]
 
