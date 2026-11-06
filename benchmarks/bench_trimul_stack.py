@@ -12,6 +12,10 @@ alternate`` runs the outgoing and incoming updates in turn, as the trunk does.
 ``--backends`` names an implementation, as in ``bench_trimul_micro.py``. The
 Triton path is forward-only, so its training columns are empty.
 
+Experimental backends use ``experimental:<variant>`` and ``--dtype fp32``.
+Each layer and the residual stack must pass strict bounded-oracle checks
+before inference timing. No experimental training timings are reported.
+
 Usage:
     python benchmarks/bench_trimul_stack.py \
         --depth 48 --directions alternate --sizes 384
@@ -37,12 +41,18 @@ from _bench_common import (
 )
 from _trimul_common import (
     BASELINE,
+    EXPERIMENTAL_BACKENDS,
     TRIMUL_IMPLEMENTATIONS,
     add_backend_argument,
     add_shape_arguments,
+    assert_qualified,
+    benchmark_source_sha256,
+    configure_experiments,
+    qualify_experimental,
 )
 from triton.testing import do_bench
 
+from geometric_nn_ops_torch.triangle.experimental import run_variant
 from testutil import seeded_randn
 from testutil.trimul import TrimulStack, make_pair_input
 
@@ -63,6 +73,9 @@ def bench_case(
         dtype,
         biases=biases,
     )
+    experimental = backend in EXPERIMENTAL_BACKENDS
+    if experimental:
+        model.requires_grad_(False)
     x, mask = make_pair_input(1, n, channels, "cuda", dtype, seed=4, requires_grad=True)
     grad_out = seeded_randn(*x.shape, device="cuda", dtype=dtype, seed=41)
 
@@ -77,13 +90,27 @@ def bench_case(
 
     if not torch.isfinite(infer_step()).all():
         raise RuntimeError("non-finite output")
+    if experimental:
+        with torch.no_grad():
+            candidate, oracle = x.detach(), x.detach()
+            for layer in model.layers:
+                weights = {name: getattr(layer, name) for name in layer.parameter_names}
+                update = qualify_experimental(
+                    layer.impl, candidate, layer.direction, mask, weights
+                )
+                candidate = candidate + update
+                oracle = oracle + run_variant(
+                    "reference_bounded", oracle, layer.direction, mask, **weights
+                )
+                assert_qualified(candidate, oracle)
+        del candidate, oracle, update, weights
 
     # A layer's own output, not the stack's: the residual add re-attaches a
     # graph around a detached layer, so the stack stays differentiable through
     # the skip connection while the op contributes no gradient at all. Timing
     # that would report the residual's backward as the op's. A forward-only
     # implementation has no training step.
-    differentiable = model.layers[0](x, mask).requires_grad
+    differentiable = not experimental and model.layers[0](x, mask).requires_grad
 
     row = {}
     for name, step in (("infer_step", infer_step), ("train_step", train_step)):
@@ -172,6 +199,7 @@ def main():
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
+    configure_experiments(parser, args)
 
     require_gpu()
     dtype = DTYPES[args.dtype]
@@ -181,6 +209,7 @@ def main():
         backends=",".join(args.backends),
         channels=args.channels,
         biases=args.biases,
+        source_sha256=benchmark_source_sha256(),
         depth=args.depth,
         measure=",".join(m for m in MEASURES if m in measures),
     )

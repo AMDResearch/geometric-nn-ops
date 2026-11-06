@@ -8,6 +8,10 @@ the others are reported against; ``public`` measures the op a caller gets,
 whichever implementation dispatch picks for it. The Triton path is
 forward-only, so its backward column is empty.
 
+Experimental backends are selected as ``experimental:<variant>`` with
+``--dtype fp32``. They report inference only, after strict bounded-oracle
+qualification; unsupported or numerically failing cases retain an error row.
+
 Each backend is checked against the reference in fp64 before being timed, to
 the bounds the tests use. Full correctness lives in ``tests/test_trimul.py``.
 
@@ -34,9 +38,13 @@ from _bench_common import (
 )
 from _trimul_common import (
     BASELINE,
+    EXPERIMENTAL_BACKENDS,
     TRIMUL_IMPLEMENTATIONS,
     add_backend_argument,
     add_shape_arguments,
+    benchmark_source_sha256,
+    configure_experiments,
+    qualify_experimental,
 )
 from triton.testing import do_bench
 
@@ -55,15 +63,20 @@ MEASURES = ["fwd_train", "fwd_infer", "bwd"]
 
 def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, biases):
     impl = TRIMUL_IMPLEMENTATIONS[backend]
+    experimental = backend in EXPERIMENTAL_BACKENDS
     weights = make_weights(
-        channels, channels, "cuda", dtype, seed=3, requires_grad=True
+        channels, channels, "cuda", dtype, seed=3, requires_grad=not experimental
     )
     if biases:
         weights |= make_projection_biases(
-            channels, channels, "cuda", dtype, seed=5, requires_grad=True
+            channels, channels, "cuda", dtype, seed=5, requires_grad=not experimental
         )
-    x, mask = make_pair_input(1, n, channels, "cuda", dtype, seed=4, requires_grad=True)
+    x, mask = make_pair_input(
+        1, n, channels, "cuda", dtype, seed=4, requires_grad=not experimental
+    )
 
+    if experimental:
+        qualify_experimental(impl, x, direction, mask, weights)
     assert_forward_agrees_with_the_oracle(
         x, mask, weights, direction, impl=impl, label=f"{backend}/{direction}"
     )
@@ -79,12 +92,14 @@ def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, bi
             return impl(x, direction, mask, **weights)
 
     row = {
-        "fwd_train_ms": timed(fwd_train) if "fwd_train" in measures else None,
+        "fwd_train_ms": (
+            timed(fwd_train) if "fwd_train" in measures and not experimental else None
+        ),
         "fwd_infer_ms": timed(fwd_infer) if "fwd_infer" in measures else None,
         "bwd_ms": None,
     }
 
-    if "bwd" in measures:
+    if "bwd" in measures and not experimental:
         out = fwd_train()
         # A forward-only implementation returns a tensor with no graph behind
         # it, so there is no backward to time. Absent, not failed.
@@ -153,6 +168,7 @@ def main():
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
+    configure_experiments(parser, args)
 
     require_gpu()
     dtype = DTYPES[args.dtype]
@@ -162,6 +178,7 @@ def main():
         backends=",".join(args.backends),
         channels=args.channels,
         biases=args.biases,
+        source_sha256=benchmark_source_sha256(),
         measure=",".join(m for m in MEASURES if m in measures),
     )
 

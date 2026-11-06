@@ -3,11 +3,17 @@
 
 """Shared utilities for the trimul benchmark scripts."""
 
+import hashlib
+from functools import partial
+from pathlib import Path
+
+import torch
 from _bench_common import DTYPES
 
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
+from geometric_nn_ops_torch.triangle.experimental import VARIANTS, run_variant
 
 # `public` decided which implementation to delegate to, so choosing it measures
 # whatever a real caller would get rather than a specific implementation.
@@ -16,8 +22,51 @@ TRIMUL_IMPLEMENTATIONS = {
     "triton": trimul_triton,
     "public": triangle_multiplicative_update,
 }
+EXPERIMENTAL_BACKENDS = {
+    f"experimental:{name}": partial(run_variant, name)
+    for name in VARIANTS
+    if name not in ("reference", "geometric")
+}
+TRIMUL_IMPLEMENTATIONS.update(EXPERIMENTAL_BACKENDS)
 
 BASELINE = "reference"
+
+
+def benchmark_source_sha256():
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for folder in ("benchmarks", "geometric_nn_ops_torch", "testutil"):
+        for path in sorted((root / folder).rglob("*.py")):
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def configure_experiments(parser, args):
+    if any(name in EXPERIMENTAL_BACKENDS for name in args.backends):
+        if args.dtype != "fp32":
+            parser.error("Experimental backends require --dtype fp32")
+        torch.set_float32_matmul_precision("highest")
+
+
+def assert_qualified(actual, expected):
+    if not torch.isfinite(expected).all():
+        raise AssertionError("Bounded oracle returned non-finite output")
+    if not torch.isfinite(actual).all():
+        raise AssertionError("Experimental backend returned non-finite output")
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def qualify_experimental(impl, x, direction, mask, weights):
+    """Strict FP32 qualification, with an independently repeated bounded oracle."""
+    with torch.no_grad():
+        expected = run_variant("reference_bounded", x, direction, mask, **weights)
+        repeated = run_variant("reference_bounded", x, direction, mask, **weights)
+        assert_qualified(repeated, expected)
+        actual = impl(x, direction, mask, **weights)
+        assert_qualified(actual, expected)
+    return actual
 
 
 def add_shape_arguments(parser, *, sizes, directions=("outgoing", "incoming")):
