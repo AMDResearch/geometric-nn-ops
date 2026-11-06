@@ -10,6 +10,7 @@ reference.
 import pytest
 import torch
 
+from geometric_nn_ops_torch.triangle import attention_pair_bias
 from geometric_nn_ops_torch.triangle._reference.attention_pair_bias import (
     attention_pair_bias_torch,
 )
@@ -38,8 +39,8 @@ def test_masked_keys_are_ignored(dtype):
         dtype,
         requires_grad=False,
     )
-    mask = make_key_mask(B, V, "cuda", dtype, seed=5)
-    dropped = (mask == 0).reshape(B, 1, V, 1)
+    mask = make_key_mask(B, V, "cuda", seed=5)
+    dropped = (~mask).reshape(B, 1, V, 1)
     assert dropped.any(), "the fixture should mask at least one key"
     perturbed = {**tensors, "v": masked_noise(tensors["v"], dropped, 7)}
 
@@ -68,12 +69,12 @@ def test_masked_logits_are_suppressed(dtype):
         dtype,
         requires_grad=False,
     )
-    mask = make_key_mask(B, V, "cuda", dtype, seed=5)
-    dropped = (mask == 0).reshape(B, 1, V, 1)
+    mask = make_key_mask(B, V, "cuda", seed=5)
+    dropped = (~mask).reshape(B, 1, V, 1)
     perturbed = {
         **tensors,
         "k": masked_noise(tensors["k"], dropped, 11),
-        "z": masked_noise(tensors["z"], (mask == 0).reshape(B, 1, V, 1), 13),
+        "z": masked_noise(tensors["z"], (~mask).reshape(B, 1, V, 1), 13),
     }
 
     with torch.no_grad():
@@ -109,7 +110,7 @@ def test_cached_pair_bias(dtype, multiplicity):
         requires_grad=False,
     )
     mask = make_key_mask(B, V, "cuda", seed=55, frac_keep=0.6)
-    assert (mask == 0).any(), "the fixture should mask at least one key"
+    assert (~mask).any(), "the fixture should mask at least one key"
 
     with torch.no_grad():
         full, projected = attention_pair_bias_torch(
@@ -138,7 +139,7 @@ def test_returned_pair_bias_is_not_masked(dtype):
         requires_grad=False,
     )
     mask = make_key_mask(B, V, "cuda", seed=55, frac_keep=0.6)
-    assert (mask == 0).any(), "the fixture should mask at least one key"
+    assert (~mask).any(), "the fixture should mask at least one key"
 
     with torch.no_grad():
         _, masked = attention_pair_bias_torch(
@@ -206,8 +207,7 @@ def test_fully_masked_rows(dtype):
         dtype,
         requires_grad=False,
     )
-    mask = torch.ones(B, V, device="cuda", dtype=dtype)
-    mask[:, :] = 0.0
+    mask = torch.zeros(B, V, device="cuda", dtype=torch.bool)
 
     with torch.no_grad():
         out, projected = attention_pair_bias_torch(
@@ -216,6 +216,16 @@ def test_fully_masked_rows(dtype):
 
     assert torch.isfinite(out).all(), "a fully masked row must not produce NaN"
     assert torch.isfinite(projected).all(), "the cached bias must stay finite"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.uint8], ids=["fp32", "uint8"])
+def test_non_boolean_mask_is_rejected(dtype):
+    B, M, H, U, V, DH, Zc = 1, 1, 2, 8, 8, 8, 8
+    tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cpu", torch.float32, seed=3)
+    mask = make_key_mask(B, V, "cpu", seed=5)
+
+    with pytest.raises(ValueError, match="mask must be bool"):
+        attention_pair_bias(**tensors, mask=mask.to(dtype), scale=DH**-0.5)
 
 
 @requires_gpu
@@ -227,7 +237,7 @@ def test_mask_layouts_agree():
     tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cuda", torch.float32, seed=3)
     per_batch = make_key_mask(B, V, "cuda", seed=5, frac_keep=0.6)
     per_copy = per_batch.repeat_interleave(M, dim=0)
-    assert (per_batch == 0).any(), "the fixture should mask at least one key"
+    assert (~per_batch).any(), "the fixture should mask at least one key"
 
     with torch.no_grad():
         from_batch, _ = attention_pair_bias_torch(

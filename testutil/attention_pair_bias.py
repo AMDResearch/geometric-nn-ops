@@ -70,9 +70,9 @@ def make_projection_biases(
 
 
 def make_key_mask(
-    batch: int, v: int, device, dtype=torch.float32, *, seed: int = 0, frac_keep=0.9
+    batch: int, v: int, device, *, seed: int = 0, frac_keep=0.9
 ) -> torch.Tensor:
-    """Key mask ``[batch, V]``, ``1`` = keep.
+    """Boolean key mask ``[batch, V]``, ``True`` = keep.
 
     Masked keys are scattered. Key 0 is always kept, since a fully masked row
     leaves softmax undefined.
@@ -80,7 +80,7 @@ def make_key_mask(
     g = generator(device, seed)
     mask = torch.rand(batch, v, device=device, generator=g) < frac_keep
     mask[:, 0] = True
-    return mask.to(dtype)
+    return mask
 
 
 def fwd_bwd(implementation, tensors, grad_out, **options):
@@ -121,7 +121,7 @@ def assert_agrees_with_the_oracle(
         attention_pair_bias_torch,
         cast_tree(tensors, torch.float64),
         grad_out.double(),
-        mask=None if mask is None else mask.double(),
+        mask=mask,
         scale=DH**-0.5,
         **options,
     )
