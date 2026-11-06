@@ -5,8 +5,7 @@
 
 ``--backends`` names an implementation to time. ``reference`` is the baseline
 the others are reported against; ``public`` measures the op a caller gets,
-whichever implementation dispatch picks for it. The Triton path is
-forward-only, so its backward column is empty.
+whichever implementation dispatch picks for it.
 
 Each backend is checked against the reference in fp64 before being timed, to
 the bounds the tests use. Full correctness lives in ``tests/test_trimul.py``.
@@ -42,7 +41,7 @@ from triton.testing import do_bench
 
 from testutil import grad_targets
 from testutil.trimul import (
-    assert_forward_agrees_with_the_oracle,
+    assert_agrees_with_the_oracle,
     make_pair_input,
     make_projection_biases,
     make_weights,
@@ -64,7 +63,8 @@ def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, bi
         )
     x, mask = make_pair_input(1, n, channels, "cuda", dtype, seed=4, requires_grad=True)
 
-    assert_forward_agrees_with_the_oracle(
+    # Smoke test of what we're about to time. Full testing left to the test suite.
+    assert_agrees_with_the_oracle(
         x, mask, weights, direction, impl=impl, label=f"{backend}/{direction}"
     )
 
@@ -86,16 +86,13 @@ def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, bi
 
     if "bwd" in measures:
         out = fwd_train()
-        # A forward-only implementation returns a tensor with no graph behind
-        # it, so there is no backward to time. Absent, not failed.
-        if out.requires_grad:
-            grad_out = torch.randn_like(out)
-            targets = [x, *grad_targets(weights).values()]
-            row["bwd_ms"] = timed(
-                lambda: torch.autograd.grad(
-                    [out], targets, grad_outputs=[grad_out], retain_graph=True
-                )
+        grad_out = torch.randn_like(out)
+        targets = [x, *grad_targets(weights).values()]
+        row["bwd_ms"] = timed(
+            lambda: torch.autograd.grad(
+                [out], targets, grad_outputs=[grad_out], retain_graph=True
             )
+        )
     return row
 
 

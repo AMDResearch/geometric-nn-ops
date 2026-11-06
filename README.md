@@ -8,8 +8,8 @@ Kernels are namespaced by family:
 - `geometric_nn_ops_torch.triangle` — protein-folding (triangle) ops. **In
   scope.**
   - `triangle_attention` (forward + backward)
-  - `triangle_multiplicative_update` (Triton forward; pure-torch differentiable
-    fallback)
+  - `triangle_multiplicative_update` (forward + backward; pure-torch fallback
+    for projection biases, non-square hidden dims and channels past 128)
   - `attention_pair_bias` (pure torch; no Triton kernel yet)
 
 ## Usage

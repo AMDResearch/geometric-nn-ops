@@ -205,7 +205,7 @@ def comparisons(out, keys, grads, out_oracle, grads_oracle):
 
 
 def assert_agrees_with_the_oracle(
-    x, mask, weights, direction, *, impl, precision="ieee", label=""
+    x, mask, weights, direction, *, impl, precision="ieee", tol=None, label=""
 ):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
     compare the output and every gradient.
@@ -226,6 +226,6 @@ def assert_agrees_with_the_oracle(
 
     assert_matches_oracle(
         comparisons(out, keys, grads, out_oracle, grads_oracle),
-        TRIMUL_TOL[x.dtype, precision],
+        tol or TRIMUL_TOL[x.dtype, precision],
         label=label,
     )

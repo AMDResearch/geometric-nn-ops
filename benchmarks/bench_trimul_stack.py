@@ -9,8 +9,7 @@ activations costs something, which the isolated op benchmark cannot see, and
 ``--depth`` compounds it the way a pairformer trunk does. ``--directions
 alternate`` runs the outgoing and incoming updates in turn, as the trunk does.
 
-``--backends`` names an implementation, as in ``bench_trimul_micro.py``. The
-Triton path is forward-only, so its training columns are empty.
+``--backends`` names an implementation, as in ``bench_trimul_micro.py``.
 
 Usage:
     python benchmarks/bench_trimul_stack.py \
@@ -78,17 +77,9 @@ def bench_case(
     if not torch.isfinite(infer_step()).all():
         raise RuntimeError("non-finite output")
 
-    # A layer's own output, not the stack's: the residual add re-attaches a
-    # graph around a detached layer, so the stack stays differentiable through
-    # the skip connection while the op contributes no gradient at all. Timing
-    # that would report the residual's backward as the op's. A forward-only
-    # implementation has no training step.
-    differentiable = model.layers[0](x, mask).requires_grad
-
     row = {}
     for name, step in (("infer_step", infer_step), ("train_step", train_step)):
-        wanted = name in measures and (differentiable or name == "infer_step")
-        if not wanted:
+        if name not in measures:
             row[f"{name}_ms"] = None
             row[f"{name}_alloc_gib"] = row[f"{name}_reserved_gib"] = None
             continue
