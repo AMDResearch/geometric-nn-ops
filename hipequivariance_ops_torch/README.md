@@ -4,13 +4,14 @@ Zero-code-change drop-in for NVIDIA's `cuequivariance_ops_torch` kernels, backed
 by Triton, with first-class support for AMD ROCm GPUs.
 
 This is an *optional convenience* package. The real compute — and the
-recommended integration path — lives in the `geometric-nn-ops-torch` package. We
-recommend a direct dependency on that API instead where possible.
+recommended integration path — lives in the
+[`geometric-nn-ops-torch`](https://pypi.org/project/geometric-nn-ops-torch/)
+package. We recommend a direct dependency on that API instead where possible.
 
 ## What it does
 
 `hipequivariance-ops-torch` installs a Python package that implements the
-`cuequivariance_ops_torch` API under the same name module name and provides the
+`cuequivariance_ops_torch` API under the same module name and provides the
 symbols `cuequivariance_torch` imports:
 
 - `triangle_attention` — routed to `geometric-nn-ops`
@@ -19,6 +20,8 @@ symbols `cuequivariance_torch` imports:
 - `TriMulPrecision`
 - `CUEQ_TRIATTN_FALLBACK_THRESHOLD` (deep import from
   `cuequivariance_ops_torch.triangle_attention`)
+- `CUEQ_TRIMUL_FALLBACK_THRESHOLD` (deep import from
+  `cuequivariance_ops_torch.triangle_multiplicative_update`)
 - `CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD` (deep import from
   `cuequivariance_ops_torch.attention_pair_bias_torch`)
 
@@ -31,53 +34,45 @@ may incur a performance penalty.
 
 The underlying ops take their fp32 matmul precision from
 `torch.backends.cuda.matmul.fp32_precision` and have no per-call override. The
-ops sometimes make use of torch operations or fallbacks where such a setting
-cannot be honored because it relies on a Torch global with no scoped option (a
-custom context manager toggling the global would not be thread safe). This
-conflicts with the cuequivariance `triangle_multiplicative_update`'s `precision`
-argument, which presents an API indicating that the user can select their
-desired precision. The actual behavior there is inconsistent however, with the
-operation sometimes not honoring the setting: likely for the same reason that
-some paths use Torch directly. Rather than providing an inconsistent API or
-making guarantees we cannot honor, the shim checks the precision setting for
-compatibility with the Torch global. A request for more precision than the torch
-setting (i.e. `precision="ieee"` when the torch global is "tf32") raises, as the
-required precision cannot be satisifed, creating a correctness issue. A request
-for less precision (i.e. `precision="tf32"` when the Torch global is "ieee")
-warns, as falling back to full precision is a performance issue but not a
-correctness one (and matches the behavior on hardware with no reduced-precision
-fast path).
+ops sometimes make use of torch operations which can only use the unscoped torch
+global. This conflicts with the cuequivariance
+`triangle_multiplicative_update`'s `precision` argument, which presents an API
+indicating that the user can select their desired precision. cuequivariance does
+not consistently honor this API, however. Rather than inconsistent behavior, the
+shim checks the precision setting for compatibility with the torch global:
+
+- requesting more precision than the torch setting (e.g. `precision="ieee"` when
+  the torch global is "tf32") raises, as the required precision cannot be
+  satisfied, creating a correctness issue.
+- requesting less (e.g. `precision="tf32"` when the torch global is "ieee")
+  warns, as falling back to full precision is a performance issue but not a
+  correctness one.
 
 ## Install
 
-Packages are not yet published on PyPI. Installing the shim is deliberately
-separate from the main package and it is never pulled in implicitly. It raises
-at import if a `cuequivariance-ops-torch-*` wheel is detected as installed, and
-warns if the installed `cuequivariance-torch` differs from the version it was
-designed for.
+Installing the shim is an optional step separate from the main package, which
+does not depend on it. The shim raises at import if a
+`cuequivariance-ops-torch-*` wheel is detected as installed, and warns if the
+installed `cuequivariance-torch` differs from the version it was designed for.
 
-### Today
-
-You can check out the source and use editable installs or install directly from
-GitHub.
+Install PyTorch for your platform first, following
+[the PyTorch instructions](https://pytorch.org/get-started/locally/). Otherwise
+pip installs the default PyTorch build from PyPI, which on Linux targets NVIDIA
+CUDA rather than AMD ROCm.
 
 ```bash
-# Install PyTorch and Triton for your environment, e.g. following https://pytorch.org/get-started/locally/
-git clone https://github.com/AMDResearch/geometric-nn-ops.git
-cd geometric-nn-ops/
-pip install -e .  # the kernels (required)
-pip install -e hipequivariance_ops_torch  # this shim (provides cuequivariance_ops_torch module)
-pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's frontend python
+pip install hipequivariance-ops-torch  # this shim, pulls in the kernels package as a dep
+pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"  # NVIDIA's frontend Python
 # do NOT install cuequivariance-ops-torch-cu12 / -cu13
 ```
 
-### Once Packages Are Published on PyPI
+For an editable install from source instead:
 
 ```bash
-pip install geometric-nn-ops-torch  # the kernels (required)
-pip install hipequivariance-ops-torch  # this shim (provides cuequivariance_ops_torch module)
-pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's frontend python
-# do NOT install cuequivariance-ops-torch-cu12 / -cu13
+git clone https://github.com/AMDResearch/geometric-nn-ops.git
+cd geometric-nn-ops/
+pip install -e .  # the kernels
+pip install -e hipequivariance_ops_torch  # this shim
 ```
 
 ## Status
@@ -90,4 +85,5 @@ pip install "cuequivariance==0.9.1" "cuequivariance-torch==0.9.1"   # NVIDIA's f
 
 ## License
 
-Apache-2.0. Copyright Advanced Micro Devices, Inc. See [LICENSE](../LICENSE).
+Apache-2.0. Copyright Advanced Micro Devices, Inc. See
+[LICENSE](https://github.com/AMDResearch/geometric-nn-ops/blob/main/hipequivariance_ops_torch/LICENSE).
