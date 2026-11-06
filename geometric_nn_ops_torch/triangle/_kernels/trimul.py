@@ -9,8 +9,6 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 
 import torch
 
-from geometric_nn_ops_torch import _precision
-
 # For now we reuse this from the pure torch implementation.
 from geometric_nn_ops_torch.triangle._reference.trimul import (
     _combine_projections,
@@ -20,6 +18,11 @@ from geometric_nn_ops_torch.triangle._reference.trimul import (
 try:
     import triton
     import triton.language as tl
+
+    from geometric_nn_ops_torch.triangle._kernels.dot_precision import (
+        current_dot_precision,
+        tl_dot,
+    )
 
     TRITON_AVAILABLE = True
 except ImportError:
@@ -126,7 +129,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+        DOT_PRECISION: tl.constexpr,
     ):
         """
         Fused linear layer with optional sigmoid, elementwise multiply, mask, and add
@@ -169,7 +172,7 @@ if TRITON_AVAILABLE:
                 other=0.0,
             )
 
-            acc = tl.dot(x, w, acc, input_precision=MATMUL_PRECISION)
+            acc = tl_dot(x, w, acc=acc, input_precision=DOT_PRECISION)
 
         if HAS_BIAS:
             bias_offsets = rn.to(tl.int64)
@@ -274,7 +277,7 @@ def triton_layernorm(
 def triton_linear_fused(
     x: torch.Tensor,
     weight: torch.Tensor,
-    matmul_precision: str,
+    dot_precision: str,
     bias: torch.Tensor | None = None,
     other: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
@@ -289,7 +292,7 @@ def triton_linear_fused(
     Args:
         x: Input tensor [..., K]
         weight: Weight tensor [N, K] (same layout as nn.Linear.weight)
-        matmul_precision: tl.dot mode to use.
+        dot_precision: tl.dot mode to use.
         bias: Optional bias tensor [N]
         other: Optional tensor to multiply with (same shape as output)
         mask: Optional mask tensor (broadcastable with output)
@@ -394,7 +397,7 @@ def triton_linear_fused(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        MATMUL_PRECISION=matmul_precision,
+        DOT_PRECISION=dot_precision,
     )
 
     output_shape = input_shape[:-1] + (N,)
@@ -431,18 +434,20 @@ def trimul_triton(
         # The kernels index one entry per pair row, so we need to make the
         # broadcast explicit.
         m = mask.unsqueeze(-1).expand(*x.shape[:-1], 1)
-    precision = _precision.matmul_precision(fp32_operands=x.dtype == torch.float32)
+    dot_precision = current_dot_precision(fp32_operands=x.dtype == torch.float32)
     z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
     pg = triton_linear_fused(
-        z, g_in_weight, precision, bias=g_in_bias, apply_sigmoid=True
+        z, g_in_weight, dot_precision, bias=g_in_bias, apply_sigmoid=True
     )
-    p = triton_linear_fused(z, p_in_weight, precision, bias=p_in_bias, other=pg, mask=m)
+    p = triton_linear_fused(
+        z, p_in_weight, dot_precision, bias=p_in_bias, other=pg, mask=m
+    )
     a = p[..., :c_hidden]
     b = p[..., c_hidden:]
     o = _combine_projections(a, b, outgoing)
     o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
-    o = triton_linear_fused(o, p_out_weight, precision, bias=p_out_bias)
+    o = triton_linear_fused(o, p_out_weight, dot_precision, bias=p_out_bias)
     g = triton_linear_fused(
-        z, g_out_weight, precision, bias=g_out_bias, apply_sigmoid=True
+        z, g_out_weight, dot_precision, bias=g_out_bias, apply_sigmoid=True
     )
     return o * g

@@ -6,8 +6,8 @@
 import enum
 import warnings
 
-from geometric_nn_ops_torch import _precision
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update as _tmu
+from geometric_nn_ops_torch.triangle._kernels import dot_precision
 
 from ._trimul_precision import TriMulPrecision
 
@@ -48,10 +48,10 @@ def _check_precision(precision) -> None:
     if precision in _NO_REQUEST:
         return
 
-    torch_precision = _precision.torch_precision()
+    torch_precision = dot_precision.torch_fp32_precision()
 
     if precision != torch_precision:
-        if torch_precision == _precision.IEEE:
+        if torch_precision == dot_precision.IEEE:
             warnings.warn(
                 f"requested triangle_multiplicative_update "
                 f"precision={precision_orig!r}, but "

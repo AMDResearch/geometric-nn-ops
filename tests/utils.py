@@ -7,28 +7,34 @@ The metrics, tolerances and the oracle assertion live in ``testutil.metrics``,
 which benchmarks can import too. Only things that depend on pytest belong here.
 """
 
+import contextlib
 import math
 
 import pytest
 import torch
 
-from geometric_nn_ops_torch import _precision
-from testutil.precision import torch_matmul_precision
+from geometric_nn_ops_torch.triangle._kernels import dot_precision
+from testutil.precision import fast_reduced_precision_dot
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs GPU + Triton"
 )
 
 
-def skip_without_reduced_precision_dot() -> None:
-    """Skip unless the target has a reduced-precision fp32 matmul.
+@contextlib.contextmanager
+def require_reduced_precision_dot():
+    """Skip if no reduced-precision fp32 dot is available.
 
-    Where it does not, tf32 correctly resolves to ieee and there is nothing to
-    tell apart.
+    If one is, assume it is fast. This is so that we can test reduced-precision
+    numerics even on systems where it's not necessarily fast.
     """
-    with torch_matmul_precision("tf32"):
-        if _precision.matmul_precision(fp32_operands=True) == _precision.IEEE:
-            pytest.skip("no reduced-precision fp32 dot on this target")
+    mode = dot_precision.resolve(
+        dot_precision.TF32, dot_precision._allowed_dot_precisions()
+    )
+    if mode == dot_precision.IEEE:
+        pytest.skip("no reduced-precision fp32 dot on this target")
+    with fast_reduced_precision_dot(True):
+        yield
 
 
 def require_device_memory(gib: float) -> None:
