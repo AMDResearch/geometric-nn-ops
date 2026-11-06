@@ -20,9 +20,9 @@ import torch
 
 from geometric_nn_ops_torch.triangle import attention_pair_bias as _apb
 
-# Provided to match cuEquivariance's documented API. Currently we always fall
-# back, so listed as a very large value for documentation, but we don't actually
-# check its value anywhere.
+# Provided to match cuEquivariance's documented API. We don't check its value
+# anywhere: the op decides when to fall back with a size gate on a work
+# estimate.
 CUEQ_ATTENTION_PAIR_BIAS_FALLBACK_THRESHOLD = sys.maxsize
 
 
