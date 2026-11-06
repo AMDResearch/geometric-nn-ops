@@ -9,7 +9,7 @@ import torch
 
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 
-from . import cast_tree, generator, grad_targets, seeded_randn
+from . import generator, grad_targets, oracle_tree, seeded_randn, to_oracle
 from .metrics import TRIMUL_TOL, assert_matches_oracle
 
 
@@ -177,10 +177,10 @@ def assert_forward_agrees_with_the_oracle(
     with torch.no_grad():
         out = impl(x, direction, mask, **weights)
         out_oracle = trimul_torch(
-            x.double(),
+            to_oracle(x),
             direction,
-            mask.double(),
-            **cast_tree(weights, torch.float64, requires_grad=False),
+            to_oracle(mask),
+            **oracle_tree(weights, requires_grad=False),
         )
 
     assert_matches_oracle(
@@ -217,11 +217,11 @@ def assert_agrees_with_the_oracle(
     out, keys, grads = fwd_bwd(impl, x, mask, weights, direction, grad_out)
     out_oracle, _, grads_oracle = fwd_bwd(
         trimul_torch,
-        x.detach().double().requires_grad_(),
-        mask.double(),
-        cast_tree(weights, torch.float64),
+        to_oracle(x.detach()).requires_grad_(),
+        to_oracle(mask),
+        oracle_tree(weights),
         direction,
-        grad_out.double(),
+        to_oracle(grad_out),
     )
 
     assert_matches_oracle(

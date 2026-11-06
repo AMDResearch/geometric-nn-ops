@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from geometric_nn_ops_torch import _precision
+from testutil import EMULATED_GPU
 from testutil.precision import torch_matmul_precision
 
 requires_gpu = pytest.mark.skipif(
@@ -71,6 +72,23 @@ def gpu_arch() -> str:
         # The name carries feature flags on some parts: ``gfx90a:sramecc+:xnack-``.
         return props.gcnArchName.split(":")[0]
     return f"sm_{props.major}{props.minor}"
+
+
+def xfail_if_emulated_xf32_is_fp32(request: pytest.FixtureRequest) -> None:
+    """Strict xfail for tf32-vs-ieee tests under emulated gfx942.
+
+    rocjitsu currently just uses full fp32 for gfx942's ``v_mfma_f32_*_xf32``,
+    so tf32 and ieee give identical results there. Remove this when the rocjitsu
+    used in CI emulates xf32 input rounding (e.g.
+    https://github.com/ROCm/rocm-systems/pull/14809).
+    """
+    if EMULATED_GPU and gpu_arch() == "gfx942":
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="emulated gfx942 executes xf32 MFMA as full fp32",
+            )
+        )
 
 
 DTYPES_PARAM = pytest.mark.parametrize(
