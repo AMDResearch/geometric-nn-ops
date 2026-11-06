@@ -54,7 +54,8 @@ def attention_pair_bias(
         ln_z_weight: ``(Zc,)`` LayerNorm affine param for ``z``.
         proj_g_bias: ``(D,)`` optional gate projection bias.
         proj_o_bias: ``(D,)`` optional output projection bias.
-        mask: ``(B, V)`` or ``(BM, V)`` key mask, ``1`` = keep, ``0`` = mask.
+        mask: ``(B, V)`` or ``(BM, V)`` boolean key mask, ``True`` = keep,
+            ``False`` = drop.
         scale: attention scale; ``None`` -> ``DH ** -0.5``.
         inf: magnitude used to push masked keys out of the softmax. This exists
             primarily for compatibility with cuequivariance. We recommend using

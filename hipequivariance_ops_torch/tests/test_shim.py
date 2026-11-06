@@ -1,7 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU: cuequivariance_torch frontend smoke tests through our shim.
+"""cuequivariance_torch frontend tests through our shim.
 
 Skips when cuequivariance_torch isn't installed.
 """
@@ -63,6 +63,16 @@ def test_tri_attn_batchless_call_matches_explicit_batch():
 
     assert batchless.shape == (1, *q.shape)
     torch.testing.assert_close(batchless, batched, rtol=0, atol=0)
+
+
+def test_tri_attn_rejects_a_mask_that_requires_grad():
+    from cuequivariance_torch.primitives.triangle import triangle_attention
+
+    q = torch.ones(1, 1, 2, 4, 8)
+    bias = torch.ones(1, 1, 2, 4, 4)
+    mask = torch.ones(1, 1, 1, 1, 4, requires_grad=True)
+    with pytest.raises(ValueError, match="cannot require grad"):
+        triangle_attention(q, q, q, bias, mask)
 
 
 @requires_gpu
@@ -175,6 +185,16 @@ def test_returned_pair_bias_round_trips():
     torch.testing.assert_close(cached, direct, rtol=0, atol=0)
 
 
+def test_attention_pair_bias_rejects_a_mask_that_requires_grad():
+    from cuequivariance_torch.primitives.triangle import attention_pair_bias
+
+    B, M, H, U, V, DH, Zc = 1, 1, 2, 4, 4, 8, 8
+    kwargs = _apb_kwargs(B, M, H, U, V, DH, Zc, "cpu", torch.float32)
+    kwargs["mask"].requires_grad_(True)
+    with pytest.raises(ValueError, match="cannot require grad"):
+        attention_pair_bias(**kwargs)
+
+
 @requires_gpu
 def test_upstream_trimul_routes_through_shim():
     from cuequivariance_torch.primitives.triangle import (
@@ -206,3 +226,14 @@ def test_upstream_trimul_routes_through_shim():
 
     assert out.shape == (B, N, N, C_z)
     assert out.dtype == dtype
+
+
+def test_upstream_trimul_rejects_a_mask_that_requires_grad():
+    from cuequivariance_torch.primitives.triangle import (
+        triangle_multiplicative_update,
+    )
+
+    x = torch.ones(1, 2, 2, 4)
+    mask = torch.ones(1, 2, 2, requires_grad=True)
+    with pytest.raises(ValueError, match="cannot require grad"):
+        triangle_multiplicative_update(x, "outgoing", mask=mask)
