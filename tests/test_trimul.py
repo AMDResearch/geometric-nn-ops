@@ -9,6 +9,7 @@ it whenever gradients are needed.
 """
 
 import contextlib
+import functools
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,7 +20,11 @@ triton = pytest.importorskip("triton")
 # ruff: noqa: E402
 
 
-from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
+from geometric_nn_ops_torch.triangle import (
+    _trimul,
+    triangle_multiplicative_update,
+    triangle_multiplicative_update_,
+)
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
@@ -37,14 +42,12 @@ from testutil.trimul import (
     make_weights,
 )
 from utils import (
+    DIRECTIONS_PARAM,
     DTYPE_PRECISION_PARAM,
     require_device_memory,
     requires_gpu,
     skip_without_reduced_precision_dot,
 )
-
-DIRECTIONS_PARAM = ["outgoing", "incoming"]
-
 
 # The structural tests hold for both implementations. The accuracy tests take
 # the reference as their oracle, so there it is not also a candidate.
@@ -70,7 +73,7 @@ def make_masked_weights(c_z, c_hidden, *, biased):
 @requires_gpu
 @IMPLEMENTATION_PARAM
 @pytest.mark.parametrize("biased", [False, True], ids=["bias_free", "biased"])
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_fully_masked_input(impl, biased, direction):
     """An all-zero mask zeroes the combine and a zeroed ``g_out_weight`` fixes
     the gate, so every output position holds the same vector."""
@@ -95,7 +98,7 @@ def test_fully_masked_input(impl, biased, direction):
 @pytest.mark.parametrize(
     "which", ["p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias"]
 )
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_each_projection_bias_contributes(impl, which, direction):
     """Zeroing any one bias changes the output, so none is silently dropped."""
     N, C = 16, 32
@@ -133,8 +136,13 @@ def test_direction_changes_the_result(impl):
 
 @pytest.mark.parametrize(
     "impl",
-    [trimul_torch, trimul_triton, triangle_multiplicative_update],
-    ids=["reference", "triton", "public"],
+    [
+        trimul_torch,
+        trimul_triton,
+        triangle_multiplicative_update,
+        triangle_multiplicative_update_,
+    ],
+    ids=["reference", "triton", "public", "in_place"],
 )
 def test_non_bool_mask_is_rejected(impl):
     N, C = 8, 16
@@ -149,8 +157,14 @@ def test_non_bool_mask_is_rejected(impl):
 @requires_gpu
 @pytest.mark.parametrize(
     "impl",
-    [trimul_torch, trimul_triton, triangle_multiplicative_update],
-    ids=["reference", "triton", "public"],
+    [
+        trimul_torch,
+        trimul_triton,
+        triangle_multiplicative_update,
+        triangle_multiplicative_update_,
+        functools.partial(triangle_multiplicative_update_, chunk_size=2),
+    ],
+    ids=["reference", "triton", "public", "in_place", "in_place_chunked"],
 )
 def test_unknown_direction_is_rejected(impl):
     """Every entry point, since a direction that is merely misspelled would
@@ -165,7 +179,25 @@ def test_unknown_direction_is_rejected(impl):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
+def test_residual_is_added(impl, direction):
+    """``residual`` gives the update plus the residual. The Triton path adds it
+    in its output kernel which can differ in rounding, so not an exact check."""
+    N, C = 12, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=41)
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=42)
+    residual = torch.randn_like(x)
+
+    with torch.no_grad():
+        out = impl(x, direction, mask, residual=residual, **weights)
+        expected = impl(x, direction, mask, **weights) + residual
+
+    torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-6)
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@DIRECTIONS_PARAM
 def test_mask_none(impl, direction):
     """``mask=None`` matches an explicit all-keep mask."""
     N, C = 12, 32
@@ -186,7 +218,7 @@ def test_mask_none(impl, direction):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_broadcast_mask(impl, direction):
     """A mask with fewer leading dims than the input matches the expanded one."""
     N, C, batch = 12, 32, 2
@@ -226,7 +258,7 @@ def test_tf32_changes_the_result():
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 @DTYPE_PRECISION_PARAM
 def test_triton_accuracy(direction, dtype, precision):
     """The kernel at ``dtype`` and ``precision`` against the reference in fp64.
@@ -271,7 +303,7 @@ def test_reference_precision(dtype, precision):
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 @pytest.mark.parametrize(
     "shape", [(2, 48, 48, 128), (2, 3, 40, 40, 128)], ids=["batched", "5D"]
 )
@@ -293,7 +325,7 @@ def test_batched(direction, shape):
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 @pytest.mark.parametrize("true_length", [32, 48], ids=["L32", "L48"])
 def test_block_padded(direction, true_length):
     """Real inputs are padded to a block: the first L residues are live and the
@@ -323,7 +355,7 @@ def test_block_padded(direction, true_length):
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 @pytest.mark.parametrize("channels", [96, 128, 256], ids=["c96", "c128", "c256"])
 def test_channel_widths(direction, channels):
     """Non-standard channel widths."""
@@ -343,7 +375,7 @@ def test_channel_widths(direction, channels):
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_hidden_differs_from_channels(direction):
     """``c_hidden`` narrower than ``c_z``, so the projections are not square."""
     N, C_z, C_hidden = 24, 64, 32
@@ -362,7 +394,7 @@ def test_hidden_differs_from_channels(direction):
 
 
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 @pytest.mark.parametrize("gamma", ["zero", "tiny", "learned"])
 def test_layernorm_affine(direction, gamma):
     """Nontrivial LayerNorm affine, including zero/near-zero gamma."""
@@ -404,7 +436,7 @@ def test_layernorm_affine(direction, gamma):
 
 @pytest.mark.large
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_large(direction):
     """N=1024, where the reductions are far deeper than the small shapes. bf16
     only to keep memory down."""
@@ -425,7 +457,7 @@ def test_large(direction):
 
 @pytest.mark.large
 @requires_gpu
-@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@DIRECTIONS_PARAM
 def test_large_n_no_int32_overflow(direction):
     """At N=4096, C=128 the flattened element count reaches 2**31, where a
     32-bit offset would wrap and give a finite but wrong result. Kept in bf16
