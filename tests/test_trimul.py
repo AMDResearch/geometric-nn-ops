@@ -164,6 +164,24 @@ def test_unknown_direction_is_rejected(impl):
 @requires_gpu
 @IMPLEMENTATION_PARAM
 @DIRECTIONS_PARAM
+def test_residual_is_added(impl, direction):
+    """``residual`` gives the update plus the residual. The Triton path adds it
+    in its output kernel which can differ in rounding, so not an exact check."""
+    N, C = 12, 32
+    weights = make_weights(C, C, "cuda", torch.float32, seed=41)
+    x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=42)
+    residual = torch.randn_like(x)
+
+    with torch.no_grad():
+        out = impl(x, direction, mask, residual=residual, **weights)
+        expected = impl(x, direction, mask, **weights) + residual
+
+    torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-6)
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
+@DIRECTIONS_PARAM
 def test_mask_none(impl, direction):
     """``mask=None`` matches an explicit all-keep mask."""
     N, C = 12, 32

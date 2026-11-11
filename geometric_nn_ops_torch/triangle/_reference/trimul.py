@@ -74,13 +74,14 @@ def trimul_torch(
     p_out_bias=None,
     g_out_weight=None,
     g_out_bias=None,
+    residual=None,
 ):
     """Triangle multiplicative update in stock PyTorch.
 
     ``x`` is ``[*, N, N, C_z]`` and ``mask`` is an optional boolean
     ``[*, N, N]`` (``True`` = keep). ``p_in_weight`` and ``g_in_weight`` are the
     concatenated ``[a; b]`` projections, so the hidden width follows from their
-    row count.
+    row count. A ``residual`` is added to the update.
     """
     outgoing = is_outgoing(direction)
     check_bool_mask(mask)
@@ -98,4 +99,5 @@ def trimul_torch(
     o = F.layer_norm(o, (c_hidden,), norm_out_weight, norm_out_bias, eps)
     o = F.linear(o, p_out_weight, p_out_bias)
     g = torch.sigmoid(F.linear(z, g_out_weight, g_out_bias))
-    return o * g
+    out = o * g
+    return out if residual is None else out + residual

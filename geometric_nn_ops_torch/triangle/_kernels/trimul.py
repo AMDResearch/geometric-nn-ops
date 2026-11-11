@@ -492,10 +492,12 @@ def trimul_triton(
     p_out_bias=None,
     g_out_weight=None,
     g_out_bias=None,
+    residual=None,
 ):
     """Triangle multiplicative update using fused Triton kernels. Forward only.
 
-    Takes the same arguments as ``trimul_torch``; see it for the layouts.
+    Takes the same arguments as ``trimul_torch``; see it for the layouts. A
+    ``residual`` is added to the update inside the output kernel.
     """
     outgoing = is_outgoing(direction)
     check_bool_mask(mask)
@@ -524,4 +526,5 @@ def trimul_triton(
         p_out_bias,
         g_out_weight,
         g_out_bias,
+        add=residual,
     )
