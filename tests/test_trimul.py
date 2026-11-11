@@ -9,6 +9,7 @@ it whenever gradients are needed.
 """
 
 import contextlib
+import functools
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,7 +20,11 @@ triton = pytest.importorskip("triton")
 # ruff: noqa: E402
 
 
-from geometric_nn_ops_torch.triangle import _trimul, triangle_multiplicative_update
+from geometric_nn_ops_torch.triangle import (
+    _trimul,
+    triangle_multiplicative_update,
+    triangle_multiplicative_update_,
+)
 from geometric_nn_ops_torch.triangle._kernels.trimul import trimul_triton
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 from testutil import cast_tree
@@ -131,8 +136,13 @@ def test_direction_changes_the_result(impl):
 
 @pytest.mark.parametrize(
     "impl",
-    [trimul_torch, trimul_triton, triangle_multiplicative_update],
-    ids=["reference", "triton", "public"],
+    [
+        trimul_torch,
+        trimul_triton,
+        triangle_multiplicative_update,
+        triangle_multiplicative_update_,
+    ],
+    ids=["reference", "triton", "public", "in_place"],
 )
 def test_non_bool_mask_is_rejected(impl):
     N, C = 8, 16
@@ -147,8 +157,14 @@ def test_non_bool_mask_is_rejected(impl):
 @requires_gpu
 @pytest.mark.parametrize(
     "impl",
-    [trimul_torch, trimul_triton, triangle_multiplicative_update],
-    ids=["reference", "triton", "public"],
+    [
+        trimul_torch,
+        trimul_triton,
+        triangle_multiplicative_update,
+        triangle_multiplicative_update_,
+        functools.partial(triangle_multiplicative_update_, chunk_size=2),
+    ],
+    ids=["reference", "triton", "public", "in_place", "in_place_chunked"],
 )
 def test_unknown_direction_is_rejected(impl):
     """Every entry point, since a direction that is merely misspelled would

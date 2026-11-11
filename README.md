@@ -10,6 +10,7 @@ Kernels are namespaced by family:
   - `triangle_attention` (forward + backward)
   - `triangle_multiplicative_update` (Triton forward; pure-torch differentiable
     fallback)
+  - `triangle_multiplicative_update_` (in-place, inference only)
   - `attention_pair_bias` (pure torch; no Triton kernel yet)
 
 ## Usage
@@ -32,6 +33,14 @@ z = triangle_multiplicative_update(x, direction="outgoing", mask=mask, **weights
 (concatenated `[a; b]` `p_in`/`g_in` projections). It runs the Triton fast path
 for inference and auto-falls back to a pure-torch differentiable implementation
 when gradients are needed or no GPU/Triton is available.
+
+For inference on long sequences, `triangle_multiplicative_update_` adds the
+update to `x` in place and can compute it in chunks to limit memory usage:
+
+```python
+with torch.inference_mode():
+    triangle_multiplicative_update_(x, "outgoing", mask, **weights, chunk_size=256)
+```
 
 All ops take a boolean `mask` (`True` = keep) or `None`, and raise on any other
 dtype. The cuequivariance shim accepts cuequivariance's 0/1 masks and casts them
