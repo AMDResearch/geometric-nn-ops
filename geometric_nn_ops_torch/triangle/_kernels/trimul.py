@@ -456,15 +456,22 @@ def output(
     p_out_bias: torch.Tensor | None,
     g_out_weight: torch.Tensor,
     g_out_bias: torch.Tensor | None,
+    add: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``sigmoid(z_n @ g_out^T) * (LayerNorm(o) @ p_out^T)``, where ``z_n`` is
-    the normalized input at the same positions as ``o``."""
+    """``sigmoid(z_n @ g_out^T) * (LayerNorm(o) @ p_out^T)``, plus ``add`` if
+    given, where ``z_n`` is the normalized input at the same positions as
+    ``o``."""
     o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
     o = triton_linear_fused(o, p_out_weight, precision, bias=p_out_bias)
-    g = triton_linear_fused(
-        z_n, g_out_weight, precision, bias=g_out_bias, apply_sigmoid=True
+    return triton_linear_fused(
+        z_n,
+        g_out_weight,
+        precision,
+        bias=g_out_bias,
+        other=o,
+        add_tensor=add,
+        apply_sigmoid=True,
     )
-    return o * g
 
 
 def trimul_triton(
