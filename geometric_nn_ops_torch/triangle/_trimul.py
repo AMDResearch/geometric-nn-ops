@@ -25,12 +25,18 @@ from ._reference.trimul import trimul_torch
 _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
-def _needs_torch_path(x: torch.Tensor, weights) -> bool:
-    if not TRITON_AVAILABLE or not x.is_cuda or x.dtype not in _TRITON_DTYPES:
-        return True
+def _has_kernel(x: torch.Tensor) -> bool:
+    return TRITON_AVAILABLE and x.is_cuda and x.dtype in _TRITON_DTYPES
+
+
+def _requires_grad(x: torch.Tensor, weights) -> bool:
     return torch.is_grad_enabled() and (
         x.requires_grad or any(w is not None and w.requires_grad for w in weights)
     )
+
+
+def _needs_torch_path(x: torch.Tensor, weights) -> bool:
+    return not _has_kernel(x) or _requires_grad(x, weights)
 
 
 def triangle_multiplicative_update(
