@@ -21,9 +21,6 @@ import torch
 from ._kernels.trimul import TRITON_AVAILABLE, trimul_triton
 from ._reference.trimul import trimul_torch
 
-__all__ = ["triangle_multiplicative_update"]
-
-
 # Dtypes the Triton kernels compile for. Anything else takes the torch path.
 _TRITON_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
