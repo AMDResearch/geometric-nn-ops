@@ -88,17 +88,15 @@ def make_pair_input(
     requires_grad: bool = False,
     frac_keep: float = 0.9,
 ):
-    """Pair representation ``[*batch, N, N, C_z]`` and a mask ``[*batch, N, N]``.
+    """Pair representation ``[*batch, N, N, C_z]`` and a boolean mask.
 
-    ``batch`` is a single leading dim or a tuple of them; ``()`` gives an
-    unbatched input.
+    The mask is ``[*batch, N, N]`` with ``True`` = keep. ``batch`` is a single
+    leading dim or a tuple of them; ``()`` gives an unbatched input.
     """
     leading = (batch,) if isinstance(batch, int) else batch
     g = generator(device, seed)
     x = torch.randn(*leading, n, n, c_z, device=device, dtype=dtype, generator=g) * 0.5
-    mask = (torch.rand(*leading, n, n, device=device, generator=g) < frac_keep).to(
-        dtype
-    )
+    mask = torch.rand(*leading, n, n, device=device, generator=g) < frac_keep
     return x.requires_grad_(requires_grad), mask
 
 
@@ -179,7 +177,7 @@ def assert_forward_agrees_with_the_oracle(
         out_oracle = trimul_torch(
             x.double(),
             direction,
-            mask.double(),
+            mask,
             **cast_tree(weights, torch.float64, requires_grad=False),
         )
 
@@ -218,7 +216,7 @@ def assert_agrees_with_the_oracle(
     out_oracle, _, grads_oracle = fwd_bwd(
         trimul_torch,
         x.detach().double().requires_grad_(),
-        mask.double(),
+        mask,
         cast_tree(weights, torch.float64),
         direction,
         grad_out.double(),

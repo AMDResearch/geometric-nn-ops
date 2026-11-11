@@ -16,6 +16,8 @@ import torch
 
 from geometric_nn_ops_torch.triangle import triangle_attention as _ta
 
+from ._mask import to_bool_mask
+
 # Provided to match cuEquivariance's documented API. Our kernel handles short
 # sequences fine, so indicate a low threshold to prefer it. We do not actually
 # use this value to trigger a fallback.
@@ -40,10 +42,7 @@ def triangle_attention(
     q = q.transpose(-2, -3)
     k = k.transpose(-2, -3)
     v = v.transpose(-2, -3)
-    # cueq documents the mask as "cast to bool internally"; our op requires bool.
-    if mask is not None:
-        mask = mask.bool()
-    o = _ta(q, k, v, bias, mask, scale).transpose(-2, -3)
+    o = _ta(q, k, v, bias, to_bool_mask(mask), scale).transpose(-2, -3)
     # cueq pads a sub-rank-5 input up to rank 5 and returns it that way; our op
     # returns the rank it was given.
     if o.dim() < 5:
