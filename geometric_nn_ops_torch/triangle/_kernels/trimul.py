@@ -1,21 +1,14 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Triton building-block kernels for triangle_multiplicative_update.
+"""Layout-aware Triton-assisted triangle multiplication, forward only."""
 
-These are fused layernorm / linear (+ sigmoid / mul / mask / add) primitives;
-depend only on ``torch`` + ``triton``. Forward-only (no autograd).
-"""
+import math
+import os
 
 import torch
 
-from geometric_nn_ops_torch import _precision
-
-# For now we reuse this from the pure torch implementation.
-from geometric_nn_ops_torch.triangle._reference.trimul import (
-    _combine_projections,
-    is_outgoing,
-)
+from geometric_nn_ops_torch.triangle._reference.trimul import is_outgoing
 
 try:
     import triton
@@ -25,380 +18,421 @@ try:
 except ImportError:
     TRITON_AVAILABLE = False
 
+
 if TRITON_AVAILABLE:
 
     @triton.jit
-    def layernorm_kernel(
-        x_ptr,
-        output_ptr,
-        weight_ptr,
-        bias_ptr,
-        M,
-        N,
-        eps,
-        BLOCK_SIZE: tl.constexpr,
-        ROWS_PER_PROGRAM: tl.constexpr,
-    ):
-        """
-        Vectorized LayerNorm kernel with multi-row processing and safe bounds checking.
-        Each program processes ROWS_PER_PROGRAM rows to amortize launch overhead.
-        Uses vectorized tl.sum reductions instead of scalar Welford loop.
-        Normalizes over the last dimension (N).
-        """
-        row_start = tl.program_id(0) * ROWS_PER_PROGRAM
-
-        # Early exit if out of bounds
-        if row_start >= M:
-            return
-
-        for row in range(ROWS_PER_PROGRAM):
-            row_idx = row_start + row
-            if row_idx < M:
-                row_offset = row_idx.to(tl.int64) * N
-                x_row_ptr = x_ptr + row_offset
-                out_row_ptr = output_ptr + row_offset
-
-                # Pass 1: vectorized mean and variance computation
-                sum_val = 0.0
-                sum_sq = 0.0
-                for block_start in range(0, N, BLOCK_SIZE):
-                    offs = block_start + tl.arange(0, BLOCK_SIZE)
-                    mask = (offs >= 0) & (offs < N)
-                    safe_offs = offs.to(tl.int64)
-                    x_block = tl.load(x_row_ptr + safe_offs, mask=mask, other=0.0).to(
-                        tl.float32
-                    )
-                    sum_val += tl.sum(x_block, axis=0)
-                    sum_sq += tl.sum(x_block * x_block, axis=0)
-
-                mean = sum_val / N
-                var = sum_sq / N - mean * mean
-                rstd = 1.0 / tl.sqrt(tl.maximum(var, eps))
-
-                # Pass 2: normalize and apply affine transform
-                for block_start in range(0, N, BLOCK_SIZE):
-                    offs = block_start + tl.arange(0, BLOCK_SIZE)
-                    mask = (offs >= 0) & (offs < N)
-
-                    safe_offs = offs.to(tl.int64)
-                    x_vals = tl.load(x_row_ptr + safe_offs, mask=mask, other=0.0).to(
-                        tl.float32
-                    )
-                    w_vals = tl.load(weight_ptr + safe_offs, mask=mask, other=1.0).to(
-                        tl.float32
-                    )
-                    b_vals = tl.load(bias_ptr + safe_offs, mask=mask, other=0.0).to(
-                        tl.float32
-                    )
-
-                    out = (x_vals - mean) * rstd * w_vals + b_vals
-                    tl.store(out_row_ptr + safe_offs, out, mask=mask)
+    def _welford_merge(mean_a, m2_a, count_a, mean_b, m2_b, count_b):
+        count = count_a + count_b
+        ratio = count_b / tl.maximum(count, 1.0)
+        delta = mean_b - mean_a
+        return (
+            mean_a + delta * ratio,
+            m2_a + m2_b + delta * delta * count_a * ratio,
+            count,
+        )
 
     @triton.jit
-    def linear_fused_kernel(
-        x_ptr,
-        w_ptr,
-        bias_ptr,
-        other_ptr,
-        mask_ptr,
-        add_tensor_ptr,
-        output_ptr,
-        M,
-        K,
-        N,
-        stride_xm,
-        stride_xk,
-        stride_wn,
-        stride_wk,
-        stride_om,
-        stride_on,
-        stride_other_m,
-        stride_other_n,
-        stride_mask_m,
-        stride_mask_n,
-        stride_add_m,
-        stride_add_n,
-        HAS_BIAS: tl.constexpr,
-        APPLY_SIGMOID: tl.constexpr,
-        APPLY_MUL: tl.constexpr,
-        HAS_MASK: tl.constexpr,
-        HAS_ADD: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        MATMUL_PRECISION: tl.constexpr,
+    def _row_norm(
+        X,
+        W,
+        B,
+        Y,
+        C: tl.constexpr,
+        SX: tl.constexpr,
+        EPS: tl.constexpr,
+        BC: tl.constexpr,
     ):
-        """
-        Fused linear layer with optional sigmoid, elementwise multiply, mask, and add
-        Supports combinations: linear [+ sigmoid] [* other] [* mask] [+ add_tensor]
-        """
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-
-        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-        m_mask = rm < M
-        n_mask = rn < N
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k_start in range(0, K, BLOCK_K):
-            rk = k_start + tl.arange(0, BLOCK_K)
-            k_mask = rk < K
-
-            x_offsets = (
-                rm[:, None].to(tl.int64) * stride_xm
-                + rk[None, :].to(tl.int64) * stride_xk
-            )
-
-            w_offsets = (
-                rn[None, :].to(tl.int64) * stride_wn
-                + rk[:, None].to(tl.int64) * stride_wk
-            )
-
-            x = tl.load(
-                x_ptr + x_offsets,
-                mask=m_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
-
-            w = tl.load(
-                w_ptr + w_offsets,
-                mask=k_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-
-            acc = tl.dot(x, w, acc, input_precision=MATMUL_PRECISION)
-
-        if HAS_BIAS:
-            bias_offsets = rn.to(tl.int64)
-            bias = tl.load(bias_ptr + bias_offsets, mask=n_mask, other=0.0)
-            acc += bias[None, :]
-
-        if APPLY_SIGMOID:
-            # Clamp to avoid exp overflow
-            acc = tl.where(acc > 20.0, 20.0, acc)
-            acc = tl.where(acc < -20.0, -20.0, acc)
-            acc = 1.0 / (1.0 + tl.exp(-acc))
-
-        if APPLY_MUL:
-            other_offsets = (
-                rm[:, None].to(tl.int64) * stride_other_m
-                + rn[None, :].to(tl.int64) * stride_other_n
-            )
-            other_vals = tl.load(
-                other_ptr + other_offsets,
-                mask=m_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-            acc = acc * other_vals
-
-        if HAS_MASK:
-            mask_offsets = (
-                rm[:, None].to(tl.int64) * stride_mask_m
-                + rn[None, :].to(tl.int64) * stride_mask_n
-            )
-            mask_vals = tl.load(
-                mask_ptr + mask_offsets,
-                mask=m_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-            acc = acc * mask_vals
-
-        if HAS_ADD:
-            add_offsets = (
-                rm[:, None].to(tl.int64) * stride_add_m
-                + rn[None, :].to(tl.int64) * stride_add_n
-            )
-            add_vals = tl.load(
-                add_tensor_ptr + add_offsets,
-                mask=m_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-            acc = acc + add_vals
-
-        out_offsets = (
-            rm[:, None].to(tl.int64) * stride_om + rn[None, :].to(tl.int64) * stride_on
+        row = tl.program_id(0).to(tl.int64)
+        col = tl.arange(0, BC)
+        x = tl.load(X + row * SX + col, col < C, 0).to(tl.float32)
+        # Shifting preserves small variances when the input has a large offset.
+        origin = tl.load(X + row * SX).to(tl.float32)
+        x = tl.where(col < C, x - origin, 0.0)
+        mean, m2, count = tl.reduce(
+            (x, tl.full((BC,), 0.0, tl.float32), (col < C).to(tl.float32)),
+            0,
+            _welford_merge,
         )
+        y = (x - mean) * tl.rsqrt(m2 / count + EPS)
+        y = y * tl.load(W + col, col < C, 0) + tl.load(B + col, col < C, 0)
+        tl.store(Y + row * C + col, y, col < C)
 
-        out_mask = m_mask[:, None] & n_mask[None, :]
-        tl.store(
-            output_ptr + out_offsets,
-            acc,
-            mask=out_mask,
+    @triton.jit
+    def _channel_norm(
+        X,
+        W,
+        B,
+        Y,
+        R: tl.constexpr,
+        C: tl.constexpr,
+        SX: tl.constexpr,
+        EPS: tl.constexpr,
+        BC: tl.constexpr,
+        BR: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64) * BR + tl.arange(0, BR)
+        col = tl.arange(0, BC)
+        valid = (col[:, None] < C) & (row[None, :] < R)
+        x = tl.load(X + col[:, None].to(tl.int64) * SX + row[None, :], valid, 0).to(
+            tl.float32
         )
+        origin = tl.load(X + row, row < R, 0).to(tl.float32)
+        x = tl.where(valid, x - origin[None, :], 0.0)
+        counts = tl.broadcast_to((col[:, None] < C).to(tl.float32), (BC, BR))
+        mean, m2, count = tl.reduce(
+            (x, tl.full((BC, BR), 0.0, tl.float32), counts),
+            0,
+            _welford_merge,
+        )
+        y = (x - mean[None, :]) * tl.rsqrt(m2[None, :] / count[None, :] + EPS)
+        y *= tl.load(W + col, col < C, 0)[:, None]
+        y += tl.load(B + col, col < C, 0)[:, None]
+        tl.store(Y + col[:, None].to(tl.int64) * R + row[None, :], y, valid)
 
-
-def triton_layernorm(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5
-) -> torch.Tensor:
-    """
-    Triton LayerNorm with vectorized reductions and multi-row processing.
-
-    Args:
-        x: Input tensor [..., N]
-        weight: Scale parameters [N]
-        bias: Shift parameters [N]
-        eps: Small constant for numerical stability
-
-    Returns:
-        Normalized tensor with same shape as x
-    """
-    input_shape = x.shape
-    N = input_shape[-1]
-    M = x.numel() // N
-
-    x_2d = x.reshape(M, N).contiguous()
-    output_2d = torch.empty_like(x_2d)
-
-    BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
-    ROWS_PER_PROGRAM = 8
-    grid = (triton.cdiv(M, ROWS_PER_PROGRAM),)
-
-    layernorm_kernel[grid](
-        x_2d,
-        output_2d,
-        weight,
-        bias,
-        M,
-        N,
-        eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        ROWS_PER_PROGRAM=ROWS_PER_PROGRAM,
-    )
-
-    return output_2d.reshape(input_shape)
-
-
-def triton_linear_fused(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    matmul_precision: str,
-    bias: torch.Tensor | None = None,
-    other: torch.Tensor | None = None,
-    mask: torch.Tensor | None = None,
-    add_tensor: torch.Tensor | None = None,
-    apply_sigmoid: bool = False,
-) -> torch.Tensor:
-    """
-    Fused linear layer with optional sigmoid, elementwise multiply, mask, and add.
-
-    Computes: linear(x) [* sigmoid] [* other] [* mask] [+ add_tensor]
-
-    Args:
-        x: Input tensor [..., K]
-        weight: Weight tensor [N, K] (same layout as nn.Linear.weight)
-        matmul_precision: tl.dot mode to use.
-        bias: Optional bias tensor [N]
-        other: Optional tensor to multiply with (same shape as output)
-        mask: Optional mask tensor (broadcastable with output)
-        add_tensor: Optional tensor to add to result (same shape as output)
-        apply_sigmoid: Whether to apply sigmoid to linear result
-
-    Returns:
-        Output tensor [..., N]
-    """
-    input_shape = x.shape
-    K = input_shape[-1]
-    M = x.numel() // K
-    N = weight.shape[0]
-
-    x_2d = x.reshape(M, K).contiguous()
-    output_2d = torch.empty((M, N), dtype=x.dtype, device=x.device)
-
-    BLOCK_M = min(128, triton.next_power_of_2(M))
-    BLOCK_N = min(64, triton.next_power_of_2(N))
-    BLOCK_K = min(64, triton.next_power_of_2(K))
-
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
-    if other is not None:
-        # other should match the output shape [..., N], so reshape accordingly
-        other_M = other.numel() // N
-        other_2d = other.reshape(other_M, N).contiguous()
-        if other_M != M:
-            raise ValueError(
-                f"Shape mismatch: tensor expects {other_M} rows but output has {M}"
+    def welford_norm(x, weight, bias, eps, *, channel_major=False):
+        """Normalize a validated matrix, retaining its consumer's layout."""
+        rows, channels = x.shape
+        if channel_major:
+            y = torch.empty_strided(
+                (rows, channels), (1, rows), device=x.device, dtype=x.dtype
             )
-        other_ptr = other_2d
-        other_stride_m, other_stride_n = other_2d.stride(0), other_2d.stride(1)
-    else:
-        other_ptr = x_2d  # guarded by APPLY_MUL constexpr
-        other_stride_m, other_stride_n = 0, 0
-
-    if mask is not None:
-        # mask should broadcast to output shape [..., N]
-        mask_M = mask.numel() // (mask.shape[-1] if mask.numel() > 0 else 1)
-        mask_features = mask.shape[-1] if mask.ndim > 0 else 1
-        if mask_features == 1:
-            # Broadcast mask to match output
-            mask_2d = mask.reshape(mask_M, 1).expand(M, N).contiguous()
+            _channel_norm[(triton.cdiv(rows, 16),)](
+                x,
+                weight.detach(),
+                bias.detach(),
+                y,
+                rows,
+                channels,
+                x.stride(1),
+                eps,
+                triton.next_power_of_2(channels),
+                16,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
         else:
-            mask_2d = mask.reshape(mask_M, mask_features).contiguous()
-            if mask_M != M or mask_features != N:
-                raise ValueError(
-                    f"Mask shape mismatch: got {mask_M}x{mask_features}, "
-                    f"expected {M}x{N}"
-                )
-        mask_ptr = mask_2d
-        mask_stride_m, mask_stride_n = mask_2d.stride(0), mask_2d.stride(1)
-    else:
-        mask_ptr = x_2d  # guarded by HAS_MASK constexpr
-        mask_stride_m, mask_stride_n = 0, 0
-
-    if add_tensor is not None:
-        # add_tensor should match the output shape [..., N]
-        add_M = add_tensor.numel() // N
-        add_tensor_2d = add_tensor.reshape(add_M, N).contiguous()
-        if add_M != M:
-            raise ValueError(
-                f"Shape mismatch: add_tensor expects {add_M} rows but output has {M}"
+            y = torch.empty((rows, channels), device=x.device, dtype=x.dtype)
+            _row_norm[(rows,)](
+                x,
+                weight.detach(),
+                bias.detach(),
+                y,
+                channels,
+                x.stride(0),
+                eps,
+                triton.next_power_of_2(channels),
+                num_warps=4,
+                enable_fp_fusion=False,
             )
-        add_tensor_ptr = add_tensor_2d
-        add_stride_m, add_stride_n = add_tensor_2d.stride(0), add_tensor_2d.stride(1)
-    else:
-        add_tensor_ptr = x_2d  # guarded by HAS_ADD constexpr
-        add_stride_m, add_stride_n = 0, 0
+        return y
 
-    bias_ptr = bias if bias is not None else x_2d  # guarded by HAS_BIAS constexpr
+    @triton.jit
+    def _input_gate(PG, MASK, M: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        valid = i < K * M
+        p = tl.load(PG + i, valid, 0).to(tl.float32)
+        g = tl.load(PG + i + K * M, valid, 0).to(tl.float32)
+        mask = tl.load(MASK + i % M, valid, 0).to(tl.float32)
+        tl.store(PG + i, p * (1.0 / (1.0 + tl.exp(-g))) * mask, valid)
 
-    linear_fused_kernel[grid](
-        x_2d,
-        weight,
-        bias_ptr,
-        other_ptr,
-        mask_ptr,
-        add_tensor_ptr,
-        output_2d,
-        M,
-        K,
-        N,
-        x_2d.stride(0),
-        x_2d.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        output_2d.stride(0),
-        output_2d.stride(1),
-        other_stride_m,
-        other_stride_n,
-        mask_stride_m,
-        mask_stride_n,
-        add_stride_m,
-        add_stride_n,
-        HAS_BIAS=(bias is not None),
-        APPLY_SIGMOID=apply_sigmoid,
-        APPLY_MUL=(other is not None),
-        HAS_MASK=(mask is not None),
-        HAS_ADD=(add_tensor is not None),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        MATMUL_PRECISION=matmul_precision,
-    )
+    @triton.jit
+    def _output_gate(P, G, SIZE: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        valid = i < SIZE
+        p = tl.load(P + i, valid, 0).to(tl.float32)
+        g = tl.load(G + i, valid, 0).to(tl.float32)
+        tl.store(P + i, p * (1.0 / (1.0 + tl.exp(-g))), valid)
 
-    output_shape = input_shape[:-1] + (N,)
-    return output_2d.reshape(output_shape)
+
+_LN_MAX_ELEMENTS = 1 << 30
+_SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _require_inference(x):
+    if torch.is_grad_enabled() or torch.is_autocast_enabled():
+        raise ValueError("Optimized inference requires no_grad and no autocast")
+    if x.dtype not in _SUPPORTED_DTYPES or x.requires_grad:
+        raise ValueError(
+            "Optimized inference requires detached FP32, FP16 or BF16 activations"
+        )
+    if os.environ.get("TRITON_INTERPRET") == "1" and x.device.type == "cpu":
+        return
+    if x.device.type != "cuda":
+        raise ValueError("Optimized inference requires a gfx950 GPU")
+    properties = torch.cuda.get_device_properties(x.device)
+    if getattr(properties, "gcnArchName", "").split(":")[0] != "gfx950":
+        raise ValueError("Optimized inference is currently supported only on gfx950")
+
+
+def _tensor(value, shape, device, dtype, name, *, contiguous=True):
+    if (
+        value.shape != shape
+        or value.dtype != dtype
+        or value.device != device
+        or (contiguous and not value.is_contiguous())
+    ):
+        raise ValueError(
+            f"{name} must be {dtype} {shape} on {device}"
+            + (" and contiguous" if contiguous else "")
+        )
+
+
+class LayoutAwareTriangleMultiplicativeUpdate:
+    """Bounded, bias-free projection TriMul with true Welford normalizations.
+
+    Parameters use the existing concatenated [a; b] p_in/g_in convention.
+    Torch GEMMs and bmm perform projections/contractions. No model import,
+    global hooks or training fallback is installed. Weights remain caller-owned;
+    ordinary in-place weight updates invalidate cached grouped weights.
+    Rebuild this object after replacing parameter tensors (e.g. model.to()).
+    """
+
+    def __init__(
+        self,
+        *,
+        norm_in_weight,
+        norm_in_bias,
+        p_in_weight,
+        g_in_weight,
+        norm_out_weight,
+        norm_out_bias,
+        p_out_weight,
+        g_out_weight,
+        p_in_bias=None,
+        g_in_bias=None,
+        p_out_bias=None,
+        g_out_bias=None,
+        eps=1e-5,
+        norm_out_eps=None,
+        memory_budget_bytes=12 << 30,
+        triton_input_gate=False,
+        triton_output_gate=False,
+    ):
+        self.weights = (
+            norm_in_weight,
+            norm_in_bias,
+            p_in_weight,
+            g_in_weight,
+            norm_out_weight,
+            norm_out_bias,
+            p_out_weight,
+            g_out_weight,
+        )
+        self.biases = (p_in_bias, g_in_bias, p_out_bias, g_out_bias)
+        self.eps = float(eps)
+        self.norm_out_eps = self.eps if norm_out_eps is None else float(norm_out_eps)
+        if not all(math.isfinite(e) and e > 0 for e in (self.eps, self.norm_out_eps)):
+            raise ValueError("LayerNorm epsilons must be positive and finite")
+        if (
+            not isinstance(memory_budget_bytes, int)
+            or isinstance(memory_budget_bytes, bool)
+            or memory_budget_bytes < 1
+        ):
+            raise ValueError("memory_budget_bytes must be a positive integer")
+        if not isinstance(triton_input_gate, bool) or not isinstance(
+            triton_output_gate, bool
+        ):
+            raise ValueError("Triton gate switches must be boolean")
+        self.memory_budget_bytes = memory_budget_bytes
+        self.triton_input_gate = triton_input_gate
+        self.triton_output_gate = triton_output_gate
+        self._cached_key = None
+        self._cached_weights = None
+
+    def _grouped_weights(self, hc, h, c):
+        pw, gw = self.weights[2:4]
+        # Inference tensors have no version counter; never cache them.
+        key = (
+            None
+            if pw.is_inference() or gw.is_inference()
+            else (
+                hc,
+                pw.data_ptr(),
+                pw._version,
+                gw.data_ptr(),
+                gw._version,
+            )
+        )
+        if key is not None and key == self._cached_key:
+            return self._cached_weights
+        parts = (*pw.detach().split(h), *gw.detach().split(h))
+        grouped = (
+            torch.stack(parts)
+            .view(4, h // hc, hc, c)
+            .transpose(0, 1)
+            .reshape(h // hc, 4 * hc, c)
+            .contiguous()
+        )
+        self._cached_key, self._cached_weights = key, grouped
+        return grouped
+
+    def __call__(self, x, direction="outgoing", mask=None, *, out=None, add=False):
+        """Update [*, N, N, C]; optional contiguous ``out`` may alias ``x``.
+
+        ``add=True`` requires ``out`` and adds the update to its existing values.
+        Masks may be broadcast bool or floating point, including fractional weights.
+        """
+        _require_inference(x)
+        outgoing = is_outgoing(direction)
+        if (
+            x.ndim < 3
+            or x.shape[-3] != x.shape[-2]
+            or not x.is_contiguous()
+            or x.numel() == 0
+        ):
+            raise ValueError("x must be a nonempty contiguous square pair tensor")
+        n, c = x.shape[-2:]
+        pw = self.weights[2]
+        if pw.ndim != 2 or pw.shape[0] % 2:
+            raise ValueError("p_in_weight must have 2 * hidden rows")
+        h = pw.shape[0] // 2
+        if not min(h, c) >= 1 or max(h, c) > 1024:
+            raise ValueError("Input and hidden channels must be in [1, 1024]")
+        shapes = [(c,), (c,), (2 * h, c), (2 * h, c), (h,), (h,), (c, h), (c, c)]
+        for i, (weight, shape) in enumerate(zip(self.weights, shapes, strict=True)):
+            _tensor(weight, shape, x.device, x.dtype, f"weight[{i}]")
+        for i, (bias, shape) in enumerate(
+            zip(self.biases, ((2 * h,), (2 * h,), (c,), (c,)), strict=True)
+        ):
+            if bias is not None:
+                _tensor(bias, shape, x.device, x.dtype, f"bias[{i}]")
+        if not isinstance(add, bool) or (add and out is None):
+            raise ValueError("add must be boolean and requires out")
+        if out is not None:
+            _tensor(out, x.shape, x.device, x.dtype, "out")
+            if out.requires_grad:
+                raise ValueError("out must not require gradients")
+            storage = out.untyped_storage().data_ptr()
+            if (
+                storage == x.untyped_storage().data_ptr()
+                and out.data_ptr() != x.data_ptr()
+            ):
+                raise ValueError("out may alias x exactly, not partially")
+            if any(storage == w.untyped_storage().data_ptr() for w in self.weights):
+                raise ValueError("out must not alias weights")
+        if mask is not None:
+            if mask.device != x.device or mask.dtype not in (
+                torch.bool,
+                *_SUPPORTED_DTYPES,
+            ):
+                raise ValueError(
+                    "mask must be bool, FP32, FP16 or BF16 on the input device"
+                )
+            if mask.requires_grad:
+                raise ValueError("mask must not require gradients")
+            if (
+                out is not None
+                and mask.untyped_storage().data_ptr()
+                == out.untyped_storage().data_ptr()
+            ):
+                raise ValueError("out must not alias mask")
+            mask = mask.broadcast_to(x.shape[:-1]).reshape(-1, n, n)
+        m = n * n
+        if self.memory_budget_bytes < max(4 * m * 4, 4 * (2 * h + 3 * c)):
+            raise ValueError("memory_budget_bytes cannot hold one head/output row")
+        cap = min(h, self.memory_budget_bytes // (4 * m * 4))
+        hc = next(d for d in range(cap, 0, -1) if h % d == 0)
+        grouped = self._grouped_weights(hc, h, c)
+        result = torch.empty_like(x) if out is None else out
+        xb, rb = x.view(-1, n, n, c), result.view(-1, n, n, c)
+        for batch in range(xb.shape[0]):
+            pair_mask = (
+                x.new_ones(1, m)
+                if mask is None
+                else mask[batch].reshape(1, m).to(x.dtype).contiguous()
+            )
+            self._update(xb[batch], rb[batch], pair_mask, grouped, h, hc, outgoing, add)
+        return result
+
+    def _update(self, x, result, mask, grouped, h, hc, outgoing, add):
+        import triton
+
+        n, _, c = x.shape
+        m = n * n
+        niw, nib, _, _, now, nob, pow_, gow = self.weights
+        pib, gib, pob, gob = self.biases
+        xf = x.view(m, c)
+        ln_rows = max(1, _LN_MAX_ELEMENTS // c)
+        if m <= ln_rows:
+            zn = welford_norm(xf, niw, nib, self.eps)
+        else:
+            zn = torch.empty_like(xf)
+            for r in range(0, m, ln_rows):
+                zn[r : r + ln_rows] = welford_norm(
+                    xf[r : r + ln_rows], niw, nib, self.eps
+                )
+        contracted = x.new_empty(h, n, n)
+        for i, weight in enumerate(grouped):
+            pg = torch.mm(weight, zn.t())
+            if pib is not None or gib is not None:
+                p_bias = pib if pib is not None else x.new_zeros(2 * h)
+                g_bias = gib if gib is not None else x.new_zeros(2 * h)
+                bias = torch.cat(
+                    (
+                        p_bias[i * hc : (i + 1) * hc],
+                        p_bias[h + i * hc : h + (i + 1) * hc],
+                        g_bias[i * hc : (i + 1) * hc],
+                        g_bias[h + i * hc : h + (i + 1) * hc],
+                    )
+                )
+                pg.add_(bias[:, None])
+            if self.triton_input_gate:
+                _input_gate[(triton.cdiv(2 * hc * m, 1024),)](
+                    pg, mask, m, 2 * hc, 1024, num_warps=4, enable_fp_fusion=False
+                )
+                ab = pg[: 2 * hc]
+            else:
+                ab = pg[: 2 * hc].mul_(pg[2 * hc :].sigmoid_()).mul_(mask)
+            a, b = ab[:hc].view(hc, n, n), ab[hc:].view(hc, n, n)
+            target = contracted[i * hc : (i + 1) * hc]
+            if outgoing:
+                torch.bmm(a, b.transpose(1, 2), out=target)
+            else:
+                torch.bmm(a.transpose(1, 2), b, out=target)
+            del pg, ab, a, b
+        rows = max(
+            1,
+            min(
+                m,
+                _LN_MAX_ELEMENTS // max(h, c),
+                self.memory_budget_bytes // (4 * (2 * h + 3 * c)),
+            ),
+        )
+        chunks = triton.cdiv(m, rows)
+        rows = triton.cdiv(m, chunks)
+        cf = contracted.view(h, m)
+        rf = result.view(m, c)
+        for r in range(0, m, rows):
+            normalized = welford_norm(
+                cf[:, r : r + rows].t(),
+                now,
+                nob,
+                self.norm_out_eps,
+                channel_major=True,
+            )
+            value = torch.mm(normalized, pow_.t())
+            gate = torch.mm(zn[r : r + rows], gow.t())
+            if pob is not None:
+                value.add_(pob)
+            if gob is not None:
+                gate.add_(gob)
+            if self.triton_output_gate:
+                _output_gate[(triton.cdiv(value.numel(), 1024),)](
+                    value,
+                    gate,
+                    value.numel(),
+                    1024,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
+            else:
+                value.mul_(gate.sigmoid_())
+            if add:
+                rf[r : r + rows].add_(value)
+            else:
+                rf[r : r + rows].copy_(value)
+            del normalized, gate, value
 
 
 def trimul_triton(
@@ -420,29 +454,23 @@ def trimul_triton(
     g_out_weight=None,
     g_out_bias=None,
 ):
-    """Triangle multiplicative update using fused Triton kernels. Forward only.
-
-    Takes the same arguments as ``trimul_torch``; see it for the layouts.
-    """
-    outgoing = is_outgoing(direction)
-    c_hidden = p_in_weight.shape[0] // 2
-    m = None
-    if mask is not None:
-        # The kernels index one entry per pair row, so we need to make the
-        # broadcast explicit.
-        m = mask.unsqueeze(-1).expand(*x.shape[:-1], 1)
-    precision = _precision.matmul_precision(fp32_operands=x.dtype == torch.float32)
-    z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
-    pg = triton_linear_fused(
-        z, g_in_weight, precision, bias=g_in_bias, apply_sigmoid=True
-    )
-    p = triton_linear_fused(z, p_in_weight, precision, bias=p_in_bias, other=pg, mask=m)
-    a = p[..., :c_hidden]
-    b = p[..., c_hidden:]
-    o = _combine_projections(a, b, outgoing)
-    o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
-    o = triton_linear_fused(o, p_out_weight, precision, bias=p_out_bias)
-    g = triton_linear_fused(
-        z, g_out_weight, precision, bias=g_out_bias, apply_sigmoid=True
-    )
-    return o * g
+    """Layout-aware forward-only triangle multiplication."""
+    with torch.no_grad():
+        op = LayoutAwareTriangleMultiplicativeUpdate(
+            norm_in_weight=norm_in_weight,
+            norm_in_bias=norm_in_bias,
+            p_in_weight=p_in_weight,
+            p_in_bias=p_in_bias,
+            g_in_weight=g_in_weight,
+            g_in_bias=g_in_bias,
+            norm_out_weight=norm_out_weight,
+            norm_out_bias=norm_out_bias,
+            p_out_weight=p_out_weight,
+            p_out_bias=p_out_bias,
+            g_out_weight=g_out_weight,
+            g_out_bias=g_out_bias,
+            eps=eps,
+            triton_input_gate=True,
+            triton_output_gate=True,
+        )
+        return op(x.detach().contiguous(), direction, mask)
