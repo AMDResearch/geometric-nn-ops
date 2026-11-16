@@ -15,6 +15,7 @@ import torch
 triton = pytest.importorskip("triton")
 
 from geometric_nn_ops_torch.triangle import triangle_attention
+from geometric_nn_ops_torch.triangle._kernels import triangle_attention as kernels
 from geometric_nn_ops_torch.triangle._kernels.triangle_attention import (
     triangle_attention_triton,
 )
@@ -60,6 +61,37 @@ IMPLEMENTATIONS = {
 IMPLEMENTATION_PARAM = pytest.mark.parametrize(
     "impl", list(IMPLEMENTATIONS.values()), ids=list(IMPLEMENTATIONS.keys())
 )
+
+
+@pytest.mark.parametrize(
+    ("hip", "dim", "expected"),
+    [
+        (
+            True,
+            32,
+            {"waves_per_eu": 3, "matrix_instr_nonkdim": 16, "allow_flush_denorm": True},
+        ),
+        (
+            True,
+            64,
+            {"waves_per_eu": 3, "matrix_instr_nonkdim": 16, "allow_flush_denorm": True},
+        ),
+        (
+            True,
+            65,
+            {"waves_per_eu": 2, "matrix_instr_nonkdim": 16, "allow_flush_denorm": True},
+        ),
+        (True, None, {"waves_per_eu": 2, "matrix_instr_nonkdim": 16}),
+        (False, 32, {}),
+        (False, 65, {}),
+        (False, None, {}),
+    ],
+)
+def test_hip_kernel_options_preserve_forward_and_backward(
+    monkeypatch, hip, dim, expected
+):
+    monkeypatch.setattr(kernels, "is_hip", lambda: hip)
+    assert kernels._hip_kernel_options(dim=dim) == expected
 
 
 # Structural tests: These use contrived scenarios where we know the answer

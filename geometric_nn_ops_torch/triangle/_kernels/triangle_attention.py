@@ -45,6 +45,17 @@ if _TRITON_AVAILABLE:
         """Check if the current backend is HIP."""
         return triton.runtime.driver.active.get_current_target().backend == "hip"
 
+    def _hip_kernel_options(*, dim=None):
+        if not is_hip():
+            return {}
+        options = {
+            "waves_per_eu": 3 if dim is not None and dim <= 64 else 2,
+            "matrix_instr_nonkdim": 16,
+        }
+        if dim is not None:
+            options["allow_flush_denorm"] = True
+        return options
+
     @triton.jit
     def _attn_fwd_inner(
         O_block,
@@ -1169,15 +1180,8 @@ if _TRITON_AVAILABLE:
 
             O = torch.empty_like(Q)
 
-            extra_kern_args = {}
-            if is_hip():
-                waves_per_eu = 3 if DIM <= 64 else 2
-                extra_kern_args = {
-                    "waves_per_eu": waves_per_eu,
-                    "allow_flush_denorm": True,
-                    "matrix_instr_nonkdim": 16,
-                }
-            else:
+            extra_kern_args = _hip_kernel_options(dim=DIM)
+            if not extra_kern_args:
                 # MFMA/waves_per_eu tunings are HIP-only; on other backends the
                 # kernel runs correct but untuned. Warn once (warnings dedups).
                 warnings.warn(
@@ -1372,8 +1376,7 @@ if _TRITON_AVAILABLE:
                 BLOCK_SIZE_KV=128,
                 num_warps=4,
                 num_stages=1,
-                # MFMA tile 16 + waves_per_eu=2 (HIP only) for dk_dv.
-                **({"waves_per_eu": 2, "matrix_instr_nonkdim": 16} if is_hip() else {}),
+                **_hip_kernel_options(),
                 WRITE_BLLHS=True,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
@@ -1429,7 +1432,7 @@ if _TRITON_AVAILABLE:
                 PIPE_STAGES=2,
                 num_warps=8,
                 num_stages=1,
-                **({"waves_per_eu": 2, "matrix_instr_nonkdim": 16} if is_hip() else {}),
+                **_hip_kernel_options(),
                 HAS_PAIR_BIAS=ctx.has_pair_bias,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
