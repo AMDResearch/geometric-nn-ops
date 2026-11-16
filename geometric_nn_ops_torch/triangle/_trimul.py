@@ -4,7 +4,7 @@
 """Functional triangle_multiplicative_update.
 
 Two backends with identical math:
-  * Triton fast path (forward-only) using the fused kernels in ``_kernels.trimul``.
+  * Layout-aware Triton-assisted path (forward-only) for gfx950.
   * Pure-torch fallback that is fully autograd-differentiable.
 
 Dispatch picks the torch path when a backward could run (grad is enabled and

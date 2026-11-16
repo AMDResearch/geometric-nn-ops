@@ -523,3 +523,43 @@ def test_cpu_is_differentiable():
     assert x.grad is not None and torch.isfinite(x.grad).all()
     for key, weight in weights.items():
         assert weight.grad is not None, f"{key} received no gradient"
+
+
+@requires_gpu
+@pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("biased", [False, True])
+@pytest.mark.parametrize(("n", "c", "hidden"), [(5, 7, 8), (32, 384, 384)])
+def test_layout_aware_forward(direction, dtype, biased, n, c, hidden):
+    weights = make_weights(c, hidden, "cuda", dtype, seed=3)
+    if biased:
+        weights |= make_projection_biases(c, hidden, "cuda", dtype, seed=5)
+    x, mask = make_pair_input(1, n, c, "cuda", dtype, seed=4)
+    with torch_matmul_precision("ieee"):
+        assert_forward_agrees_with_the_oracle(
+            x, mask, weights, direction, impl=triangle_multiplicative_update
+        )
+
+
+@requires_gpu
+@pytest.mark.parametrize("channels", [7, 64, 384])
+@pytest.mark.parametrize("offset", [0.0, 10000.0])
+def test_layout_aware_welford(channels, offset):
+    from geometric_nn_ops_torch.triangle._kernels.trimul import welford_norm
+
+    weight = torch.randn(channels, device="cuda")
+    bias = torch.randn(channels, device="cuda")
+    source = torch.randn(19, channels, device="cuda") * 0.1 + offset
+    expected = torch.nn.functional.layer_norm(
+        source.double(), (channels,), weight.double(), bias.double(), 1e-5
+    ).float()
+    for channel_major in (False, True):
+        x = (
+            torch.empty(channels, 30, device="cuda")[:, :19].t()
+            if channel_major
+            else torch.empty(19, channels + 3, device="cuda")[:, :channels]
+        )
+        x.copy_(source)
+        actual = welford_norm(x, weight, bias, 1e-5, channel_major=channel_major)
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        assert actual.stride() == ((1, 19) if channel_major else (channels, 1))
