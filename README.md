@@ -22,6 +22,20 @@ o = triangle_attention(q, k, v, bias=pair_bias, mask=mask, scale=scale)
 
 See the docstring for the appropriate tensor layouts and other options.
 
+For inference with shared pair bias and mask across row chunks,
+`PreparedTriangleAttention` snapshots those inputs once and optionally fuses
+multiplication by an already sigmoid-transformed gate. Head count is inferred
+from the bias; head dimension is inferred from Q/K/V. The opt-in API accepts
+FP32 IEEE inference on gfx950, batch size one, head dimensions from 1 to 128,
+up to 32 rows per call, and sequence lengths up to 3488. Recreate the prepared
+object after changing the shared bias or mask. The functional API is unchanged.
+
+Prepared-attention tests sweep head counts and dimensions, including the
+template and pair-attention configurations from the public
+[OpenFold3 model configuration](https://github.com/aqlaboratory/openfold-3/blob/b600fbf74720b3259d59b93ffa62a07516099d06/openfold3/projects/of3_all_atom/config/model_config.py),
+alongside synthetic shape and boundary cases. These are operation-level tests,
+not end-to-end OpenFold3 validation.
+
 ```python
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update
 

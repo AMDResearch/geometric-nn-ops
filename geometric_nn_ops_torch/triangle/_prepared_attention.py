@@ -45,10 +45,11 @@ def _tensor(value, shape, device, name, *, contiguous=True):
 class PreparedTriangleAttention:
     """Prepare invocation-local pair bias and mask for primary pair attention.
 
-    ``pair_bias``: [1, 1, 12, N, N] FP32; ``mask``: [1, N, 1, 1, N] bool,
+    ``pair_bias``: [1, 1, H, N, N] FP32; ``mask``: [1, N, 1, 1, N] bool,
     True means keep. Q/K/V and optional *already sigmoid-transformed* gate use
-    the public [1, rows, N, 12, 32] layout. Only batch=1, rows<=32, N<=3488,
-    FP32 gfx950 inference is supported. Recreate after bias/mask updates.
+    the public [1, rows, N, H, D] layout. Supports positive head counts,
+    head dimensions 1 to 128, batch=1, rows<=32, N<=3488, and FP32 gfx950
+    inference. Recreate after bias/mask updates.
 
     Construct once per shared bias and mask, then call with each Q/K/V chunk
     and its starting row. The existing functional attention API is unchanged.
@@ -59,10 +60,17 @@ class PreparedTriangleAttention:
         if pair_bias.ndim != 5:
             raise ValueError("pair_bias must have five axes")
         n = pair_bias.shape[-1]
+        heads = pair_bias.shape[2]
         if not 1 <= n <= 3488:
             raise ValueError("Prepared attention requires 1 <= N <= 3488")
+        if heads < 1:
+            raise ValueError("Prepared attention requires at least one head")
         _tensor(
-            pair_bias, (1, 1, 12, n, n), pair_bias.device, "pair_bias", contiguous=False
+            pair_bias,
+            (1, 1, heads, n, n),
+            pair_bias.device,
+            "pair_bias",
+            contiguous=False,
         )
         if (
             mask.shape != (1, n, 1, 1, n)
@@ -71,6 +79,7 @@ class PreparedTriangleAttention:
         ):
             raise ValueError("mask must be bool [1, N, 1, 1, N] on the bias device")
         self.n = n
+        self.heads = heads
         # Own snapshots rather than silently retaining mutable caller storage.
         self.bias = pair_bias.detach().clone(memory_format=torch.contiguous_format)
         self.mask = masked_key_bias(mask, torch.float32).contiguous()
@@ -78,7 +87,7 @@ class PreparedTriangleAttention:
     def __call__(
         self, q, k, v, *, start, gate=None, scale=None, return_logsumexp=False
     ):
-        """Return O, or (O, natural-log sumexp [1, rows, 12, N])."""
+        """Return O, or (O, natural-log sumexp [1, rows, H, N])."""
         _require_inference(q)
         if not isinstance(return_logsumexp, bool):
             raise ValueError("return_logsumexp must be boolean")
@@ -92,7 +101,10 @@ class PreparedTriangleAttention:
             or not 0 <= start <= self.n - rows
         ):
             raise ValueError("Invalid attention row chunk/start")
-        shape = (1, rows, self.n, 12, 32)
+        dim = q.shape[-1]
+        if not 1 <= dim <= 128:
+            raise ValueError("Prepared attention requires head dimension in [1, 128]")
+        shape = (1, rows, self.n, self.heads, dim)
         for name, value in (("q", q), ("k", k), ("v", v)):
             _tensor(value, shape, self.bias.device, name, contiguous=False)
             if (
@@ -109,7 +121,7 @@ class PreparedTriangleAttention:
                 or any(s <= 0 for s in gate.stride())
             ):
                 raise ValueError("gate requires detached, positive-stride channels")
-        scale = 32**-0.5 if scale is None else float(scale)
+        scale = dim**-0.5 if scale is None else float(scale)
         if not math.isfinite(scale):
             raise ValueError("scale must be finite")
         import triton
@@ -120,12 +132,12 @@ class PreparedTriangleAttention:
         canonical = [value.transpose(2, 3) for value in (q, k, v)]
         g = canonical[0] if gate is None else gate.transpose(2, 3)
         o = torch.empty_like(canonical[0])
-        m = torch.empty((1, rows, 12, self.n), device=q.device, dtype=q.dtype)
+        m = torch.empty((1, rows, self.heads, self.n), device=q.device, dtype=q.dtype)
         mask = self.mask[:, start : start + rows]
         options = dict(num_warps=4, num_stages=1)
         if q.device.type == "cuda":
-            options.update(_hip_kernel_options(dim=32))
-        _attention[(triton.cdiv(self.n, 64) * rows * 12,)](
+            options.update(_hip_kernel_options(dim=dim))
+        _attention[(triton.cdiv(self.n, 64) * rows * self.heads,)](
             *canonical,
             mask,
             self.bias,
@@ -143,7 +155,10 @@ class PreparedTriangleAttention:
             self.bias.stride(3),
             self.bias.stride(4),
             rows,
+            self.heads,
             self.n,
+            dim,
+            max(16, triton.next_power_of_2(dim)),
             scale,
             gate is not None,
             **options,

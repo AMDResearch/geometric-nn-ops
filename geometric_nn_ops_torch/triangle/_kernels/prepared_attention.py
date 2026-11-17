@@ -50,7 +50,10 @@ def _attention(
     SB3: tl.constexpr,
     SB4: tl.constexpr,
     ROWS: tl.constexpr,
+    HEADS: tl.constexpr,
     N: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
     SCALE: tl.constexpr,
     FUSE_GATE: tl.constexpr,
 ):
@@ -62,14 +65,14 @@ def _attention(
     head = (rest // tl.cdiv(N, 64)).to(tl.int64)
     q = (query * 64 + tl.arange(0, 64)).to(tl.int64)
     k = tl.arange(0, 32).to(tl.int64)
-    d = tl.arange(0, 32).to(tl.int64)
+    d = tl.arange(0, BLOCK_DIM).to(tl.int64)
     qp = Q + row * SQ1 + head * SQ2 + q[:, None] * SQ3 + d[None, :] * SQ4
     kp = K + row * SK1 + head * SK2 + d[:, None] * SK4 + k[None, :] * SK3
     vp = V + row * SV1 + head * SV2 + k[:, None] * SV3 + d[None, :] * SV4
     bp = BIAS + head * SB2 + q[:, None] * SB3 + k[None, :] * SB4
     mp = MASK + row * SM1 + k[None, :] * SM4
-    qb = tl.load(qp, q[:, None] < N, 0.0)
-    acc = tl.zeros((64, 32), tl.float32)
+    qb = tl.load(qp, (q[:, None] < N) & (d[None, :] < DIM), 0.0)
+    acc = tl.zeros((64, BLOCK_DIM), tl.float32)
     denominator = tl.full((64,), 1.0, tl.float32)
     maximum = tl.full((64,), float("-inf"), tl.float32)
     acc, denominator, maximum = _attn_fwd_inner(
@@ -82,7 +85,7 @@ def _attention(
         mp,
         bp,
         query,
-        32,
+        DIM,
         SK3,
         SV3,
         SM4,
@@ -90,11 +93,11 @@ def _attention(
         SCALE,
         N % 64 == 0,
         N % 32 == 0,
-        True,
+        DIM == BLOCK_DIM,
         True,
         64,
         32,
-        32,
+        BLOCK_DIM,
         q,
         k,
         d,
@@ -106,7 +109,7 @@ def _attention(
     acc = acc / denominator[:, None]
     if FUSE_GATE:
         gp = GATE + row * SG1 + head * SG2 + q[:, None] * SG3 + d[None, :] * SG4
-        acc *= tl.load(gp, q[:, None] < N, 0.0)
+        acc *= tl.load(gp, (q[:, None] < N) & (d[None, :] < DIM), 0.0)
     op = O + row * SO1 + head * SO2 + q[:, None] * SO3 + d[None, :] * SO4
-    tl.store(op, acc, q[:, None] < N)
-    tl.store(M + (row * 12 + head) * N + q, maximum, q < N)
+    tl.store(op, acc, (q[:, None] < N) & (d[None, :] < DIM))
+    tl.store(M + (row * HEADS + head) * N + q, maximum, q < N)
