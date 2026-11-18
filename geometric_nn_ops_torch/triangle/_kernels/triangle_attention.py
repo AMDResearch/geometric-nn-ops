@@ -1329,6 +1329,7 @@ if _TRITON_AVAILABLE:
                 num_warps=4,
                 num_stages=2,
                 **_hip_kernel_options(),
+                **_hip_kernel_options()
             )
 
             bwd_dk_dv_grid = lambda args: (  # noqa: E731
