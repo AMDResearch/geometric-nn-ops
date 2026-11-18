@@ -1181,11 +1181,6 @@ if _TRITON_AVAILABLE:
                     "tuned for performance on this non-HIP backend.",
                     stacklevel=2,
                 )
-            extra_kern_args = _hip_kernel_options(
-                waves_per_eu=3 if DIM <= 64 else 2,
-                allow_flush_denorm=True,
-            )
-
             # Forward tiles Q=64, KV=16: validated fastest on real (low_mem chunked)
             block_size_q = 64
             _oss_bkv = 16
@@ -1259,7 +1254,10 @@ if _TRITON_AVAILABLE:
                 num_warps=4,
                 num_stages=1,
                 **_extra_even,
-                **extra_kern_args,
+                **_hip_kernel_options(
+                    waves_per_eu=3 if DIM <= 64 else 2,
+                    allow_flush_denorm=True,
+                ),
             )
 
             ctx.save_for_backward(Q, K, V, res_mask, pair_bias, O, M)
