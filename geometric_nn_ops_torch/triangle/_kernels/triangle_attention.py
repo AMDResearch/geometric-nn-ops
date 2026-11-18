@@ -45,16 +45,11 @@ if _TRITON_AVAILABLE:
         """Check if the current backend is HIP."""
         return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-    def _hip_kernel_options(*, dim=None):
+    def _hip_kernel_options(**tuning):
+        """Return common HIP launch options plus kernel-specific tuning."""
         if not is_hip():
             return {}
-        options = {
-            "waves_per_eu": 3 if dim is not None and dim <= 64 else 2,
-            "matrix_instr_nonkdim": 16,
-        }
-        if dim is not None:
-            options["allow_flush_denorm"] = True
-        return options
+        return {"matrix_instr_nonkdim": 16, **tuning}
 
     @triton.jit
     def _attn_fwd_inner(
@@ -1180,17 +1175,16 @@ if _TRITON_AVAILABLE:
 
             O = torch.empty_like(Q)
 
-            extra_kern_args = _hip_kernel_options(dim=DIM)
-            if not extra_kern_args:
-                # MFMA/waves_per_eu tunings are HIP-only; on other backends the
-                # kernel runs correct but untuned. Warn once (warnings dedups).
+            if not is_hip():
                 warnings.warn(
-                    "OpenFold3 Triton evoformer kernel is running on a non-HIP "
-                    "backend with default, untuned Triton config (AMD MFMA / "
-                    "waves_per_eu tunings disabled). Correctness holds; "
-                    "performance is not tuned for this backend.",
+                    "Triton triangle attention configurations have not been "
+                    "tuned for performance on this non-HIP backend.",
                     stacklevel=2,
                 )
+            extra_kern_args = _hip_kernel_options(
+                waves_per_eu=3 if DIM <= 64 else 2,
+                allow_flush_denorm=True,
+            )
 
             # Forward tiles Q=64, KV=16: validated fastest on real (low_mem chunked)
             block_size_q = 64
@@ -1377,7 +1371,7 @@ if _TRITON_AVAILABLE:
                 BLOCK_SIZE_KV=128,
                 num_warps=4,
                 num_stages=1,
-                **_hip_kernel_options(),
+                **_hip_kernel_options(waves_per_eu=2),
                 WRITE_BLLHS=True,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
@@ -1433,7 +1427,7 @@ if _TRITON_AVAILABLE:
                 PIPE_STAGES=2,
                 num_warps=8,
                 num_stages=1,
-                **_hip_kernel_options(),
+                **_hip_kernel_options(waves_per_eu=2),
                 HAS_PAIR_BIAS=ctx.has_pair_bias,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
