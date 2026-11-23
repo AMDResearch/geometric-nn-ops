@@ -127,7 +127,7 @@ class PreparedTriangleAttention:
         import triton
 
         from ._kernels.prepared_attention import _attention
-        from ._kernels.triangle_attention import _hip_kernel_options
+        from ._kernels.triangle_attention import _hip_kernel_options, is_hip
 
         canonical = [value.transpose(2, 3) for value in (q, k, v)]
         g = canonical[0] if gate is None else gate.transpose(2, 3)
@@ -136,7 +136,13 @@ class PreparedTriangleAttention:
         mask = self.mask[:, start : start + rows]
         options = dict(num_warps=4, num_stages=1)
         if q.device.type == "cuda":
-            options.update(_hip_kernel_options(dim=dim))
+            options.update(
+                _hip_kernel_options(
+                    is_hip(),
+                    waves_per_eu=3 if dim <= 64 else 2,
+                    allow_flush_denorm=True,
+                )
+            )
         _attention[(triton.cdiv(self.n, 64) * rows * self.heads,)](
             *canonical,
             mask,
