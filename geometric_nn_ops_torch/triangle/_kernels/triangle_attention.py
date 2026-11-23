@@ -45,9 +45,9 @@ if _TRITON_AVAILABLE:
         """Check if the current backend is HIP."""
         return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-    def _hip_kernel_options(**tuning):
+    def _hip_kernel_options(hip, **tuning):
         """Return common HIP launch options plus kernel-specific tuning."""
-        if not is_hip():
+        if not hip:
             return {}
         return {"matrix_instr_nonkdim": 16, **tuning}
 
@@ -1175,7 +1175,8 @@ if _TRITON_AVAILABLE:
 
             O = torch.empty_like(Q)
 
-            if not is_hip():
+            hip = is_hip()
+            if not hip:
                 warnings.warn(
                     "Triton triangle attention configurations have not been "
                     "tuned for performance on this non-HIP backend.",
@@ -1255,6 +1256,7 @@ if _TRITON_AVAILABLE:
                 num_stages=1,
                 **_extra_even,
                 **_hip_kernel_options(
+                    hip,
                     waves_per_eu=3 if DIM <= 64 else 2,
                     allow_flush_denorm=True,
                 ),
@@ -1277,6 +1279,7 @@ if _TRITON_AVAILABLE:
             """Run the backward pass of the attention mechanism."""
 
             Q, K, V, res_mask, pair_bias, O, M = ctx.saved_tensors
+            hip = is_hip()
             # preprocess writes the internal-layout dO, folding away a transpose.
             dO_bllhs = dO.contiguous()
             dO = torch.empty_like(Q)  # internal layout, filled by preprocess
@@ -1328,7 +1331,7 @@ if _TRITON_AVAILABLE:
                 N_SEQ=N_SEQ,
                 num_warps=4,
                 num_stages=2,
-                **_hip_kernel_options(),
+                **_hip_kernel_options(hip),
             )
 
             bwd_dk_dv_grid = lambda args: (  # noqa: E731
@@ -1369,7 +1372,7 @@ if _TRITON_AVAILABLE:
                 BLOCK_SIZE_KV=128,
                 num_warps=4,
                 num_stages=1,
-                **_hip_kernel_options(waves_per_eu=2),
+                **_hip_kernel_options(hip, waves_per_eu=2),
                 WRITE_BLLHS=True,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
@@ -1425,7 +1428,7 @@ if _TRITON_AVAILABLE:
                 PIPE_STAGES=2,
                 num_warps=8,
                 num_stages=1,
-                **_hip_kernel_options(waves_per_eu=2),
+                **_hip_kernel_options(hip, waves_per_eu=2),
                 HAS_PAIR_BIAS=ctx.has_pair_bias,
                 USE_EXP2=ctx.use_exp2,
                 MATMUL_PRECISION=ctx.matmul_precision,
