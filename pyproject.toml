@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"] # 1.27 has default License-Expression and License-File.
 build-backend = "hatchling.build"
 
 [project]
@@ -7,12 +7,11 @@ name = "geometric-nn-ops-torch"
 version = "0.1.0"
 description = "Vendor-neutral GPU kernels for geometry-aware neural nets (triangle/folding ops)"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [{ name = "Advanced Micro Devices, Inc." }]
 keywords = ["triton", "rocm", "hip", "amd", "attention", "alphafold", "openfold"]
 classifiers = [
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -22,9 +21,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+# Triton is not listed and we get it transitively through torch. Until the
+# Python ecosystem sorts out environment specific dependency variants, this
+# appears to be the least bad way and common practice. The package providing
+# Triton is sometimes named like `pytorch-triton-rocm` and so a dep on triton
+# here would clobber it.
 dependencies = [
     "torch>=2.4",
-    "triton>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -73,6 +76,10 @@ exclude_also = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["geometric_nn_ops_torch"]
+
+# The shim is a separate distribution built from its own directory.
+[tool.hatch.build.targets.sdist]
+exclude = ["/hipequivariance_ops_torch"]
 
 [tool.ruff]
 line-length = 88  # Black/ruff default

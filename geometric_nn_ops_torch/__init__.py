@@ -8,5 +8,3 @@ Kernels are namespaced by family as submodules, mirroring
 
 * ``geometric_nn_ops_torch.triangle`` — protein-folding (triangle) ops.
 """
-
-__version__ = "0.1.0"

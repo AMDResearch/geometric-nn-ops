@@ -1,0 +1,108 @@
+name: Build
+
+# Builds the sdists and wheels for both packages. Runs on PRs and main to catch
+# packaging problems early, and is called by release.yml
+
+on:
+  # Not push+pull_request because then it runs twice for PRs from branches
+  # within the repo.
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    outputs:
+      version:
+        description: The version both packages are built at.
+        value: ${{ jobs.build.outputs.version }}
+
+# A new push to a PR cancels the previous run. Pushes to main fall back to the
+# unique run_id and so never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      # A mismatched pair cannot be replaced once uploaded.
+      - name: Check the packages are versioned in lockstep
+        id: version
+        shell: python
+        run: |
+          import os
+          import sys
+          import tomllib
+
+          def project(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)["project"]
+
+          kernels = project("pyproject.toml")
+          shim = project("hipequivariance_ops_torch/pyproject.toml")
+          errors = []
+          if shim["version"] != kernels["version"]:
+              errors.append(
+                  f"shim version {shim['version']} != kernels version {kernels['version']}"
+              )
+          pin = f"{kernels['name']}=={kernels['version']}"
+          if pin not in shim["dependencies"]:
+              errors.append(f"shim dependencies {shim['dependencies']} lack {pin!r}")
+          if errors:
+              sys.exit("\n".join(errors))
+          print(f"version {kernels['version']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              print(f"version={kernels['version']}", file=f)
+
+      # Each package goes in its own directory so release.yml can publish them
+      # separately.
+      - name: Build
+        run: |
+          python -m pip install build check-wheel-contents twine
+          python -m build --outdir dist/geometric-nn-ops-torch .
+          python -m build --outdir dist/hipequivariance-ops-torch hipequivariance_ops_torch
+          python -m twine check --strict dist/*/*
+
+      - name: Check wheel contents
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          check-wheel-contents --package geometric_nn_ops_torch \
+            "dist/geometric-nn-ops-torch/geometric_nn_ops_torch-$VERSION-py3-none-any.whl"
+          check-wheel-contents --package hipequivariance_ops_torch/cuequivariance_ops_torch \
+            "dist/hipequivariance-ops-torch/hipequivariance_ops_torch-$VERSION-py3-none-any.whl"
+
+      - name: Check the wheels carry the license
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          unzip -l "dist/geometric-nn-ops-torch/geometric_nn_ops_torch-$VERSION-py3-none-any.whl" \
+            "geometric_nn_ops_torch-$VERSION.dist-info/licenses/LICENSE"
+          unzip -l "dist/hipequivariance-ops-torch/hipequivariance_ops_torch-$VERSION-py3-none-any.whl" \
+            "hipequivariance_ops_torch-$VERSION.dist-info/licenses/LICENSE"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-geometric-nn-ops-torch
+          path: dist/geometric-nn-ops-torch/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-hipequivariance-ops-torch
+          path: dist/hipequivariance-ops-torch/
+          if-no-files-found: error

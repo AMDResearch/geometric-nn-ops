@@ -1,0 +1,158 @@
+name: release
+
+# Releases both packages at the version in their pyproject.toml files. Run it by
+# dispatching it on a release tag, after pushing the tag:
+#
+#     git tag v0.1.0rc1 <commit> && git push <remote> v0.1.0rc1
+#
+# The tag selects where to publish. vVERSION publishes to PyPI and test-vVERSION
+# to TestPyPI, with VERSION X.Y.Z or X.Y.Z{a,b,rc}N. Both run the same steps
+# except that a test-v tag publishes to TestPyPI, skips the GitHub release, and
+# may be for a commit not on main. A v tag must be on main, and the workflow
+# creates a GitHub release for it with the sdists and wheels attached before
+# publishing to PyPI. a, b and rc versions are marked as GitHub pre-releases and
+# not as the latest release.
+#
+# PyPI and TestPyPI Trusted Publishing for both projects are bound to this
+# file's name and to the `pypi` and `testpypi` environments. Renaming the file
+# requires updating all four publishers.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  check:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      # The environment and package index to publish to: pypi or testpypi.
+      index: ${{ steps.check.outputs.index }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - name: Check the tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            echo "::error::Run this workflow on a release tag, not $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in
+            "v$VERSION") index=pypi ;;
+            "test-v$VERSION") index=testpypi ;;
+            *)
+              echo "::error::Tag $GITHUB_REF_NAME must be v$VERSION (PyPI) or test-v$VERSION (TestPyPI) for package version $VERSION"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::Release version $VERSION is not X.Y.Z or X.Y.Z{a,b,rc}N"
+            exit 1
+          fi
+          if [[ "$index" == pypi ]]; then
+            # "identical" or "ahead" means the tagged commit is an ancestor of main.
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)
+            if [[ "$status" != identical && "$status" != ahead ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME is not on main (compare status: $status)"
+              exit 1
+            fi
+          fi
+          echo "index=$index" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  github-release:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Create the GitHub release
+        # Skip actual release creation for tests. GitHub has no equivalent of
+        # TestPyPI. We skip at the step level so we exercise as much of the
+        # workflow as possible. It also allows us to avoid GitHub's weird
+        # behavior with jobs that depend on skipped jobs
+        # (https://github.com/orgs/community/discussions/45058)
+        if: needs.check.outputs.index == 'pypi'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          options=()
+          if [[ "$PRERELEASE" == true ]]; then
+            options=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "geometric-nn-ops $GITHUB_REF_NAME" \
+            --generate-notes \
+            "${options[@]}"
+
+  # Each package publishes from its own job because a single PyPI token exchange
+  # can create at most one new project. The shim goes second because it pins the
+  # kernels' exact version and must not be published without them.
+  publish-kernels:
+    needs: [check, github-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.check.outputs.index }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-geometric-nn-ops-torch
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: >-
+            ${{ needs.check.outputs.index == 'pypi'
+                && 'https://upload.pypi.org/legacy/'
+                || 'https://test.pypi.org/legacy/' }}
+          print-hash: true
+
+  publish-shim:
+    needs: [check, publish-kernels]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.check.outputs.index }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-hipequivariance-ops-torch
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: >-
+            ${{ needs.check.outputs.index == 'pypi'
+                && 'https://upload.pypi.org/legacy/'
+                || 'https://test.pypi.org/legacy/' }}
+          print-hash: true
