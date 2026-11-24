@@ -402,6 +402,78 @@ def triton_linear_fused(
     return output_2d.reshape(output_shape)
 
 
+def matmul_precision(dtype: torch.dtype) -> str:
+    return _precision.matmul_precision(fp32_operands=dtype == torch.float32)
+
+
+def _rows(t: torch.Tensor | None, rows: slice) -> torch.Tensor | None:
+    return None if t is None else t[rows]
+
+
+def gated_projection(
+    z_n: torch.Tensor,
+    mask: torch.Tensor | None,
+    precision: str,
+    channels: slice,
+    p_in_weight: torch.Tensor,
+    p_in_bias: torch.Tensor | None,
+    g_in_weight: torch.Tensor,
+    g_in_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Output ``channels`` of the gated input projection,
+    ``sigmoid(z_n @ g_in^T) * (z_n @ p_in^T)``, zeroed where ``mask`` is
+    ``False``. ``mask`` has a trailing singleton dim and broadcasts against the
+    output, or is ``None``."""
+    if mask is not None:
+        # The kernels index one entry per pair row, so we need to make the
+        # broadcast explicit.
+        mask = mask.expand(*z_n.shape[:-1], 1)
+    g = triton_linear_fused(
+        z_n,
+        g_in_weight[channels],
+        precision,
+        bias=_rows(g_in_bias, channels),
+        apply_sigmoid=True,
+    )
+    return triton_linear_fused(
+        z_n,
+        p_in_weight[channels],
+        precision,
+        bias=_rows(p_in_bias, channels),
+        other=g,
+        mask=mask,
+    )
+
+
+def output(
+    o: torch.Tensor,
+    z_n: torch.Tensor,
+    precision: str,
+    eps: float,
+    norm_out_weight: torch.Tensor | None,
+    norm_out_bias: torch.Tensor | None,
+    p_out_weight: torch.Tensor,
+    p_out_bias: torch.Tensor | None,
+    g_out_weight: torch.Tensor,
+    g_out_bias: torch.Tensor | None,
+    add: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``sigmoid(z_n @ g_out^T) * (LayerNorm(o) @ p_out^T)``, plus ``add`` if
+    given, where ``z_n`` is the normalized input at the same positions as
+    ``o``."""
+    o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
+    o = triton_linear_fused(o, p_out_weight, precision, bias=p_out_bias)
+    return triton_linear_fused(
+        z_n,
+        g_out_weight,
+        precision,
+        bias=g_out_bias,
+        other=o,
+        add_tensor=add,
+        apply_sigmoid=True,
+    )
+
+
 def trimul_triton(
     x,
     direction="outgoing",
@@ -420,31 +492,39 @@ def trimul_triton(
     p_out_bias=None,
     g_out_weight=None,
     g_out_bias=None,
+    residual=None,
 ):
     """Triangle multiplicative update using fused Triton kernels. Forward only.
 
-    Takes the same arguments as ``trimul_torch``; see it for the layouts.
+    Takes the same arguments as ``trimul_torch``; see it for the layouts. A
+    ``residual`` is added to the update inside the output kernel.
     """
     outgoing = is_outgoing(direction)
     check_bool_mask(mask)
+    precision = matmul_precision(x.dtype)
+    z_n = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
+    p = gated_projection(
+        z_n,
+        None if mask is None else mask.unsqueeze(-1),
+        precision,
+        slice(None),
+        p_in_weight,
+        p_in_bias,
+        g_in_weight,
+        g_in_bias,
+    )
     c_hidden = p_in_weight.shape[0] // 2
-    m = None
-    if mask is not None:
-        # The kernels index one entry per pair row, so we need to make the
-        # broadcast explicit.
-        m = mask.unsqueeze(-1).expand(*x.shape[:-1], 1)
-    precision = _precision.matmul_precision(fp32_operands=x.dtype == torch.float32)
-    z = triton_layernorm(x, norm_in_weight, norm_in_bias, eps)
-    pg = triton_linear_fused(
-        z, g_in_weight, precision, bias=g_in_bias, apply_sigmoid=True
+    o = _combine_projections(p[..., :c_hidden], p[..., c_hidden:], outgoing)
+    return output(
+        o,
+        z_n,
+        precision,
+        eps,
+        norm_out_weight,
+        norm_out_bias,
+        p_out_weight,
+        p_out_bias,
+        g_out_weight,
+        g_out_bias,
+        add=residual,
     )
-    p = triton_linear_fused(z, p_in_weight, precision, bias=p_in_bias, other=pg, mask=m)
-    a = p[..., :c_hidden]
-    b = p[..., c_hidden:]
-    o = _combine_projections(a, b, outgoing)
-    o = triton_layernorm(o, norm_out_weight, norm_out_bias, eps)
-    o = triton_linear_fused(o, p_out_weight, precision, bias=p_out_bias)
-    g = triton_linear_fused(
-        z, g_out_weight, precision, bias=g_out_bias, apply_sigmoid=True
-    )
-    return o * g

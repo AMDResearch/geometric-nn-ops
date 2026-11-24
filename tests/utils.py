@@ -73,6 +73,8 @@ def gpu_arch() -> str:
     return f"sm_{props.major}{props.minor}"
 
 
+DIRECTIONS_PARAM = pytest.mark.parametrize("direction", ["outgoing", "incoming"])
+
 DTYPES_PARAM = pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
