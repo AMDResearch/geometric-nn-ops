@@ -7,11 +7,21 @@ We read torch's fp32 matmul precision and have no per-call override, so cueq's
 ``precision`` argument can only be checked against that setting.
 """
 
+from unittest import mock
+
 import pytest
 from cuequivariance_ops_torch import TriMulPrecision
 from cuequivariance_ops_torch.triangle_multiplicative_update import _check_precision
 
-from testutil.precision import torch_matmul_precision
+from geometric_nn_ops_torch.triangle._kernels import dot_precision
+
+
+def mock_torch_matmul_precision(precision: str):
+    """Make the effective torch setting ``precision``. Reading the real setting
+    is tested in the main package; these only check the shim's logic."""
+    return mock.patch.object(
+        dot_precision, "torch_fp32_precision", return_value=precision
+    )
 
 
 def spellings(*members):
@@ -42,14 +52,14 @@ PERMITS_REDUCED = spellings(TriMulPrecision.TF32)
 def test_accepts_every_request_when_torch_is_ieee(precision):
     """Full precision satisfies every request, including those that would have
     permitted less."""
-    with torch_matmul_precision("ieee"):
+    with mock_torch_matmul_precision("ieee"):
         _check_precision(precision)
 
 
 @pytest.mark.parametrize("precision", [None, *NO_PREFERENCE], ids=str)
 def test_no_preference_passes_whatever_torch_is_set_to(precision):
     """NONE and DEFAULT express no request."""
-    with torch_matmul_precision("tf32"):
+    with mock_torch_matmul_precision("tf32"):
         _check_precision(precision)
 
 
@@ -57,7 +67,7 @@ def test_no_preference_passes_whatever_torch_is_set_to(precision):
 def test_rejects_more_precision_than_torch_is_set_to(precision):
     """We can't run with reduced precision when the caller asked for full."""
     with (
-        torch_matmul_precision("tf32"),
+        mock_torch_matmul_precision("tf32"),
         pytest.raises(ValueError, match="may not be able to satisfy"),
     ):
         _check_precision(precision)
@@ -68,7 +78,7 @@ def test_warns_when_torch_gives_more_precision_than_requested(precision):
     """Accuracy is satisfied, so this is not an error, but the caller asked for
     a speedup they are not getting."""
     with (
-        torch_matmul_precision("ieee"),
+        mock_torch_matmul_precision("ieee"),
         pytest.warns(UserWarning, match="without the speedup"),
     ):
         _check_precision(precision)
@@ -83,9 +93,8 @@ def test_rejects_an_unknown_int(precision):
 
 @pytest.mark.parametrize("precision", ["bogus", "mxfp8", "bf16"], ids=str)
 def test_tolerates_a_name_it_does_not_know(precision):
-    """Deliberate: the check compares the requested name to torch's setting
-    rather than against a fixed list, so names added by later cuequivariance
-    releases warn and run in full fp32 instead of hard-failing. A typo gets the
-    same treatment, which is the cost of not pinning the set."""
-    with torch_matmul_precision("ieee"), pytest.warns(UserWarning):
+    """We compare to the torch setting rather than a fixed list, so names added by
+    later cuequivariance releases warn and run in full fp32 instead of hard-failing.\
+    The cost is a typo gets the same treatment."""
+    with mock_torch_matmul_precision("ieee"), pytest.warns(UserWarning):
         _check_precision(precision)

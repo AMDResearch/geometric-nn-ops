@@ -1,0 +1,119 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Honors torch's fp32 matmul precision setting in the Triton kernels.
+
+``torch.backends.cuda.matmul.fp32_precision`` has values ``"ieee"`` or
+``"tf32"``, but there are other reduced precision dots as well (which Torch
+itself uses in its "high" precision mode), so we use the supported mode with at
+least the required precision.
+
+Left unset, ``tl.dot`` picks tf32 where available (which on AMD is only gfx942)
+and doesn't use other reduced-precision modes (e.g. bf16x3) or respect the Torch
+precision setting. So the kernels call ``tl_dot`` instead and pass the mode from
+``current_dot_precision``. Ruff bans ``tl.dot`` everywhere else (TID251).
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+IEEE = "ieee"
+TF32 = "tf32"
+
+# Triton dot modes for each setting, fastest first. Every chain ends at "ieee",
+# which all backends support, so resolution should always succeed.
+_MODES = {
+    TF32: ("tf32", "bf16x3", "ieee"),
+    IEEE: ("ieee",),
+}
+
+_ALLOWED_BY_TARGET: dict[object, tuple[str, ...]] = {}
+
+
+def has_fast_reduced_precision_fp32_dot() -> bool:
+    """Whether the current device has a reduced-precision fp32 dot that is faster
+    than full fp32.
+
+    Since bf16x3 is a software emulation, Triton reports it available on many
+    targets where it's not actually faster than ieee. This mirrors
+    ``torch.cuda.is_tf32_supported``. We implement it ourselves because that
+    function's behavior varies across torch versions: it does not exist before
+    2.7, and in 2.7 it returns False for all ROCm devices. If we drop support
+    for torch<2.7, we could consider using Torch's function directly.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return arch.gcnArchName.startswith(("gfx94", "gfx95"))
+    return torch.cuda.get_device_capability() >= (8, 0)
+
+
+def torch_fp32_precision() -> str:
+    """torch's current fp32 matmul precision, as ``IEEE`` or ``TF32``.
+
+    Returns ``IEEE`` on devices without a fast reduced-precision dot, whatever
+    the setting; see ``has_fast_reduced_precision_fp32_dot``.
+
+    Uses ``matmul.fp32_precision`` where available. The older
+    ``get_float32_matmul_precision()`` or ``matmul.allow_tf32`` raise if a
+    process has mixed torch's precision APIs whereas this works no matter how
+    the precision was set.
+    """
+    if not has_fast_reduced_precision_fp32_dot():
+        return IEEE
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        return TF32 if matmul.fp32_precision == TF32 else IEEE
+    return TF32 if matmul.allow_tf32 else IEEE
+
+
+def resolve(precision: str, allowed: tuple[str, ...]) -> str:
+    """Triton dot mode for ``precision`` on a target supporting ``allowed``."""
+    if precision not in _MODES:
+        raise ValueError(
+            f"unknown precision {precision!r}, expected one of {tuple(_MODES)}"
+        )
+    for mode in _MODES[precision]:
+        if mode in allowed:
+            return mode
+    # This should never happen because all targets should support ieee and we
+    # should always bottom out at that.
+    raise RuntimeError(
+        f"target supports none of {_MODES[precision]}; it allows only {allowed}"
+    )
+
+
+def _allowed_dot_precisions() -> tuple[str, ...]:
+    """Dot input precisions the active Triton target supports, cached per target."""
+    target = triton.runtime.driver.active.get_current_target()
+    if target not in _ALLOWED_BY_TARGET:
+        options = triton.compiler.make_backend(target).parse_options({})
+        _ALLOWED_BY_TARGET[target] = tuple(options.allowed_dot_input_precisions)
+    return _ALLOWED_BY_TARGET[target]
+
+
+def current_dot_precision(*, fp32_operands: bool) -> str:
+    """``input_precision`` to pass to ``tl_dot`` under torch's current setting.
+
+    Triton ignores the mode unless the operands are fp32, so
+    ``fp32_operands=False`` pins to ieee to avoid compiling a second,
+    identical kernel.
+    """
+    if not fp32_operands:
+        return IEEE
+    return resolve(torch_fp32_precision(), _allowed_dot_precisions())
+
+
+@triton.jit
+def tl_dot(a, b, input_precision: tl.constexpr, acc=None):
+    """``tl.dot`` but with ``input_precision`` as a required argument.
+
+    This exists so we can ban ``tl.dot`` calls without an explicit
+    ``input_precision`` using a lint rule. Note that because ``triton.jit``
+    doesn't support required keyword-only arguments (``, *, ...``) this swaps
+    the order of ``input_precision`` and ``acc``. Both should be passed as
+    keyword arguments.
+    """
+    return tl.dot(a, b, acc=acc, input_precision=input_precision)  # noqa: TID251

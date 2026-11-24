@@ -39,8 +39,8 @@ from utils import (
     DTYPE_PRECISION_PARAM,
     DTYPES_PARAM,
     gpu_arch,
+    require_reduced_precision_dot,
     requires_gpu,
-    skip_without_reduced_precision_dot,
 )
 
 SHAPES = [
@@ -459,20 +459,20 @@ def test_dynamic_entry_point():
 )
 def test_tf32_changes_the_result(impl):
     """Make sure the reduced precision actually affects the output."""
-    skip_without_reduced_precision_dot()
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=5)
 
     results = {}
-    for precision in ("ieee", "tf32"):
-        tensors = make_inputs(
-            B, N_seq, N_res, H, D, "cuda", torch.float32, seed=3, requires_grad=True
-        )
-        grad_out = seeded_randn(
-            *tensors["q"].shape, device="cuda", dtype=torch.float32, seed=31
-        )
-        with torch_matmul_precision(precision):
-            results[precision] = fwd_bwd(impl, tensors, mask, D**-0.5, grad_out)
+    with require_reduced_precision_dot():
+        for precision in ("ieee", "tf32"):
+            tensors = make_inputs(
+                B, N_seq, N_res, H, D, "cuda", torch.float32, seed=3, requires_grad=True
+            )
+            grad_out = seeded_randn(
+                *tensors["q"].shape, device="cuda", dtype=torch.float32, seed=31
+            )
+            with torch_matmul_precision(precision):
+                results[precision] = fwd_bwd(impl, tensors, mask, D**-0.5, grad_out)
 
     out_ieee, keys, grads_ieee = results["ieee"]
     out_tf32, _, grads_tf32 = results["tf32"]

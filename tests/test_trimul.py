@@ -39,8 +39,8 @@ from testutil.trimul import (
 from utils import (
     DTYPE_PRECISION_PARAM,
     require_device_memory,
+    require_reduced_precision_dot,
     requires_gpu,
-    skip_without_reduced_precision_dot,
 )
 
 DIRECTIONS_PARAM = ["outgoing", "incoming"]
@@ -186,15 +186,15 @@ def test_broadcast_mask(impl, direction):
 def test_tf32_changes_the_result():
     """Make sure the reduced precision actually affects the output."""
 
-    skip_without_reduced_precision_dot()
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", torch.float32, seed=3)
     x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=4)
 
     outputs = {}
-    for precision in ("ieee", "tf32"):
-        with torch_matmul_precision(precision), torch.no_grad():
-            outputs[precision] = trimul_triton(x, "outgoing", mask, **weights)
+    with require_reduced_precision_dot():
+        for precision in ("ieee", "tf32"):
+            with torch_matmul_precision(precision), torch.no_grad():
+                outputs[precision] = trimul_triton(x, "outgoing", mask, **weights)
 
     assert not torch.allclose(outputs["ieee"], outputs["tf32"], rtol=0, atol=0), (
         "bit-identical output for ieee and tf32"
