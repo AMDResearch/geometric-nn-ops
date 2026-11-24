@@ -20,6 +20,8 @@ import torch
 
 from geometric_nn_ops_torch.triangle import attention_pair_bias as _apb
 
+from ._mask import to_bool_mask
+
 # Provided to match cuEquivariance's documented API. Currently we always fall
 # back, so listed as a very large value for documentation, but we don't actually
 # check its value anywhere.
@@ -75,7 +77,7 @@ def attention_pair_bias(
         ln_z_weight=w_ln_z,
         proj_g_bias=b_proj_g,
         proj_o_bias=b_proj_o,
-        mask=mask,
+        mask=to_bool_mask(mask),
         scale=attn_scale,
         inf=inf,
         eps=eps,

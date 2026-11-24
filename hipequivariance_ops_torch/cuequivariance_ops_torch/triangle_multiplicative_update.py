@@ -9,6 +9,7 @@ import warnings
 from geometric_nn_ops_torch import _precision
 from geometric_nn_ops_torch.triangle import triangle_multiplicative_update as _tmu
 
+from ._mask import to_bool_mask
 from ._trimul_precision import TriMulPrecision
 
 # Provided to match cuEquivariance's documented API. We don't actually use this
@@ -93,7 +94,7 @@ def triangle_multiplicative_update(
     return _tmu(
         x,
         direction=direction,
-        mask=mask,
+        mask=to_bool_mask(mask),
         norm_in_weight=norm_in_weight,
         norm_in_bias=norm_in_bias,
         p_in_weight=p_in_weight,

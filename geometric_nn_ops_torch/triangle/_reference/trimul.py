@@ -24,6 +24,8 @@ Adapted from OpenFold-3.
 import torch
 import torch.nn.functional as F
 
+from geometric_nn_ops_torch.triangle._masking import check_bool_mask
+
 DIRECTIONS = ("outgoing", "incoming")
 
 
@@ -75,11 +77,13 @@ def trimul_torch(
 ):
     """Triangle multiplicative update in stock PyTorch.
 
-    ``x`` is ``[*, N, N, C_z]`` and ``mask`` ``[*, N, N]``. ``p_in_weight`` and
-    ``g_in_weight`` are the concatenated ``[a; b]`` projections, so the hidden
-    width follows from their row count.
+    ``x`` is ``[*, N, N, C_z]`` and ``mask`` is an optional boolean
+    ``[*, N, N]`` (``True`` = keep). ``p_in_weight`` and ``g_in_weight`` are the
+    concatenated ``[a; b]`` projections, so the hidden width follows from their
+    row count.
     """
     outgoing = is_outgoing(direction)
+    check_bool_mask(mask)
     c_z = x.shape[-1]
     c_hidden = p_in_weight.shape[0] // 2
     z = F.layer_norm(x, (c_z,), norm_in_weight, norm_in_bias, eps)

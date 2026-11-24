@@ -1,13 +1,19 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Turning a key mask into an additive bias on the softmax logits.
+"""Mask handling shared by the ops.
 
-Shared by the ops that mask keys out of a softmax, so they all push a masked
-key down by the same amount and fold a boolean mask the same way.
+The ops that mask keys out of a softmax use the same additive bias, so they all
+push a masked key down by the same amount.
 """
 
 import torch
+
+
+def check_bool_mask(mask: torch.Tensor | None) -> None:
+    """Raise unless ``mask`` is ``None`` or boolean (``True`` = keep)."""
+    if mask is not None and mask.dtype != torch.bool:
+        raise ValueError(f"mask must be bool (keep=True/drop=False), got {mask.dtype}")
 
 
 def mask_val(dtype: torch.dtype) -> float:

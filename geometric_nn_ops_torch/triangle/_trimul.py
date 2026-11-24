@@ -59,7 +59,7 @@ def triangle_multiplicative_update(
     Args:
         x: ``[*, N, N, C_z]`` pair representation.
         direction: ``"outgoing"`` or ``"incoming"``.
-        mask: optional ``[*, N, N]`` pair mask (1 = keep).
+        mask: optional boolean ``[*, N, N]`` pair mask (``True`` = keep).
         *_weight / *_bias: layernorm/projection/gate parameters. ``p_in_weight`` and
             ``g_in_weight`` are concatenated ``[a; b]`` (``[2 * C_hidden, C_z]``).
         eps: layernorm epsilon.

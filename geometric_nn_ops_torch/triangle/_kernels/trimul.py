@@ -10,6 +10,7 @@ depend only on ``torch`` + ``triton``. Forward-only (no autograd).
 import torch
 
 from geometric_nn_ops_torch import _precision
+from geometric_nn_ops_torch.triangle._masking import check_bool_mask
 
 # For now we reuse this from the pure torch implementation.
 from geometric_nn_ops_torch.triangle._reference.trimul import (
@@ -203,7 +204,7 @@ if TRITON_AVAILABLE:
                 mask_ptr + mask_offsets,
                 mask=m_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            )
+            ).to(tl.float32)
             acc = acc * mask_vals
 
         if HAS_ADD:
@@ -425,6 +426,7 @@ def trimul_triton(
     Takes the same arguments as ``trimul_torch``; see it for the layouts.
     """
     outgoing = is_outgoing(direction)
+    check_bool_mask(mask)
     c_hidden = p_in_weight.shape[0] // 2
     m = None
     if mask is not None:

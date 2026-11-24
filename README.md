@@ -51,6 +51,10 @@ z = triangle_multiplicative_update(x, direction="outgoing", mask=mask, **weights
 for inference and auto-falls back to a pure-torch differentiable implementation
 when gradients are needed or no GPU/Triton is available.
 
+All ops take a boolean `mask` (`True` = keep) or `None`, and raise on any other
+dtype. The cuequivariance shim accepts cuequivariance's 0/1 masks and casts them
+to bool, erroring if the mask has `requires_grad` set.
+
 ## fp32 matmul precision
 
 For fp32 inputs, these ops read `torch.backends.cuda.matmul.fp32_precision`. In

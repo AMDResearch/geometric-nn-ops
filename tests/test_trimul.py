@@ -77,7 +77,7 @@ def test_fully_masked_input(impl, biased, direction):
     N, C = 32, 128
     weights = make_masked_weights(C, C, biased=biased)
     x, _ = make_pair_input(1, N, C, "cuda", torch.float32, seed=4)
-    mask = torch.zeros(1, N, N, device="cuda")
+    mask = torch.zeros(1, N, N, device="cuda", dtype=torch.bool)
 
     with torch.no_grad():
         out = impl(x, direction, mask, **weights)
@@ -131,6 +131,21 @@ def test_direction_changes_the_result(impl):
     )
 
 
+@pytest.mark.parametrize(
+    "impl",
+    [trimul_torch, trimul_triton, triangle_multiplicative_update],
+    ids=["reference", "triton", "public"],
+)
+def test_non_bool_mask_is_rejected(impl):
+    N, C = 8, 16
+    weights = make_weights(C, C, "cpu", torch.float32, seed=1)
+    x, _ = make_pair_input(1, N, C, "cpu", torch.float32, seed=2)
+    mask = torch.ones(1, N, N, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="mask must be bool"):
+        impl(x, "outgoing", mask, **weights)
+
+
 @requires_gpu
 @pytest.mark.parametrize(
     "impl",
@@ -152,14 +167,19 @@ def test_unknown_direction_is_rejected(impl):
 @IMPLEMENTATION_PARAM
 @pytest.mark.parametrize("direction", DIRECTIONS_PARAM)
 def test_mask_none(impl, direction):
-    """``mask=None`` matches an explicit all-ones mask."""
+    """``mask=None`` matches an explicit all-keep mask."""
     N, C = 12, 32
     weights = make_weights(C, C, "cuda", torch.float32, seed=37)
     x, _ = make_pair_input(1, N, C, "cuda", torch.float32, seed=38)
 
     with torch.no_grad():
         out = impl(x, direction, None, **weights)
-        expected = impl(x, direction, torch.ones(1, N, N, device="cuda"), **weights)
+        expected = impl(
+            x,
+            direction,
+            torch.ones(1, N, N, device="cuda", dtype=torch.bool),
+            **weights,
+        )
 
     torch.testing.assert_close(out, expected, rtol=2e-3, atol=2e-3)
 
@@ -284,13 +304,13 @@ def test_block_padded(direction, true_length):
     x, _ = make_pair_input(batch, N, C, "cuda", dtype, seed=13)
 
     generator = torch.Generator(device="cuda").manual_seed(13)
-    mask = torch.zeros(batch, N, N, device="cuda", dtype=dtype)
+    mask = torch.zeros(batch, N, N, device="cuda", dtype=torch.bool)
     for index in range(batch):
         # Distinct per-batch true lengths, so the max-L slice is not the length
         # of every element.
         live = max(1, true_length - 8 * index)
         inner = torch.rand(live, live, device="cuda", generator=generator) < 0.9
-        mask[index, :live, :live] = inner.to(dtype)
+        mask[index, :live, :live] = inner
     assert_forward_agrees_with_the_oracle(
         x,
         mask,
@@ -418,7 +438,7 @@ def test_large_n_no_int32_overflow(direction):
         make_weights(C, C, "cuda", dtype, seed=13), dtype, requires_grad=False
     )
     x, _ = make_pair_input((), N, C, "cuda", dtype, seed=47)
-    mask = torch.ones(N, N, device="cuda", dtype=dtype)
+    mask = torch.ones(N, N, device="cuda", dtype=torch.bool)
 
     with torch.inference_mode():
         out = trimul_triton(x, direction, mask, **weights).float()
@@ -516,7 +536,7 @@ def test_cpu_is_differentiable():
     x, _ = make_pair_input(
         (), N, C_z, "cpu", torch.float32, seed=49, requires_grad=True
     )
-    mask = torch.ones(N, N)
+    mask = torch.ones(N, N, dtype=torch.bool)
 
     triangle_multiplicative_update(x, "outgoing", mask, **weights).sum().backward()
 

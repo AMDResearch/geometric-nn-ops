@@ -12,7 +12,7 @@ documentation.
 import torch
 import torch.nn.functional as F
 
-from geometric_nn_ops_torch.triangle._masking import mask_val
+from geometric_nn_ops_torch.triangle._masking import check_bool_mask, mask_val
 
 
 def _project_pair_bias(z, ln_z_weight, proj_z_weight, eps):
@@ -44,6 +44,7 @@ def attention_pair_bias_torch(
     return_z_proj=False,
 ):
     """Attention with pair bias, in stock PyTorch."""
+    check_bool_mask(mask)
     BM, H, U, DH = q.shape
     V = k.shape[2]
     D = H * DH

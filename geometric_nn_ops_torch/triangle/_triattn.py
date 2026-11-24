@@ -18,6 +18,7 @@ through to the kernel's `softmax_scale` runtime parameter.
 import torch
 
 from ._kernels.triangle_attention import triangle_attention_triton
+from ._masking import check_bool_mask
 
 
 def triangle_attention(
@@ -37,7 +38,7 @@ def triangle_attention(
             accepted; leading dims are collapsed to a single batch.
         bias: pair bias broadcastable to ``[B, 1, H, N_res, N_res]``, or ``None``
             for no bias (skips all bias work in the kernel).
-        mask: boolean tensor where ``True`` keeps and ``False`` masks; shape
+        mask: boolean tensor where ``True`` keeps and ``False`` drops; shape
             broadcastable to ``[B, N_seq, 1, 1, N_res]``, or ``None`` for
             all-keep.
         scale: softmax scale, passed to the kernel as its ``softmax_scale``
@@ -55,8 +56,7 @@ def triangle_attention(
 
     fp32 matmuls follow ``torch.backends.cuda.matmul.fp32_precision``.
     """
-    if mask is not None and mask.dtype != torch.bool:
-        raise ValueError(f"mask must be bool (keep=True/mask=False), got {mask.dtype}")
+    check_bool_mask(mask)
 
     orig_shape = q.shape
     orig_dtype = q.dtype
