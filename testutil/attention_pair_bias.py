@@ -95,7 +95,7 @@ def comparisons(out, keys, grads, out_oracle, grads_oracle):
     return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
 
 
-def assert_agrees_with_the_oracle(
+def assert_agrees_with_oracle(
     tensors, dtype, *, impl, label, precision="ieee", grad_seed=11, **options
 ):
     """Run the ``impl`` at ``dtype`` and the reference in fp64, compare the

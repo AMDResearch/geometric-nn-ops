@@ -29,7 +29,7 @@ from testutil.metrics import (
 )
 from testutil.precision import torch_matmul_precision
 from testutil.triangle_attention import (
-    assert_agrees_with_the_oracle,
+    assert_agrees_with_oracle,
     comparisons,
     fwd_bwd,
     make_inputs,
@@ -499,7 +499,7 @@ def test_triton_accuracy(shape, dtype, precision):
     )
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
     with torch_matmul_precision(precision):
-        assert_agrees_with_the_oracle(
+        assert_agrees_with_oracle(
             tensors,
             mask,
             D**-0.5,
@@ -521,7 +521,7 @@ def test_exp2_softmax(shape, dtype):
         B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True
     )
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=1)
-    assert_agrees_with_the_oracle(
+    assert_agrees_with_oracle(
         tensors,
         mask,
         D**-0.5,
@@ -553,7 +553,7 @@ def test_fully_masked_row(request, dtype):
     )
     mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
 
-    assert_agrees_with_the_oracle(
+    assert_agrees_with_oracle(
         tensors,
         mask,
         D**-0.5,
@@ -583,7 +583,7 @@ def test_optional_arguments(case):
     mask = None if case == "no_mask" else make_key_mask(B, N_seq, N_res, "cuda")
     scale = D**-0.5 * (1.75 if case == "custom_scale" else 1.0)
 
-    assert_agrees_with_the_oracle(
+    assert_agrees_with_oracle(
         tensors, mask, scale, impl=triangle_attention_triton, label=case
     )
 

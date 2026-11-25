@@ -3,6 +3,7 @@
 
 """Input builders for triangle_multiplicative_update."""
 
+import copy
 from collections.abc import Sequence
 
 import torch
@@ -10,7 +11,11 @@ import torch
 from geometric_nn_ops_torch.triangle._reference.trimul import trimul_torch
 
 from . import cast_tree, generator, grad_targets, seeded_randn
-from .metrics import TRIMUL_TOL, assert_matches_oracle
+from .metrics import (
+    TRIMUL_TOL,
+    assert_matches_oracle,
+    assert_module_agrees_with_oracle,
+)
 
 
 def make_weights(
@@ -164,7 +169,7 @@ class TrimulStack(torch.nn.Module):
         return x
 
 
-def assert_forward_agrees_with_the_oracle(
+def assert_forward_agrees_with_oracle(
     x, mask, weights, direction, *, impl, precision="ieee", tol=None, label=""
 ):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
@@ -204,16 +209,18 @@ def comparisons(out, keys, grads, out_oracle, grads_oracle):
     return list(zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True))
 
 
-def assert_agrees_with_the_oracle(
-    x, mask, weights, direction, *, impl, precision="ieee", label=""
+def assert_agrees_with_oracle(
+    x, mask, weights, direction, *, impl, grad_out=None, precision="ieee", label=""
 ):
     """Run the ``impl`` on the inputs as given and the reference in fp64,
-    compare the output and every gradient.
+    compare the output and every gradient, with ``grad_out`` as the output
+    gradient (seeded random by default).
 
     ``precision`` only selects the tolerance; the caller sets it on torch. The
     fp64 oracle is unaffected by it.
     """
-    grad_out = seeded_randn(*x.shape, device=x.device, dtype=x.dtype, seed=11)
+    if grad_out is None:
+        grad_out = seeded_randn(*x.shape, device=x.device, dtype=x.dtype, seed=11)
     out, keys, grads = fwd_bwd(impl, x, mask, weights, direction, grad_out)
     out_oracle, _, grads_oracle = fwd_bwd(
         trimul_torch,
@@ -227,5 +234,34 @@ def assert_agrees_with_the_oracle(
     assert_matches_oracle(
         comparisons(out, keys, grads, out_oracle, grads_oracle),
         TRIMUL_TOL[x.dtype, precision],
+        label=label,
+    )
+
+
+def assert_stack_agrees_with_oracle(
+    model, x, mask, *, training, inference, grad_out=None, precision="ieee", label=""
+):
+    """``model``, a :class:`TrimulStack`, against an fp64 copy of itself running
+    the reference.
+
+    With ``training``, compares the output and the gradients wrt ``x`` and the
+    parameters, with ``grad_out`` as the output gradient (seeded random by
+    default). With ``inference``, compares the output under
+    ``torch.inference_mode``.
+    """
+    oracle = copy.deepcopy(model).to(torch.float64)
+    for layer in oracle.layers:
+        layer.impl = trimul_torch
+    if training and grad_out is None:
+        grad_out = seeded_randn(*x.shape, device=x.device, dtype=x.dtype, seed=41)
+    assert_module_agrees_with_oracle(
+        model,
+        oracle,
+        x,
+        call=lambda module, x: module(x, mask.to(x.dtype)),
+        training=training,
+        inference=inference,
+        grad_out=grad_out,
+        tol=TRIMUL_TOL[x.dtype, precision],
         label=label,
     )

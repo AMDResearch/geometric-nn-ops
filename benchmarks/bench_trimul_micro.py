@@ -3,13 +3,14 @@
 
 """Microbenchmark the isolated triangle_multiplicative_update op.
 
-``--backends`` names an implementation to time. ``reference`` is the baseline
-the others are reported against; ``public`` measures the op a caller gets,
-whichever implementation dispatch picks for it. The Triton path is
-forward-only, so its backward column is empty.
+``--backends`` names the implementations to time. ``reference`` is the
+pure-torch reference, ``triton`` our Triton kernel, which has no backward, and
+``public`` the public API, which could dispatch to either.
 
-Each backend is checked against the reference in fp64 before being timed, to
-the bounds the tests use. Full correctness lives in ``tests/test_trimul.py``.
+Each backend is checked against the fp64 reference before being timed: the
+forward, and the gradients if training is measured. Full correctness lives in
+``tests/test_trimul.py``. See ``run_benchmark`` for how steps are timed and
+their memory measured.
 
 Usage:
     python benchmarks/bench_trimul_micro.py \
@@ -17,191 +18,139 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
+import functools
+import itertools
 
-import torch
 from _bench_common import (
     DTYPES,
-    add_timing_arguments,
-    describe_case,
-    finish,
-    fmt,
-    git_commit,
-    pct,
-    print_provenance,
-    release_blas_workspaces,
-    require_gpu,
+    OP_BACKWARD_MEASURES,
+    OP_MEASURES,
+    OP_TRAINING_MEASURES,
+    BenchCase,
+    Column,
+    add_benchmark_arguments,
+    op_steps,
+    run_benchmark,
+    run_fields,
+    tolerance_precision,
 )
 from _trimul_common import (
-    BASELINE,
+    DEFAULT_BACKENDS,
+    DEFAULT_BASELINES,
+    FORWARD_ONLY,
     TRIMUL_IMPLEMENTATIONS,
-    add_backend_argument,
     add_shape_arguments,
 )
-from triton.testing import do_bench
 
-from testutil import grad_targets
+from testutil import grad_targets, seeded_randn
 from testutil.trimul import (
-    assert_forward_agrees_with_the_oracle,
+    assert_agrees_with_oracle,
+    assert_forward_agrees_with_oracle,
     make_pair_input,
     make_projection_biases,
     make_weights,
 )
 
-CASE_KEYS = ("size", "direction", "backend")
+CASE = (
+    Column("size", "size", 5),
+    Column("direction", "dir", 9, align="<"),
+    Column("backend", "backend", 10, align="<"),
+)
 
-MEASURES = ["fwd_train", "fwd_infer", "bwd"]
 
+class Case(BenchCase):
+    """The pair rep, its mask and the weights for one size and direction."""
 
-def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, biases):
-    impl = TRIMUL_IMPLEMENTATIONS[backend]
-    weights = make_weights(
-        channels, channels, "cuda", dtype, seed=3, requires_grad=True
-    )
-    if biases:
-        weights |= make_projection_biases(
-            channels, channels, "cuda", dtype, seed=5, requires_grad=True
+    def __init__(self, args, key, measures, *, oracle):
+        n, self.direction = key
+        dtype = DTYPES[args.dtype]
+        self.training = bool(set(measures) & OP_TRAINING_MEASURES)
+        self.precision = tolerance_precision(dtype)
+        self.weights = make_weights(
+            args.channels,
+            args.channels,
+            "cuda",
+            dtype,
+            seed=3,
+            requires_grad=self.training,
         )
-    x, mask = make_pair_input(1, n, channels, "cuda", dtype, seed=4, requires_grad=True)
+        if args.biases:
+            self.weights |= make_projection_biases(
+                args.channels,
+                args.channels,
+                "cuda",
+                dtype,
+                seed=5,
+                requires_grad=self.training,
+            )
+        self.x, self.mask = make_pair_input(
+            1, n, args.channels, "cuda", dtype, seed=4, requires_grad=self.training
+        )
+        self.grad_out = None
+        if set(measures) & OP_BACKWARD_MEASURES:
+            self.grad_out = seeded_randn(
+                *self.x.shape, device="cuda", dtype=dtype, seed=11
+            )
+        self.targets = [self.x, *grad_targets(self.weights).values()]
 
-    assert_forward_agrees_with_the_oracle(
-        x, mask, weights, direction, impl=impl, label=f"{backend}/{direction}"
-    )
+    def steps(self, backend, measures) -> dict:
+        impl = TRIMUL_IMPLEMENTATIONS[backend]
 
-    def timed(fn):
-        return do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
+        def forward():
+            return impl(self.x, self.direction, self.mask, **self.weights)
 
-    def fwd_train():
-        return impl(x, direction, mask, **weights)
+        return op_steps(
+            measures,
+            infer=forward,
+            train=None if backend in FORWARD_ONLY else forward,
+            targets=self.targets,
+            grad_out=self.grad_out,
+        )
 
-    def fwd_infer():
-        with torch.inference_mode():
-            return impl(x, direction, mask, **weights)
+    def check(self, backend, measures, label):
+        impl = TRIMUL_IMPLEMENTATIONS[backend]
+        inputs = (self.x, self.mask, self.weights, self.direction)
+        options = {"impl": impl, "precision": self.precision, "label": label}
+        # Without gradients enabled, which may dispatch differently.
+        if "fwd_infer" in measures:
+            assert_forward_agrees_with_oracle(*inputs, **options)
+        if set(measures) & OP_TRAINING_MEASURES:
+            assert_agrees_with_oracle(*inputs, grad_out=self.grad_out, **options)
 
-    row = {
-        "fwd_train_ms": timed(fwd_train) if "fwd_train" in measures else None,
-        "fwd_infer_ms": timed(fwd_infer) if "fwd_infer" in measures else None,
-        "bwd_ms": None,
+
+def make_row(args, key) -> dict:
+    """The case's own result row fields."""
+    n, direction = key
+    return {
+        "size": n,
+        "direction": direction,
+        "backend": None,
+        "channels": args.channels,
+        "biases": args.biases,
+        **run_fields(args),
     }
-
-    if "bwd" in measures:
-        out = fwd_train()
-        # A forward-only implementation returns a tensor with no graph behind
-        # it, so there is no backward to time. Absent, not failed.
-        if out.requires_grad:
-            grad_out = torch.randn_like(out)
-            targets = [x, *grad_targets(weights).values()]
-            row["bwd_ms"] = timed(
-                lambda: torch.autograd.grad(
-                    [out], targets, grad_outputs=[grad_out], retain_graph=True
-                )
-            )
-    return row
-
-
-def report(rows, backends):
-    header = (
-        f"{'size':>5} {'dir':<9} {'backend':<10} "
-        f"{'ftrain_ms':>10} {'finfer_ms':>10} {'bwd_ms':>10}"
-    )
-    print(header)
-    print("-" * len(header))
-    for row in rows:
-        if row["error"]:
-            print(f"{describe_case(row, CASE_KEYS)}  FAILED {row['error']}")
-            continue
-        print(
-            f"{row['size']:>5} {row['direction']:<9} {row['backend']:<10} "
-            f"{fmt(row['fwd_train_ms'])} {fmt(row['fwd_infer_ms'])} "
-            f"{fmt(row['bwd_ms'])}"
-        )
-
-    if BASELINE not in backends or len(backends) == 1:
-        return
-    print(f"\n# Time as % of {BASELINE} (lower is faster)")
-    comparison = (
-        f"{'size':>5} {'dir':<9} {'backend':<10} "
-        f"{'ftrain_%':>10} {'finfer_%':>10} {'bwd_%':>10}"
-    )
-    print(comparison)
-    print("-" * len(comparison))
-    by_case = {}
-    for row in rows:
-        by_case.setdefault((row["size"], row["direction"]), {})[row["backend"]] = row
-    for (n, direction), per_backend in sorted(by_case.items()):
-        base = per_backend.get(BASELINE)
-        if base is None:
-            continue
-        for backend, row in per_backend.items():
-            if backend == BASELINE:
-                continue
-            print(
-                f"{n:>5} {direction:<9} {backend:<10} "
-                f"{pct(row['fwd_train_ms'], base['fwd_train_ms'])} "
-                f"{pct(row['fwd_infer_ms'], base['fwd_infer_ms'])} "
-                f"{pct(row['bwd_ms'], base['bwd_ms'])}"
-            )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_shape_arguments(parser, sizes=[256, 384, 512, 768])
-    add_backend_argument(parser)
-    add_timing_arguments(parser)
-    parser.add_argument(
-        "--measure", nargs="+", default=list(MEASURES), choices=MEASURES
+    add_benchmark_arguments(
+        parser,
+        measures=OP_MEASURES,
+        backends=TRIMUL_IMPLEMENTATIONS,
+        default_backends=DEFAULT_BACKENDS,
+        baselines=DEFAULT_BASELINES,
     )
-    parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
-
-    require_gpu()
-    dtype = DTYPES[args.dtype]
-    measures = set(args.measure)
-    print_provenance(
-        args.dtype,
-        backends=",".join(args.backends),
-        channels=args.channels,
-        biases=args.biases,
-        measure=",".join(m for m in MEASURES if m in measures),
+    run_benchmark(
+        args,
+        measures=OP_MEASURES,
+        cases=itertools.product(args.sizes, args.directions),
+        make_case=functools.partial(Case, args),
+        make_row=functools.partial(make_row, args),
+        case_columns=CASE,
+        provenance={"channels": args.channels, "biases": args.biases},
     )
-
-    rows = []
-    for n in args.sizes:
-        for direction in args.directions:
-            for backend in args.backends:
-                row = {
-                    "size": n,
-                    "direction": direction,
-                    "backend": backend,
-                    "channels": args.channels,
-                    "biases": args.biases,
-                    "dtype": args.dtype,
-                    "device": torch.cuda.get_device_name(0),
-                    "commit": git_commit(),
-                    "fwd_train_ms": None,
-                    "fwd_infer_ms": None,
-                    "bwd_ms": None,
-                    "error": None,
-                }
-                try:
-                    row |= bench_case(
-                        backend,
-                        n,
-                        args.channels,
-                        direction,
-                        dtype,
-                        args.warmup,
-                        args.rep,
-                        measures,
-                        args.biases,
-                    )
-                except Exception as error:  # noqa: BLE001
-                    row["error"] = f"{type(error).__name__}: {error}"
-                rows.append(row)
-                release_blas_workspaces()
-
-    report(rows, args.backends)
-    finish(rows, args.out, case_keys=CASE_KEYS)
 
 
 if __name__ == "__main__":
