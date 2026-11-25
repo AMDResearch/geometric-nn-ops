@@ -77,6 +77,61 @@ def assert_matches_oracle(comparisons, tol: Tolerance, *, label: str = "") -> No
     )
 
 
+def assert_module_agrees_with_oracle(
+    model,
+    oracle,
+    x,
+    *,
+    call,
+    training,
+    inference,
+    grad_out,
+    tol: Tolerance,
+    infer_call=None,
+    input_name="x",
+    label="",
+):
+    """``model`` against ``oracle``, an fp64 copy of it running the reference.
+
+    ``call(module, x)`` runs ``module`` on ``x``, with the module's other
+    arguments. With ``training``, compares the output and the gradients wrt
+    ``x`` and every parameter, with ``grad_out`` as the output gradient. With
+    ``inference``, compares the output of ``infer_call`` (``call`` by default)
+    under ``torch.inference_mode``.
+    """
+    infer_call = infer_call or call
+
+    def fwd_bwd(module, x, grad):
+        x = x.detach().requires_grad_()
+        out = call(module, x)
+        parameters = [x, *module.parameters()]
+        return out, torch.autograd.grad(out, parameters, grad_outputs=grad)
+
+    def compare_training():
+        out, grads = fwd_bwd(model, x, grad_out)
+        out_oracle, grads_oracle = fwd_bwd(oracle, x.double(), grad_out.double())
+        names = [
+            "out",
+            f"grad_{input_name}",
+            *(f"grad_{name}" for name, _ in model.named_parameters()),
+        ]
+        assert_matches_oracle(
+            zip(names, [out, *grads], [out_oracle, *grads_oracle], strict=True),
+            tol,
+            label=label,
+        )
+
+    # In a function, so the training outputs and gradients are freed before
+    # inference runs.
+    if training:
+        compare_training()
+    if inference:
+        with torch.inference_mode():
+            out = infer_call(model, x)
+            out_oracle = infer_call(oracle, x.double())
+        assert_matches_oracle([("out_inference", out, out_oracle)], tol, label=label)
+
+
 # Per-op, per-dtype relative Frobenius norm and cosine similarity tolerances
 # against the fp64 oracle, over the forward output and every gradient. Kernels
 # legitimately differ: a flash attention reduces over the key axis in a
