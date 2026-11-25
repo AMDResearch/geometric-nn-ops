@@ -216,6 +216,317 @@ def test_masked_logits_are_suppressed(impl, dtype):
     )
 
 
+# Non-contiguous q/k/v, bias and mask. Each test compares a view against
+# .contiguous() of itself. Layout does not change the reduction order, so the
+# results must match exactly.
+
+# For a given target shape, functions to create a backing buffer and take a view
+# from it.
+STRIDE_VIEWS = {
+    # Starts at a nonzero storage offset. Slicing a prefix of the outermost dim
+    # would leave the view contiguous.
+    "batch_step": (
+        lambda b, s, n, h, d: (2 * b, s, n, h, d),
+        lambda t, shape: t[1::2],
+    ),
+    "seq": (
+        lambda b, s, n, h, d: (b, 2 * s, n, h, d),
+        lambda t, shape: t[:, : shape[1]],
+    ),
+    "res": (
+        lambda b, s, n, h, d: (b, s, 2 * n, h, d),
+        lambda t, shape: t[:, :, : shape[2]],
+    ),
+    "head": (
+        lambda b, s, n, h, d: (b, s, n, 2 * h, d),
+        lambda t, shape: t[:, :, :, : shape[3]],
+    ),
+    "dim": (
+        lambda b, s, n, h, d: (b, s, n, h, 2 * d),
+        lambda t, shape: t[..., : shape[4]],
+    ),
+    # The only case whose innermost stride is not 1.
+    "head_dim_transposed": (
+        lambda b, s, n, h, d: (b, s, n, d, h),
+        lambda t, shape: t.transpose(-1, -2),
+    ),
+    # Stride 0, so the slabs overlap.
+    "expand_seq": (
+        lambda b, s, n, h, d: (b, 1, n, h, d),
+        lambda t, shape: t.expand(shape),
+    ),
+    "res_and_head": (
+        lambda b, s, n, h, d: (b, s, 2 * n, 2 * h, d),
+        lambda t, shape: t[:, :, : shape[2], : shape[3]],
+    ),
+    # Contiguous in the kernel's internal [B, N_seq, H, N_res, D] layout.
+    "heads_first": (
+        lambda b, s, n, h, d: (b, s, h, n, d),
+        lambda t, shape: t.transpose(2, 3),
+    ),
+    "contiguous": (lambda b, s, n, h, d: (b, s, n, h, d), lambda t, shape: t),
+}
+
+# The layout of q, k and v for each case. Mostly mixed, since giving all three
+# the same layout wouldn't catch one tensor being addressed with another's
+# strides. The rotations put each layout in each of the three positions.
+LAYOUT_CASES = {
+    "res_head_contiguous": ("res", "head", "contiguous"),
+    "head_contiguous_res": ("head", "contiguous", "res"),
+    "contiguous_res_head": ("contiguous", "res", "head"),
+    "seq_dim_batch_step": ("seq", "dim", "batch_step"),
+    "dim_batch_step_seq": ("dim", "batch_step", "seq"),
+    "batch_step_seq_dim": ("batch_step", "seq", "dim"),
+    "heads_first_contiguous": ("heads_first", "contiguous", "contiguous"),
+    "contiguous_heads_first": ("contiguous", "heads_first", "heads_first"),
+    "transposed_contiguous": ("head_dim_transposed", "contiguous", "contiguous"),
+    "expand_res_and_head_dim": ("expand_seq", "res_and_head", "dim"),
+    "res_and_head_transposed_expand": (
+        "res_and_head",
+        "head_dim_transposed",
+        "expand_seq",
+    ),
+    "transposed_expand_res_and_head": (
+        "head_dim_transposed",
+        "expand_seq",
+        "res_and_head",
+    ),
+    "all_res": ("res",) * 3,
+    "all_head_dim_transposed": ("head_dim_transposed",) * 3,
+}
+
+LAYOUT_PARAM = pytest.mark.parametrize("case", list(LAYOUT_CASES))
+
+
+def strided_tensor(shape, device, dtype, *, layout, seed):
+    """A tensor of ``shape`` laid out according to the named ``layout``."""
+    backing_shape, take_view = STRIDE_VIEWS[layout]
+    backing = seeded_randn(
+        *backing_shape(*shape), device=device, dtype=dtype, seed=seed
+    )
+    view = take_view(backing, shape)
+
+    assert view.shape == torch.Size(shape), f"{layout} gave {tuple(view.shape)}"
+    assert view.is_contiguous() == (layout == "contiguous"), (
+        f"{layout} contiguity is not what the case intends"
+    )
+    return view
+
+
+def strided_qkv(shape, device, dtype, case):
+    """q, k and v under the layouts the named case asks for."""
+    return {
+        name: strided_tensor(shape, device, dtype, layout=layout, seed=seed)
+        for name, layout, seed in zip(
+            ("q", "k", "v"), LAYOUT_CASES[case], (41, 43, 47), strict=True
+        )
+    }
+
+
+def contiguous_qkv(shape, device, dtype):
+    """Contiguous q/k/v, for the tests that vary the bias or the mask."""
+    return {
+        name: strided_tensor(shape, device, dtype, layout="contiguous", seed=seed)
+        for name, seed in zip(("q", "k", "v"), (41, 43, 47), strict=True)
+    }
+
+
+def contiguous_twin(tensors):
+    """The same values, laid out contiguously."""
+    return {k: v.contiguous() for k, v in tensors.items()}
+
+
+# B and N_seq are both > 1, so a wrong batch or sequence stride is observable.
+STRIDE_SHAPE = (2, 2, 32, 4, 32)
+
+
+def strided_case_inputs(case, dtype, shape=STRIDE_SHAPE):
+    """q/k/v under the named stride case, with a contiguous bias and mask."""
+    b, n_seq, n_res, h, _ = shape
+    qkv = strided_qkv(shape, "cuda", dtype, case)
+    bias = 0.1 * seeded_randn(
+        b, 1, h, n_res, n_res, device="cuda", dtype=dtype, seed=53
+    )
+    mask = make_key_mask(b, n_seq, n_res, "cuda", seed=9)
+    return qkv, bias, mask
+
+
+@requires_gpu
+@LAYOUT_PARAM
+@DTYPES_PARAM
+def test_strided_qkv_inference(case, dtype):
+    """Strided q/k/v match their contiguous equivalents."""
+    scale = STRIDE_SHAPE[-1] ** -0.5
+    qkv, bias, mask = strided_case_inputs(case, dtype)
+
+    with torch.no_grad():
+        out = triangle_attention(**qkv, bias=bias, mask=mask, scale=scale)
+        expected = triangle_attention(
+            **contiguous_twin(qkv), bias=bias, mask=mask, scale=scale
+        )
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@requires_gpu
+@LAYOUT_PARAM
+@DTYPES_PARAM
+def test_strided_qkv_training(case, dtype):
+    """Strided q/k/v match contiguous copy for the output and gradients."""
+    scale = STRIDE_SHAPE[-1] ** -0.5
+    qkv, bias_values, mask = strided_case_inputs(case, dtype)
+    grad_out = seeded_randn(*STRIDE_SHAPE, device="cuda", dtype=dtype, seed=31)
+
+    def run(tensors):
+        leaves = {k: v.detach().requires_grad_(True) for k, v in tensors.items()}
+        bias = bias_values.detach().requires_grad_(True)
+        out = triangle_attention(**leaves, bias=bias, mask=mask, scale=scale)
+        grads = torch.autograd.grad(out, [*leaves.values(), bias], grad_out)
+        return out, grads
+
+    out, grads = run(qkv)
+    expected, expected_grads = run(contiguous_twin(qkv))
+
+    names = ("grad_q", "grad_k", "grad_v", "grad_bias")
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    for name, got, want in zip(names, grads, expected_grads, strict=True):
+        torch.testing.assert_close(
+            got, want, rtol=0, atol=0, msg=lambda built, name=name: f"{name}: {built}"
+        )
+
+
+# The bias and mask tests call triangle_attention_triton directly, since the
+# public entry point copies both contiguous.
+
+# bias is [B, 1, H, N_res, N_res]. A case gives the backing's
+# (B, H, N_res, N_res) and then the view taken from it.
+BIAS_VIEWS = {
+    "head": (lambda b, h, n: (b, 2 * h, n, n), lambda t, b, h, n: t[:, :, :h]),
+    "seq1": (lambda b, h, n: (b, h, 2 * n, n), lambda t, b, h, n: t[:, :, :, :n]),
+    "seq2": (lambda b, h, n: (b, h, n, 2 * n), lambda t, b, h, n: t[..., :n]),
+    # Innermost stride not 1, which the kernel handles for the bias.
+    "transposed": (
+        lambda b, h, n: (b, h, n, n),
+        lambda t, b, h, n: t.transpose(-1, -2),
+    ),
+    "expand_batch": (
+        lambda b, h, n: (1, h, n, n),
+        lambda t, b, h, n: t.expand(b, 1, h, n, n),
+    ),
+}
+
+# mask is [B, N_seq, 1, 1, N_res]. A case gives the backing's (B, N_seq, N_res)
+# and then the view taken from it.
+MASK_VIEWS = {
+    "res": (lambda b, s, n: (b, s, 2 * n), lambda t, b, s, n: t[..., :n]),
+    "res_step": (lambda b, s, n: (b, s, 2 * n), lambda t, b, s, n: t[..., ::2]),
+    "seq": (lambda b, s, n: (b, 2 * s, n), lambda t, b, s, n: t[:, :s]),
+    "expand_seq": (
+        lambda b, s, n: (b, 1, n),
+        lambda t, b, s, n: t.expand(b, s, 1, 1, n),
+    ),
+}
+
+
+def strided_bias(case, dtype):
+    b, _, n_res, h, _ = STRIDE_SHAPE
+    backing_dims, take_view = BIAS_VIEWS[case]
+    batch, head, seq1, seq2 = backing_dims(b, h, n_res)
+    backing = 0.1 * seeded_randn(
+        batch, 1, head, seq1, seq2, device="cuda", dtype=dtype, seed=61
+    )
+    view = take_view(backing, b, h, n_res)
+    assert view.shape == (b, 1, h, n_res, n_res), f"{case} gave {tuple(view.shape)}"
+    assert not view.is_contiguous(), f"{case} did not produce a strided view"
+    return view
+
+
+def strided_mask(case):
+    b, n_seq, n_res, _, _ = STRIDE_SHAPE
+    backing_dims, take_view = MASK_VIEWS[case]
+    # make_key_mask keeps key 0 so no row is fully masked. Every view here
+    # keeps that key.
+    batch, seq, res = backing_dims(b, n_seq, n_res)
+    backing = make_key_mask(batch, seq, res, "cuda", seed=67)
+    view = take_view(backing, b, n_seq, n_res)
+    assert view.shape == (b, n_seq, 1, 1, n_res), f"{case} gave {tuple(view.shape)}"
+    assert not view.is_contiguous(), f"{case} did not produce a strided view"
+    return view
+
+
+@requires_gpu
+@pytest.mark.parametrize("case", list(BIAS_VIEWS))
+@DTYPES_PARAM
+def test_strided_bias(case, dtype):
+    """A non-contiguous bias matches its contiguous equivalent."""
+    scale = STRIDE_SHAPE[-1] ** -0.5
+    qkv = contiguous_qkv(STRIDE_SHAPE, "cuda", dtype)
+    mask = make_key_mask(*STRIDE_SHAPE[:3], "cuda", seed=9)
+    bias = strided_bias(case, dtype)
+
+    with torch.no_grad():
+        out = triangle_attention_triton(**qkv, bias=bias, mask=mask, scale=scale)
+        expected = triangle_attention_triton(
+            **qkv, bias=bias.contiguous(), mask=mask, scale=scale
+        )
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@requires_gpu
+@pytest.mark.parametrize("case", list(MASK_VIEWS))
+@DTYPES_PARAM
+def test_strided_mask(case, dtype):
+    """A non-contiguous boolean mask matches its contiguous equivalent."""
+    scale = STRIDE_SHAPE[-1] ** -0.5
+    qkv = contiguous_qkv(STRIDE_SHAPE, "cuda", dtype)
+    bias = strided_bias("expand_batch", dtype).contiguous()
+    mask = strided_mask(case)
+
+    with torch.no_grad():
+        out = triangle_attention_triton(**qkv, bias=bias, mask=mask, scale=scale)
+        expected = triangle_attention_triton(
+            **qkv, bias=bias, mask=mask.contiguous(), scale=scale
+        )
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@requires_gpu
+@DTYPES_PARAM
+def test_strided_qkv_head_dim_one(dtype):
+    """Strided inputs when only one lane of the padded head dim is valid."""
+    b, n_seq, n_res, h, _ = STRIDE_SHAPE
+    shape = (b, n_seq, n_res, h, 1)
+    qkv, bias, mask = strided_case_inputs("dim_batch_step_seq", dtype, shape)
+
+    with torch.no_grad():
+        out = triangle_attention(**qkv, bias=bias, mask=mask, scale=1.0)
+        expected = triangle_attention(
+            **contiguous_twin(qkv), bias=bias, mask=mask, scale=1.0
+        )
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@requires_gpu
+def test_strided_qkv_dynamic():
+    """Strided q/k/v through the dynamic-shape kernel.
+
+    In this case K's slab strides differ from Q's, and so do O's.
+    """
+    scale = STRIDE_SHAPE[-1] ** -0.5
+    qkv, bias, mask = strided_case_inputs("seq_dim_batch_step", torch.bfloat16)
+
+    with torch.no_grad():
+        out = triangle_attention(**qkv, bias=bias, mask=mask, scale=scale, dynamic=True)
+        expected = triangle_attention(
+            **contiguous_twin(qkv), bias=bias, mask=mask, scale=scale, dynamic=True
+        )
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 @requires_gpu
 @IMPLEMENTATION_PARAM
 def test_no_bias(impl):
