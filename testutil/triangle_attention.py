@@ -11,7 +11,14 @@ from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
     triangle_attention_torch,
 )
 
-from . import cast_tree, generator, grad_targets, seeded_randn
+from . import (
+    ORACLE_DEVICE,
+    generator,
+    grad_targets,
+    oracle_tree,
+    seeded_randn,
+    to_oracle,
+)
 from .metrics import TRIANGLE_ATTENTION_TOL, assert_matches_oracle
 
 
@@ -95,10 +102,10 @@ def assert_agrees_with_the_oracle(
     out, keys, grads = fwd_bwd(impl, tensors, mask, scale, grad_out)
     out_oracle, _, grads_oracle = fwd_bwd(
         triangle_attention_torch,
-        cast_tree(tensors, torch.float64),
-        mask,
+        oracle_tree(tensors),
+        None if mask is None else mask.to(device=ORACLE_DEVICE),
         scale,
-        grad_out.double(),
+        to_oracle(grad_out),
     )
 
     assert_matches_oracle(

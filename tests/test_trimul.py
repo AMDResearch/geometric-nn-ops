@@ -41,6 +41,7 @@ from utils import (
     require_device_memory,
     requires_gpu,
     skip_without_reduced_precision_dot,
+    xfail_if_emulated_xf32_is_fp32,
 )
 
 DIRECTIONS_PARAM = ["outgoing", "incoming"]
@@ -183,10 +184,11 @@ def test_broadcast_mask(impl, direction):
 
 
 @requires_gpu
-def test_tf32_changes_the_result():
+def test_tf32_changes_the_result(request):
     """Make sure the reduced precision actually affects the output."""
 
     skip_without_reduced_precision_dot()
+    xfail_if_emulated_xf32_is_fp32(request)
     N, C = 32, 32
     weights = make_weights(C, C, "cuda", torch.float32, seed=3)
     x, mask = make_pair_input(1, N, C, "cuda", torch.float32, seed=4)

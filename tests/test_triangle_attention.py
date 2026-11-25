@@ -22,7 +22,7 @@ from geometric_nn_ops_torch.triangle._masking import mask_val
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
     triangle_attention_torch,
 )
-from testutil import cast_tree, generator, masked_noise, seeded_randn
+from testutil import EMULATED_GPU, generator, masked_noise, oracle_tree, seeded_randn
 from testutil.metrics import (
     Tolerance,
     assert_matches_oracle,
@@ -41,6 +41,7 @@ from utils import (
     gpu_arch,
     requires_gpu,
     skip_without_reduced_precision_dot,
+    xfail_if_emulated_xf32_is_fp32,
 )
 
 SHAPES = [
@@ -162,9 +163,26 @@ def test_masked_keys_are_ignored(request, impl, dtype):
         unmasked = impl(**tensors, mask=None, scale=D**-0.5)
         unmasked_perturbed = impl(**perturbed, mask=None, scale=D**-0.5)
 
-    # fp16 Triton on gfx1151 is off by one ULP. Do a close test first and then
-    # xfail that combination before doing the exact test.
-    # TODO(gmngeoffrey): root cause this issue
+    # rocjitsu before https://github.com/ROCm/rocm-systems/commit/e59f42c853 has
+    # a bug that doesn't match hardware here. xfail until that commit is
+    # included in CI.
+    if (
+        EMULATED_GPU
+        and impl is triangle_attention_triton
+        and dtype is torch.bfloat16
+        and gpu_arch() in ("gfx1100", "gfx1151")
+    ):
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="emulated gfx11 bf16: masked v perturbs the output",
+            )
+        )
+
+    # gfx11 WMMA has a strange accumulator implementation that means the sign of
+    # masked values actually does affect the output a small amount. See
+    # https://github.com/ROCm/rocm-systems/issues/12056. Do a close test first
+    # and then xfail that combination before doing the exact test.
     torch.testing.assert_close(out, out_perturbed, rtol=0, atol=1e-6)
     assert not torch.allclose(unmasked, unmasked_perturbed), (
         "the perturbation does not change the result even unmasked"
@@ -173,12 +191,12 @@ def test_masked_keys_are_ignored(request, impl, dtype):
     if (
         impl is triangle_attention_triton
         and dtype is torch.float16
-        and gpu_arch() == "gfx1151"
+        and gpu_arch() in ("gfx1100", "gfx1151")
     ):
         request.node.add_marker(
             pytest.mark.xfail(
                 strict=True,
-                reason="gfx1151 fp16: masked v perturbs the output by one ulp",
+                reason="gfx11 fp16: masked v perturbs the output",
             )
         )
 
@@ -457,9 +475,10 @@ def test_dynamic_entry_point():
     ],
     ids=["triton", "triton_dynamic"],
 )
-def test_tf32_changes_the_result(impl):
+def test_tf32_changes_the_result(request, impl):
     """Make sure the reduced precision actually affects the output."""
     skip_without_reduced_precision_dot()
+    xfail_if_emulated_xf32_is_fp32(request)
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
     mask = make_key_mask(B, N_seq, N_res, "cuda", seed=5)
 
@@ -598,7 +617,7 @@ def test_pairformer_shape():
     with torch.no_grad():
         out = triangle_attention(**tensors, scale=None)
         out_oracle = triangle_attention_torch(
-            **cast_tree(tensors, torch.float64, requires_grad=False), scale=None
+            **oracle_tree(tensors, requires_grad=False), scale=None
         )
 
     assert_matches_oracle(

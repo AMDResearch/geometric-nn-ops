@@ -30,8 +30,10 @@ def cos(a: torch.Tensor, b: torch.Tensor, *, accumulate=ACCUMULATE) -> float:
     undefined and torch reports 0, which would reject an exact match; a
     structurally zero gradient is a legitimate oracle result. One zero side
     against a non-zero one still scores 0.
+
+    Computed on ``b``'s device, see ``testutil.ORACLE_DEVICE``.
     """
-    a = a.detach().flatten().to(accumulate)
+    a = a.detach().flatten().to(device=b.device, dtype=accumulate)
     b = b.detach().flatten().to(accumulate)
     if torch.linalg.vector_norm(a) == 0 and torch.linalg.vector_norm(b) == 0:
         return 1.0
@@ -39,8 +41,8 @@ def cos(a: torch.Tensor, b: torch.Tensor, *, accumulate=ACCUMULATE) -> float:
 
 
 def rel_fro(a: torch.Tensor, b: torch.Tensor, *, accumulate=ACCUMULATE) -> float:
-    """``||a - b|| / ||b||``. ``b`` is the reference."""
-    a = a.detach().to(accumulate)
+    """``||a - b|| / ||b||``. ``b`` is the reference, and sets the device."""
+    a = a.detach().to(device=b.device, dtype=accumulate)
     b = b.detach().to(accumulate)
     return (
         torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-30)
