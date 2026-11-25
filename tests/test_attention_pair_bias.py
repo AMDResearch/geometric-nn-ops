@@ -15,7 +15,7 @@ from geometric_nn_ops_torch.triangle._reference.attention_pair_bias import (
 )
 from testutil import cast_tree, masked_noise
 from testutil.attention_pair_bias import (
-    assert_agrees_with_the_oracle,
+    assert_agrees_with_oracle,
     make_key_mask,
     make_op_tensors,
     make_projection_biases,
@@ -275,7 +275,7 @@ def test_reference_precision(dtype, precision):
     B, M, H, U, V, DH, Zc = 1, 1, 4, 32, 32, 16, 16
     tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cuda", torch.float32, seed=3)
     with torch_matmul_precision(precision):
-        assert_agrees_with_the_oracle(
+        assert_agrees_with_oracle(
             tensors,
             dtype,
             precision=precision,
@@ -294,6 +294,6 @@ def test_reference_precision_with_optional_projection_biases(dtype):
     tensors = make_op_tensors(B, M, H, U, V, DH, Zc, "cuda", torch.float32, seed=3)
     tensors |= make_projection_biases(H, DH, "cuda", torch.float32, seed=5)
 
-    assert_agrees_with_the_oracle(
+    assert_agrees_with_oracle(
         tensors, dtype, impl=attention_pair_bias_torch, label="projection-biases"
     )

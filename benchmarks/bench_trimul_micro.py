@@ -42,7 +42,7 @@ from triton.testing import do_bench
 
 from testutil import grad_targets
 from testutil.trimul import (
-    assert_forward_agrees_with_the_oracle,
+    assert_forward_agrees_with_oracle,
     make_pair_input,
     make_projection_biases,
     make_weights,
@@ -64,7 +64,7 @@ def bench_case(backend, n, channels, direction, dtype, warmup, rep, measures, bi
         )
     x, mask = make_pair_input(1, n, channels, "cuda", dtype, seed=4, requires_grad=True)
 
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x, mask, weights, direction, impl=impl, label=f"{backend}/{direction}"
     )
 

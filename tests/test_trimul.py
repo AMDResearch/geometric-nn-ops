@@ -30,8 +30,8 @@ from testutil.metrics import (
 )
 from testutil.precision import torch_matmul_precision
 from testutil.trimul import (
-    assert_agrees_with_the_oracle,
-    assert_forward_agrees_with_the_oracle,
+    assert_agrees_with_oracle,
+    assert_forward_agrees_with_oracle,
     make_pair_input,
     make_projection_biases,
     make_weights,
@@ -217,7 +217,7 @@ def test_triton_accuracy(direction, dtype, precision):
     weights = make_weights(C, C, "cuda", dtype, seed=3)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4)
     with torch_matmul_precision(precision):
-        assert_forward_agrees_with_the_oracle(
+        assert_forward_agrees_with_oracle(
             x0,
             mask,
             weights,
@@ -239,7 +239,7 @@ def test_reference_precision(dtype, precision):
     weights = make_weights(C, C, "cuda", dtype, seed=3, requires_grad=True)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=4, requires_grad=True)
     with torch_matmul_precision(precision):
-        assert_agrees_with_the_oracle(
+        assert_agrees_with_oracle(
             x0,
             mask,
             weights,
@@ -261,7 +261,7 @@ def test_batched(direction, shape):
     dtype = torch.bfloat16
     weights = make_weights(C, C, "cuda", dtype, seed=7)
     x, mask = make_pair_input(batch, N, C, "cuda", dtype, seed=11)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x,
         mask,
         weights,
@@ -291,7 +291,7 @@ def test_block_padded(direction, true_length):
         live = max(1, true_length - 8 * index)
         inner = torch.rand(live, live, device="cuda", generator=generator) < 0.9
         mask[index, :live, :live] = inner.to(dtype)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x,
         mask,
         weights,
@@ -311,7 +311,7 @@ def test_channel_widths(direction, channels):
     dtype = torch.bfloat16
     weights = make_weights(channels, channels, "cuda", dtype, seed=17)
     x0, mask = make_pair_input(1, N, channels, "cuda", dtype, seed=18)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x0,
         mask,
         weights,
@@ -330,7 +330,7 @@ def test_hidden_differs_from_channels(direction):
     dtype = torch.bfloat16
     weights = make_weights(C_z, C_hidden, "cuda", dtype, seed=19)
     x0, mask = make_pair_input(1, N, C_z, "cuda", dtype, seed=20)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x0,
         mask,
         weights,
@@ -371,7 +371,7 @@ def test_layernorm_affine(direction, gamma):
     weights["norm_out_bias"] = randn(C) * 0.1
 
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=20)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x0,
         mask,
         weights,
@@ -392,7 +392,7 @@ def test_large(direction):
     dtype = torch.bfloat16
     weights = make_weights(C, C, "cuda", dtype, seed=5)
     x0, mask = make_pair_input(1, N, C, "cuda", dtype, seed=6)
-    assert_forward_agrees_with_the_oracle(
+    assert_forward_agrees_with_oracle(
         x0,
         mask,
         weights,
