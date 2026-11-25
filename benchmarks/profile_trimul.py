@@ -3,8 +3,8 @@
 
 """Rank the kernels inside triangle_multiplicative_update by device time.
 
-``--mode fwdbwd`` needs a differentiable implementation, so it does not apply
-to the forward-only Triton path.
+Profiles the steps ``bench_trimul_micro.py`` times. The training steps don't
+apply to the forward-only Triton path.
 
 Usage:
     python benchmarks/profile_trimul.py --sizes 768 --rows 15
@@ -14,111 +14,75 @@ import argparse
 
 import torch
 from _bench_common import (
-    DTYPES,
+    OP_MEASURES,
+    add_backend_arguments,
+    add_dtype_arguments,
     print_provenance,
-    release_blas_workspaces,
     require_gpu,
 )
-from _trimul_common import (
-    TRIMUL_IMPLEMENTATIONS,
-    add_backend_argument,
-    add_shape_arguments,
-)
+from _trimul_common import TRIMUL_IMPLEMENTATIONS, add_shape_arguments
+from bench_trimul_micro import Case
 from torch.profiler import ProfilerActivity, profile
 
-from testutil import grad_targets
-from testutil.trimul import (
-    make_pair_input,
-    make_weights,
-)
+from testutil.precision import torch_matmul_precision
 
 
-def make_step(backend, n, channels, direction, dtype, mode):
-    """A callable running the op alone.
-
-    Inputs are built here rather than inside it, so that constructing and
-    randomizing them does not land in the trace and outrank the kernels the
-    profile is meant to show.
-    """
-    impl = TRIMUL_IMPLEMENTATIONS[backend]
-    train = mode == "fwdbwd"
-    weights = make_weights(
-        channels, channels, "cuda", dtype, seed=3, requires_grad=train
-    )
-    x, mask = make_pair_input(
-        1, n, channels, "cuda", dtype, seed=4, requires_grad=train
-    )
-
-    if not train:
-
-        def forward():
-            with torch.inference_mode():
-                impl(x, direction, mask, **weights)
-
-        return forward
-
-    probe = impl(x, direction, mask, **weights)
-    if not probe.requires_grad:
-        raise RuntimeError(f"backend '{backend}' has no backward to profile")
-    grad_out = torch.randn_like(probe)
-    targets = [x, *grad_targets(weights).values()]
-
-    def forward_backward():
-        out = impl(x, direction, mask, **weights)
-        torch.autograd.grad(out, targets, grad_outputs=[grad_out])
-
-    return forward_backward
-
-
-def profile_case(backend, n, channels, direction, dtype, mode, warmup, active, rows):
-    step = make_step(backend, n, channels, direction, dtype, mode)
-    for _ in range(warmup):  # compile and autotune outside the trace
+def profile_case(args, backend, n, direction, measure):
+    # The inputs are built before the trace, so that constructing and
+    # randomizing them doesn't land in it and outrank the kernels.
+    case = Case(args, (n, direction), [measure], oracle=False)
+    step = case.steps(backend, [measure]).get(measure)
+    if step is None:
+        print(f"\n===== backend={backend}: {measure} doesn't apply, skipped =====")
+        return
+    for _ in range(args.warmup):  # compile and autotune outside the trace
         step()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for _ in range(active):
+        for _ in range(args.active):
             step()
         torch.cuda.synchronize()
 
     print(
-        f"\n===== backend={backend} N={n} dir={direction} dtype={dtype} "
-        f"mode={mode} (active={active}) ====="
+        f"\n===== backend={backend} N={n} dir={direction} dtype={args.dtype} "
+        f"measure={measure} (active={args.active}) ====="
     )
-    print(prof.key_averages().table(sort_by="self_device_time_total", row_limit=rows))
+    table = prof.key_averages().table(
+        sort_by="self_device_time_total", row_limit=args.rows
+    )
+    print(table)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_shape_arguments(parser, sizes=[768], directions=["outgoing"])
-    add_backend_argument(parser, default=["triton"])
-    parser.add_argument("--mode", nargs="+", default=["fwd"], choices=["fwd", "fwdbwd"])
+    add_dtype_arguments(parser)
+    add_backend_arguments(parser, TRIMUL_IMPLEMENTATIONS, default=["triton"])
+    parser.add_argument(
+        "--measure", nargs="+", default=["fwd_infer"], choices=OP_MEASURES
+    )
     parser.add_argument(
         "--warmup", type=int, default=10, help="untraced iterations before the trace"
     )
     parser.add_argument("--active", type=int, default=10, help="profiled iterations")
     parser.add_argument("--rows", type=int, default=15, help="top-N ops to print")
     args = parser.parse_args()
+    args.warmup = max(1, args.warmup)
+    args.active = max(1, args.active)
 
     require_gpu()
-    dtype = DTYPES[args.dtype]
-    print_provenance(args.dtype, channels=args.channels)
-
-    for n in args.sizes:
-        for direction in args.directions:
-            for mode in args.mode:
-                for backend in args.backends:
-                    profile_case(
-                        backend,
-                        n,
-                        args.channels,
-                        direction,
-                        dtype,
-                        mode,
-                        max(1, args.warmup),
-                        max(1, args.active),
-                        args.rows,
-                    )
-                    release_blas_workspaces()
+    print_provenance(
+        args.dtype,
+        channels=args.channels,
+        biases=args.biases,
+        fp32_precision=args.fp32_precision,
+    )
+    with torch_matmul_precision(args.fp32_precision):
+        for n in args.sizes:
+            for direction in args.directions:
+                for measure in args.measure:
+                    for backend in args.backends:
+                        profile_case(args, backend, n, direction, measure)
 
 
 if __name__ == "__main__":
