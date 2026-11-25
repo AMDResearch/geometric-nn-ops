@@ -3,9 +3,6 @@
 
 """Rank the kernels inside triangle_multiplicative_update by device time.
 
-``--mode fwdbwd`` needs a differentiable implementation, so it does not apply
-to the forward-only Triton path.
-
 Usage:
     python benchmarks/profile_trimul.py --sizes 768 --rows 15
 """
@@ -57,10 +54,7 @@ def make_step(backend, n, channels, direction, dtype, mode):
 
         return forward
 
-    probe = impl(x, direction, mask, **weights)
-    if not probe.requires_grad:
-        raise RuntimeError(f"backend '{backend}' has no backward to profile")
-    grad_out = torch.randn_like(probe)
+    grad_out = torch.randn_like(impl(x, direction, mask, **weights))
     targets = [x, *grad_targets(weights).values()]
 
     def forward_backward():

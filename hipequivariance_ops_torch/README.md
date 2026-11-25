@@ -77,11 +77,11 @@ pip install -e hipequivariance_ops_torch  # this shim
 
 ## Status
 
-| Op                               | Forward                                | Backward                                        |
-| -------------------------------- | -------------------------------------- | ----------------------------------------------- |
-| `triangle_attention`             | yes                                    | yes                                             |
-| `triangle_multiplicative_update` | yes                                    | yes (torch fallback; native Triton bwd pending) |
-| `attention_pair_bias`            | yes (pure torch; no Triton kernel yet) | yes (pure torch; no Triton kernel yet)          |
+| Op                               | Forward                                | Backward                               |
+| -------------------------------- | -------------------------------------- | -------------------------------------- |
+| `triangle_attention`             | yes                                    | yes                                    |
+| `triangle_multiplicative_update` | yes                                    | yes                                    |
+| `attention_pair_bias`            | yes (pure torch; no Triton kernel yet) | yes (pure torch; no Triton kernel yet) |
 
 ## License
 
