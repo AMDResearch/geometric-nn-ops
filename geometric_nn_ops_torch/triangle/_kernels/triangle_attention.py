@@ -52,6 +52,38 @@ if _TRITON_AVAILABLE:
         return {"matrix_instr_nonkdim": 16, **tuning}
 
     @triton.jit
+    def _slab_indices(pid, HEAD: tl.constexpr, N_SEQ: tl.constexpr):
+        """Split a combined (batch, msa, head) program id into its parts."""
+        index_batch_msa = pid // HEAD
+        return index_batch_msa // N_SEQ, index_batch_msa % N_SEQ, pid % HEAD
+
+    @triton.jit
+    def _seq_slab_mem_offset(index_slab, seq_len):
+        """Slab offset into ``M`` or ``D``, contiguous [batch, msa, head, seq].
+
+        ``index_slab`` is the flattened (batch, msa, head) index, which is the
+        program id of kernels launched with one program per slab.
+        """
+        return tl.cast(index_slab, tl.int64) * seq_len
+
+    @triton.jit
+    def _slab_mem_offset(index_batch, index_msa, index_head, s_batch, s_msa, s_head):
+        """Slab offset for a tensor with shape [batch, msa, head, ...].
+
+        Computed in int64 because ``index * stride`` can overflow int32 at
+        realistic shapes. Triton passes a stride of 2**31 or more as int64, but
+        a smaller stride times an index can still exceed it. Triton often drops
+        the widening when it can tell it isn't needed.
+        """
+        # ``tl.cast`` rather than ``.to`` so a literal 0 can be passed for an
+        # absent axis.
+        return (
+            tl.cast(index_batch, tl.int64) * s_batch
+            + tl.cast(index_msa, tl.int64) * s_msa
+            + tl.cast(index_head, tl.int64) * s_head
+        )
+
+    @triton.jit
     def _attn_fwd_inner(
         O_block,
         l_i,
@@ -248,44 +280,85 @@ if _TRITON_AVAILABLE:
         """Run the forward pass of the attention mechanism."""
         block_index_q = tl.program_id(0)
 
-        index_batch_msa_head = tl.program_id(1)
-        index_batch_msa = index_batch_msa_head // HEAD
-        index_head = index_batch_msa_head % HEAD
-        index_batch = index_batch_msa // N_SEQ
-        index_msa = index_batch_msa % N_SEQ
+        index_slab = tl.program_id(1)
+        index_batch, index_msa, index_head = _slab_indices(index_slab, HEAD, N_SEQ)
 
-        # Cast to int64 to avoid int32 overflow for large sequences.
-        ib = index_batch.to(tl.int64)
-        im = index_msa.to(tl.int64)
-        ih = index_head.to(tl.int64)
-        q_offset = ib * stride_Q_batch + im * stride_Q_msa + ih * stride_Q_head
-        k_offset = ib * stride_K_batch + im * stride_K_msa + ih * stride_K_head
-        v_offset = ib * stride_V_batch + im * stride_V_msa + ih * stride_V_head
-        o_offset = ib * stride_O_batch + im * stride_O_msa + ih * stride_O_head
+        moff_q_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_Q_batch,
+            stride_Q_msa,
+            stride_Q_head,
+        )
+        moff_k_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_K_batch,
+            stride_K_msa,
+            stride_K_head,
+        )
+        moff_v_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_V_batch,
+            stride_V_msa,
+            stride_V_head,
+        )
+        moff_o_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_O_batch,
+            stride_O_msa,
+            stride_O_head,
+        )
 
         offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
         offs_d = tl.arange(0, BLOCK_DIM)
 
-        Q_block_ptr = Q + q_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
-        V_block_ptr = V + v_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
-        K_block_ptr = K + k_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
+        Q_block_ptr = (
+            Q + moff_q_slab + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
+        )
+        V_block_ptr = (
+            V + moff_v_slab + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
+        )
+        K_block_ptr = (
+            K + moff_k_slab + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
+        )
+        moff_pair_bias_slab = _slab_mem_offset(
+            index_batch,
+            0,
+            index_head,
+            stride_pair_bias_batch,
+            0,
+            stride_pair_bias_head,
+        )
         pair_bias_block_ptr = (
             pair_bias
-            + index_batch * stride_pair_bias_batch
-            + index_head * stride_pair_bias_head
+            + moff_pair_bias_slab
             + (
                 offs_q[:, None] * stride_pair_bias_seq1
                 + offs_kv[None, :] * stride_pair_bias_seq2
             )
         )
-        O_block_ptr = O + o_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
+        O_block_ptr = (
+            O + moff_o_slab + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
+        )
 
+        moff_res_mask_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            0,
+            stride_mask_batch,
+            stride_mask_msa,
+            0,
+        )
         res_mask_block_ptr = (
-            res_mask
-            + index_batch * stride_mask_batch
-            + index_msa * stride_mask_msa
-            + (offs_kv[None, :] * stride_mask_seq)
+            res_mask + moff_res_mask_slab + (offs_kv[None, :] * stride_mask_seq)
         )
 
         m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
@@ -346,7 +419,7 @@ if _TRITON_AVAILABLE:
         )  # base matches fwd-inner exp2 gate
         O_block = O_block / l_i[:, None]
         O_block = O_block.to(O.type.element_ty)
-        m_ptrs = M + index_batch_msa_head * SEQ_LEN + offs_q
+        m_ptrs = M + _seq_slab_mem_offset(index_slab, SEQ_LEN) + offs_q
 
         if EVEN_Q:
             tl.store(m_ptrs, m_i)
@@ -424,44 +497,84 @@ if _TRITON_AVAILABLE:
         """
         block_index_q = tl.program_id(0)
 
-        index_batch_msa_head = tl.program_id(1)
-        index_batch_msa = index_batch_msa_head // HEAD
-        index_head = index_batch_msa_head % HEAD
-        index_batch = index_batch_msa // N_SEQ
-        index_msa = index_batch_msa % N_SEQ
+        index_slab = tl.program_id(1)
+        index_batch, index_msa, index_head = _slab_indices(index_slab, HEAD, N_SEQ)
 
-        # Cast to int64 to avoid int32 overflow for large sequences.
-        ib = index_batch.to(tl.int64)
-        im = index_msa.to(tl.int64)
-        ih = index_head.to(tl.int64)
-        q_offset = ib * stride_Q_batch + im * stride_Q_msa + ih * stride_Q_head
-        k_offset = ib * stride_K_batch + im * stride_K_msa + ih * stride_K_head
-        v_offset = ib * stride_V_batch + im * stride_V_msa + ih * stride_V_head
-        o_offset = ib * stride_O_batch + im * stride_O_msa + ih * stride_O_head
+        moff_q_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_Q_batch,
+            stride_Q_msa,
+            stride_Q_head,
+        )
+        moff_k_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_K_batch,
+            stride_K_msa,
+            stride_K_head,
+        )
+        moff_v_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_V_batch,
+            stride_V_msa,
+            stride_V_head,
+        )
+        moff_o_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            index_head,
+            stride_O_batch,
+            stride_O_msa,
+            stride_O_head,
+        )
+        moff_pair_bias_slab = _slab_mem_offset(
+            index_batch,
+            0,
+            index_head,
+            stride_pair_bias_batch,
+            0,
+            stride_pair_bias_head,
+        )
+        moff_res_mask_slab = _slab_mem_offset(
+            index_batch,
+            index_msa,
+            0,
+            stride_mask_batch,
+            stride_mask_msa,
+            0,
+        )
 
         offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
         offs_d = tl.arange(0, BLOCK_DIM)
 
-        Q_block_ptr = Q + q_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
-        V_block_ptr = V + v_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
-        K_block_ptr = K + k_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
+        Q_block_ptr = (
+            Q + moff_q_slab + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
+        )
+        V_block_ptr = (
+            V + moff_v_slab + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
+        )
+        K_block_ptr = (
+            K + moff_k_slab + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
+        )
+        O_block_ptr = (
+            O + moff_o_slab + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
+        )
         pair_bias_block_ptr = (
             pair_bias
-            + index_batch * stride_pair_bias_batch
-            + index_head * stride_pair_bias_head
+            + moff_pair_bias_slab
             + (
                 offs_q[:, None] * stride_pair_bias_seq1
                 + offs_kv[None, :] * stride_pair_bias_seq2
             )
         )
-        O_block_ptr = O + o_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
-
         res_mask_block_ptr = (
-            res_mask
-            + index_batch * stride_mask_batch
-            + index_msa * stride_mask_msa
-            + (offs_kv[None, :] * stride_mask_seq)
+            res_mask + moff_res_mask_slab + (offs_kv[None, :] * stride_mask_seq)
         )
 
         m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
@@ -522,7 +635,7 @@ if _TRITON_AVAILABLE:
         )  # base matches fwd-inner exp2 gate
         O_block = O_block / l_i[:, None]
         O_block = O_block.to(O.type.element_ty)
-        m_ptrs = M + index_batch_msa_head * SEQ_LEN + offs_q
+        m_ptrs = M + _seq_slab_mem_offset(index_slab, SEQ_LEN) + offs_q
 
         if EVEN_Q:
             tl.store(m_ptrs, m_i)
@@ -568,56 +681,53 @@ if _TRITON_AVAILABLE:
         """
         block_index_q = tl.program_id(0)
         offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-        index_batch_msa_head = tl.program_id(1)
         offs_dim = tl.arange(0, BLOCK_DIM)
 
-        # Cast to int64 to avoid int32 overflow for large sequences
-        # Internal-layout slab from explicit strides (contiguous =>
-        # stride_seq==DIM and slab==idx*SEQ_LEN*DIM, identical to before).
-        ibm = index_batch_msa_head // HEAD
-        ih = index_batch_msa_head % HEAD
-        ib = ibm // N_SEQ
-        im = ibm % N_SEQ
-        slab = (
-            ib.to(tl.int64) * stride_batch
-            + im.to(tl.int64) * stride_msa
-            + ih.to(tl.int64) * stride_head
+        index_slab = tl.program_id(1)
+        index_batch, index_msa, index_head = _slab_indices(index_slab, HEAD, N_SEQ)
+        moff_slab = _slab_mem_offset(
+            index_batch, index_msa, index_head, stride_batch, stride_msa, stride_head
         )
         q_mask = (offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM)
 
         # Load a single block of BLOCK_SIZE_Q rows of O
         O_block = tl.load(
-            O + slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
+            O + moff_slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
             mask=q_mask,
             other=0.0,
         )
         # Load a single block of BLOCK_SIZE_Q rows of dO
         if READ_DO_BLLHS:
             # BLLHS [B,N,L,H,D]: head stride DIM, residue stride HEAD*DIM.
-            bn = index_batch_msa_head.to(tl.int64) // HEAD
-            h = index_batch_msa_head.to(tl.int64) % HEAD
-            do_base = bn * SEQ_LEN * HEAD * DIM + h * DIM
+            moff_do_slab = _slab_mem_offset(
+                index_batch,
+                index_msa,
+                index_head,
+                N_SEQ * SEQ_LEN * HEAD * DIM,
+                SEQ_LEN * HEAD * DIM,
+                DIM,
+            )
             dO_raw = tl.load(
-                dO + do_base + offs_q[:, None] * (HEAD * DIM) + offs_dim[None, :],
+                dO + moff_do_slab + offs_q[:, None] * (HEAD * DIM) + offs_dim[None, :],
                 mask=q_mask,
                 other=0.0,
             )
             tl.store(
-                dO_out + slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                dO_out + moff_slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
                 dO_raw,
                 mask=q_mask,
             )
             dO_block = dO_raw.to(tl.float32)
         else:
             dO_block = tl.load(
-                dO + slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                dO + moff_slab + offs_q[:, None] * stride_seq + offs_dim[None, :],
                 mask=q_mask,
                 other=0.0,
             ).to(tl.float32)
         # Compute the D block
         D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,)
         # Store the D block
-        D_block_ptrs = D + index_batch_msa_head.to(tl.int64) * SEQ_LEN + offs_q
+        D_block_ptrs = D + _seq_slab_mem_offset(index_slab, SEQ_LEN) + offs_q
         tl.store(D_block_ptrs, D_block, mask=offs_q < SEQ_LEN)
 
     @triton.jit
@@ -676,19 +786,20 @@ if _TRITON_AVAILABLE:
         kv_in = offs_kv < SEQ_LEN
         dim_in = offs_dim < DIM
 
-        bh_off = (
-            index_batch.to(tl.int64) * stride_batch
-            + index_head.to(tl.int64) * stride_head
-        )
-
         kvT_col = offs_kv[None, :] * stride_seq + offs_dim[:, None]
 
         qk_valid = q_in[:, None] & kv_in[None, :]
         if HAS_PAIR_BIAS:
             pb_ptrs = (
                 pair_bias
-                + index_batch.to(tl.int64) * stride_pair_bias_batch
-                + index_head.to(tl.int64) * stride_pair_bias_head
+                + _slab_mem_offset(
+                    index_batch,
+                    0,
+                    index_head,
+                    stride_pair_bias_batch,
+                    0,
+                    stride_pair_bias_head,
+                )
                 + offs_q[:, None] * stride_pair_bias_seq1
                 + offs_kv[None, :] * stride_pair_bias_seq2
             )
@@ -697,34 +808,49 @@ if _TRITON_AVAILABLE:
         dbias_block = tl.zeros([BLOCK_SIZE_Q, BLOCK_SIZE_KV], dtype=tl.float32)
 
         for index_msa in tl.range(0, N_SEQ, num_stages=PIPE_STAGES):
-            msa_off = bh_off + index_msa.to(tl.int64) * stride_msa
-            md_off = ((index_batch * N_SEQ + index_msa) * HEAD + index_head).to(
-                tl.int64
-            ) * SEQ_LEN
+            moff_qkv_slab = _slab_mem_offset(
+                index_batch,
+                index_msa,
+                index_head,
+                stride_batch,
+                stride_msa,
+                stride_head,
+            )
+            # M and D are [batch, msa, head, seq] and contiguous so strides are
+            # derived.
+            moff_md_slab = _slab_mem_offset(
+                index_batch,
+                index_msa,
+                index_head,
+                N_SEQ * HEAD * SEQ_LEN,
+                HEAD * SEQ_LEN,
+                SEQ_LEN,
+            )
 
             K_T_block = tl.load(
-                K + msa_off + kvT_col,
+                K + moff_qkv_slab + kvT_col,
                 mask=kv_in[None, :] & dim_in[:, None],
                 other=0.0,
             )
             V_T_block = tl.load(
-                V + msa_off + kvT_col,
+                V + moff_qkv_slab + kvT_col,
                 mask=kv_in[None, :] & dim_in[:, None],
                 other=0.0,
             )
 
             qd = offs_q[:, None] * stride_seq + offs_dim[None, :]
             q_valid = q_in[:, None] & dim_in[None, :]
-            Q_block = tl.load(Q + msa_off + qd, mask=q_valid, other=0.0)
-            dO_block = tl.load(dO + msa_off + qd, mask=q_valid, other=0.0)
+            Q_block = tl.load(Q + moff_qkv_slab + qd, mask=q_valid, other=0.0)
+            dO_block = tl.load(dO + moff_qkv_slab + qd, mask=q_valid, other=0.0)
 
-            M_block = tl.load(M + md_off + offs_q, mask=q_in, other=0.0)[:, None]
-            Di = tl.load(D + md_off + offs_q, mask=q_in, other=0.0)
+            M_block = tl.load(M + moff_md_slab + offs_q, mask=q_in, other=0.0)[:, None]
+            Di = tl.load(D + moff_md_slab + offs_q, mask=q_in, other=0.0)
 
             rm_ptrs = (
                 res_mask
-                + index_batch.to(tl.int64) * stride_mask_batch
-                + index_msa.to(tl.int64) * stride_mask_msa
+                + _slab_mem_offset(
+                    index_batch, index_msa, 0, stride_mask_batch, stride_mask_msa, 0
+                )
                 + offs_kv * stride_mask_seq
             )
             res_mask_block = tl.load(rm_ptrs, mask=kv_in, other=float("-inf"))[
@@ -774,7 +900,7 @@ if _TRITON_AVAILABLE:
                 dS_cast, tl.trans(K_T_block), input_precision=MATMUL_PRECISION
             )
             tl.atomic_add(
-                dQ + msa_off + qd,
+                dQ + moff_qkv_slab + qd,
                 dQ_block,
                 mask=q_valid,
                 sem="relaxed",
@@ -783,8 +909,14 @@ if _TRITON_AVAILABLE:
         if HAS_PAIR_BIAS:
             dbias_ptrs = (
                 d_pair_bias
-                + index_batch.to(tl.int64) * stride_d_pair_bias_batch
-                + index_head.to(tl.int64) * stride_d_pair_bias_head
+                + _slab_mem_offset(
+                    index_batch,
+                    0,
+                    index_head,
+                    stride_d_pair_bias_batch,
+                    0,
+                    stride_d_pair_bias_head,
+                )
                 + offs_q[:, None] * stride_d_pair_bias_seq1
                 + offs_kv[None, :] * stride_d_pair_bias_seq2
             )
@@ -837,40 +969,31 @@ if _TRITON_AVAILABLE:
         USE_EXP2: tl.constexpr = False,
     ):
         """Run the backward pass of the attention mechanism."""
-        index_batch_msa_head = tl.program_id(1)
-        index_batch_msa = index_batch_msa_head // HEAD
-        index_head = index_batch_msa_head % HEAD
-        index_batch = index_batch_msa // N_SEQ
-        index_msa = index_batch_msa % N_SEQ
-
-        # Cast indices to int64 to avoid int32 overflow
-        offset_batch_msa_head = (
-            index_batch.to(tl.int64) * stride_batch
-            + index_msa.to(tl.int64) * stride_msa
-            + index_head.to(tl.int64) * stride_head
+        index_slab = tl.program_id(1)
+        index_batch, index_msa, index_head = _slab_indices(index_slab, HEAD, N_SEQ)
+        moff_qkv_slab = _slab_mem_offset(
+            index_batch, index_msa, index_head, stride_batch, stride_msa, stride_head
         )
-        offset_batch_msa_head_seq = index_batch_msa_head.to(tl.int64) * SEQ_LEN
+        moff_md_slab = _seq_slab_mem_offset(index_slab, SEQ_LEN)
 
-        Q += offset_batch_msa_head
-        K += offset_batch_msa_head
-        V += offset_batch_msa_head
-        dO += offset_batch_msa_head
-        dQ += offset_batch_msa_head
+        Q += moff_qkv_slab
+        K += moff_qkv_slab
+        V += moff_qkv_slab
+        dO += moff_qkv_slab
+        dQ += moff_qkv_slab
         # dK/dV optionally written directly in BLLHS layout to skip a transpose.
         if WRITE_BLLHS:
-            out_off = (
-                index_batch.to(tl.int64) * stride_batch
-                + index_msa.to(tl.int64) * stride_msa
-                + index_head.to(tl.int64) * DIM
+            moff_out_slab = _slab_mem_offset(
+                index_batch, index_msa, index_head, stride_batch, stride_msa, DIM
             )
-            dK += out_off
-            dV += out_off
+            dK += moff_out_slab
+            dV += moff_out_slab
         else:
-            dK += offset_batch_msa_head
-            dV += offset_batch_msa_head
+            dK += moff_qkv_slab
+            dV += moff_qkv_slab
 
-        M += offset_batch_msa_head_seq
-        D += offset_batch_msa_head_seq
+        M += moff_md_slab
+        D += moff_md_slab
 
         offs_dim = tl.arange(0, BLOCK_DIM)
 
@@ -883,8 +1006,9 @@ if _TRITON_AVAILABLE:
 
         res_mask_block_ptr = (
             res_mask
-            + index_batch.to(tl.int64) * stride_mask_batch
-            + index_msa.to(tl.int64) * stride_mask_msa
+            + _slab_mem_offset(
+                index_batch, index_msa, 0, stride_mask_batch, stride_mask_msa, 0
+            )
             + offs_kv[None, :] * stride_mask_seq
         )
 
@@ -945,8 +1069,14 @@ if _TRITON_AVAILABLE:
         pair_bias_T_block_ptr = (
             pair_bias
             + (
-                index_batch.to(tl.int64) * stride_pair_bias_batch
-                + index_head.to(tl.int64) * stride_pair_bias_head
+                _slab_mem_offset(
+                    index_batch,
+                    0,
+                    index_head,
+                    stride_pair_bias_batch,
+                    0,
+                    stride_pair_bias_head,
+                )
             )
             + offs_q[None, :] * stride_pair_bias_seq1
             + offs_kv[:, None] * stride_pair_bias_seq2
